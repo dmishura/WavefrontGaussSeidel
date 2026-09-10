@@ -942,6 +942,52 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         }
     );
 
+    constexpr label shortCallSweeps = 3;
+    constexpr label shortCallsPerSample = 100;
+    constexpr label shortTimedSweeps = shortCallSweeps*shortCallsPerSample;
+    constexpr label shortWarmupSweeps = 12;
+    const ImplementationTiming shortReferenceTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingSamples, shortTimedSweeps,
+        shortWarmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
+        {
+            for (label sweep=0; sweep<nSweeps; sweep += shortCallSweeps)
+            {
+                GaussSeidelSmoother::smooth
+                (
+                    "psi", timedPsi, matrix, source,
+                    interfaceCoeffs, interfaces, 0, shortCallSweeps
+                );
+            }
+        }
+    );
+    const ImplementationTiming shortScalarTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingSamples, shortTimedSweeps,
+        shortWarmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
+        {
+            for (label sweep=0; sweep<nSweeps; sweep += shortCallSweeps)
+                serialGatherSmooth
+                (
+                    timedPsi, source, schedule, shortCallSweeps
+                );
+        }
+    );
+    scalarField shortReorderedWorkspace(initialPsi.size());
+    const ImplementationTiming shortReorderedTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingSamples, shortTimedSweeps,
+        shortWarmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
+        {
+            for (label sweep=0; sweep<nSweeps; sweep += shortCallSweeps)
+                serialReorderedPsiSmooth
+                (
+                    timedPsi, shortReorderedWorkspace, source, schedule,
+                    shortCallSweeps
+                );
+        }
+    );
+
     scalarField psi = initialPsi;
     const SweepMeasurements measurements = measureSweeps
     (
@@ -1113,6 +1159,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         sequentialTiming.medianSeconds/persistentTiming.medianSeconds;
     const scalar persistentVsPerLevel =
         perLevelTiming.medianSeconds/persistentTiming.medianSeconds;
+    const scalar shortReorderedSpeedupScalar =
+        shortScalarTiming.medianSeconds/shortReorderedTiming.medianSeconds;
+    const scalar shortReorderedSpeedupReference =
+        shortReferenceTiming.medianSeconds/shortReorderedTiming.medianSeconds;
 
     std::cout << "dependency validation: PASS\n"
         << "\nStable performance benchmark:"
@@ -1129,6 +1179,16 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     printTiming("Serial packed AVX-512 across rows", avx512AcrossRowsTiming);
     printTiming("Wavefront per-level OpenMP", perLevelTiming);
     printTiming("Wavefront persistent OpenMP", persistentTiming);
+
+    std::cout << "\nThree-sweep call benchmark:"
+        << "\n  calls/sample: " << shortCallsPerSample
+        << "\n  sweeps/call: " << shortCallSweeps << '\n';
+    printTiming("3-sweep Reference GS", shortReferenceTiming);
+    printTiming("3-sweep Serial packed scalar", shortScalarTiming);
+    printTiming("3-sweep Serial packed reordered psi", shortReorderedTiming);
+    std::cout << "\n  3-sweep reordered-psi speedup vs scalar/reference: "
+        << shortReorderedSpeedupScalar << "x / "
+        << shortReorderedSpeedupReference << "x\n";
 
     std::cout << "\nMedian-based comparisons:"
         << "\n  serial packed slowdown vs reference: " << gatherSlowdown << "x"
