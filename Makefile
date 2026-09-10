@@ -1,6 +1,7 @@
 CXX ?= c++
 CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -Icompat -Isrc
+HISTORY_SWEEPS ?= 20
 
 OPENFOAM_DIR ?= ../OpenFOAM-14
 GS_DIR := $(OPENFOAM_DIR)/src/OpenFOAM/matrices/lduMatrix/smoothers/GaussSeidel
@@ -27,7 +28,7 @@ test-reader: $(READER_TARGET) $(MESH_STAMP)
 	./$(READER_TARGET) $(MESH_DIR)
 
 test-smoother run: $(SMOOTHER_TARGET) $(MESH_STAMP)
-	./$(SMOOTHER_TARGET) $(MESH_DIR)
+	./$(SMOOTHER_TARGET) $(MESH_DIR) --history-sweeps $(HISTORY_SWEEPS)
 
 $(SMOOTHER_TARGET): $(SMOOTHER_OBJECTS)
 	$(CXX) $(CXXFLAGS) $^ -o $@

@@ -6,10 +6,13 @@
 #include "PolyMeshReader.H"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include <vector>
 
 using namespace Foam;
 using smootherTest::PolyMeshReader;
@@ -86,9 +89,143 @@ scalar relativeResidual
     return numerator/std::max(denominator, 1e-300);
 }
 
+struct SweepMeasurements
+{
+    std::vector<scalar> residuals;
+    std::chrono::nanoseconds sweepTime{0};
+};
+
+SweepMeasurements measureSweeps
+(
+    scalarField& psi,
+    const lduMatrix& matrix,
+    const scalarField& source,
+    const label nSweeps,
+    const FieldField<Field, scalar>& interfaceCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces
+)
+{
+    SweepMeasurements result;
+    result.residuals.reserve(static_cast<std::size_t>(nSweeps) + 1);
+    result.residuals.push_back(relativeResidual(matrix, psi, source));
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        GaussSeidelSmoother::smooth
+        (
+            "psi", psi, matrix, source,
+            interfaceCoeffs, interfaces, 0, 1
+        );
+        const auto end = std::chrono::steady_clock::now();
+        result.sweepTime +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin);
+
+        // Deliberately outside the timed interval.
+        result.residuals.push_back(relativeResidual(matrix, psi, source));
+    }
+    return result;
 }
 
-int runTest(const std::string& meshDirectory)
+struct WavefrontStatistics
+{
+    std::vector<label> levels;
+    std::vector<std::size_t> widths;
+    std::size_t minimumWidth = 0;
+    std::size_t maximumWidth = 0;
+    scalar meanWidth = 0;
+    scalar medianWidth = 0;
+    std::size_t p90Width = 0;
+    std::size_t p95Width = 0;
+};
+
+std::size_t percentile
+(
+    const std::vector<std::size_t>& sortedValues,
+    const scalar fraction
+)
+{
+    const std::size_t index = static_cast<std::size_t>
+    (
+        std::ceil(fraction*sortedValues.size()) - 1
+    );
+    return sortedValues[std::min(index, sortedValues.size() - 1)];
+}
+
+WavefrontStatistics constructWavefronts(const PolyMeshTopology& mesh)
+{
+    WavefrontStatistics result;
+    result.levels.assign(mesh.nCells, 0);
+
+    // OpenFOAM internal faces are upper-triangular: owner < neighbour.
+    // In a forward sweep, neighbour depends on its already-updated owner.
+    for (std::size_t face=0; face<mesh.nInternalFaces(); ++face)
+    {
+        const label dependency = mesh.owner[face];
+        const label cell = mesh.neighbour[face];
+        result.levels[cell] = std::max
+        (
+            result.levels[cell], result.levels[dependency] + 1
+        );
+    }
+
+    const label maximumLevel =
+        *std::max_element(result.levels.begin(), result.levels.end());
+    result.widths.assign(static_cast<std::size_t>(maximumLevel) + 1, 0);
+    for (const label level : result.levels) ++result.widths[level];
+
+    // Validate the exact dependency invariant used to construct the levels.
+    for (std::size_t face=0; face<mesh.nInternalFaces(); ++face)
+    {
+        const label dependency = mesh.owner[face];
+        const label cell = mesh.neighbour[face];
+        if (result.levels[dependency] >= result.levels[cell])
+        {
+            throw std::runtime_error
+            (
+                "wavefront dependency validation failed at internal face "
+              + std::to_string(face)
+            );
+        }
+    }
+
+    const auto bounds =
+        std::minmax_element(result.widths.begin(), result.widths.end());
+    result.minimumWidth = *bounds.first;
+    result.maximumWidth = *bounds.second;
+    result.meanWidth = scalar(mesh.nCells)/result.widths.size();
+
+    std::vector<std::size_t> sortedWidths = result.widths;
+    std::sort(sortedWidths.begin(), sortedWidths.end());
+    const std::size_t middle = sortedWidths.size()/2;
+    result.medianWidth = sortedWidths.size() % 2
+        ? scalar(sortedWidths[middle])
+        : 0.5*scalar(sortedWidths[middle - 1] + sortedWidths[middle]);
+    result.p90Width = percentile(sortedWidths, 0.90);
+    result.p95Width = percentile(sortedWidths, 0.95);
+    return result;
+}
+
+void printLevelWidths
+(
+    const char* labelText,
+    const std::vector<std::size_t>& widths,
+    const std::size_t begin,
+    const std::size_t end
+)
+{
+    std::cout << labelText;
+    for (std::size_t i=begin; i<end; ++i)
+    {
+        if (i != begin) std::cout << ' ';
+        std::cout << i << ':' << widths[i];
+    }
+    std::cout << '\n';
+}
+
+}
+
+int runTest(const std::string& meshDirectory, const label historySweeps)
 {
     const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
     lduMatrix matrix = makeMatrix(mesh);
@@ -107,28 +244,111 @@ int runTest(const std::string& meshDirectory)
     FieldField<Field, scalar> interfaceCoeffs(0);
     lduInterfaceFieldPtrsList interfaces(0);
 
-    const scalar initial = relativeResidual(matrix, psi, source);
-    GaussSeidelSmoother::smooth
+    const SweepMeasurements measurements = measureSweeps
     (
-        "psi", psi, matrix, source, interfaceCoeffs, interfaces, 0, 1
+        psi, matrix, source, historySweeps, interfaceCoeffs, interfaces
     );
-    const scalar afterOne = relativeResidual(matrix, psi, source);
+    const scalar initial = measurements.residuals.front();
+    const scalar afterOne = measurements.residuals[1];
     if (!(afterOne < initial))
         throw std::runtime_error("one sweep did not reduce the residual");
 
-    GaussSeidelSmoother::smooth
-    (
-        "psi", psi, matrix, source, interfaceCoeffs, interfaces, 0, 199
-    );
+    constexpr label totalCorrectnessSweeps = 200;
+    if (historySweeps < totalCorrectnessSweeps)
+    {
+        GaussSeidelSmoother::smooth
+        (
+            "psi", psi, matrix, source, interfaceCoeffs, interfaces, 0,
+            totalCorrectnessSweeps - historySweeps
+        );
+    }
     const scalar final = relativeResidual(matrix, psi, source);
     scalar maxError = 0;
     for (label i=0; i<label(psi.size()); ++i)
         maxError = std::max(maxError, std::abs(psi[i] - exact[i]));
 
+    const WavefrontStatistics wavefronts = constructWavefronts(mesh);
+    const std::size_t totalLevelCells =
+        std::accumulate
+        (
+            wavefronts.widths.begin(), wavefronts.widths.end(), std::size_t(0)
+        );
+    if (totalLevelCells != mesh.nCells)
+        throw std::runtime_error("wavefront levels do not cover every cell");
+
+    const scalar totalSeconds =
+        std::chrono::duration<scalar>(measurements.sweepTime).count();
+    const scalar totalNanoseconds = scalar(measurements.sweepTime.count());
+    const scalar averageSeconds = totalSeconds/historySweeps;
+    const scalar nsPerCellSweep =
+        totalNanoseconds/(scalar(mesh.nCells)*historySweeps);
+    const scalar nsPerFaceSweep =
+        totalNanoseconds/(scalar(mesh.nInternalFaces())*historySweeps);
+    const scalar eta = -std::log
+    (
+        measurements.residuals.back()/measurements.residuals.front()
+    )/totalSeconds;
+
     std::cout << "motorBike cells: " << mesh.nCells
         << "\ninternal faces: " << mesh.nInternalFaces()
         << "\ninitial residual: " << initial
-        << "\none-sweep residual: " << afterOne
+        << "\none-sweep residual: " << afterOne << "\n\n";
+
+    std::cout << "Residual history:\n"
+        << "sweep   residual        ratio           effective-factor\n";
+    const auto oldFlags = std::cout.flags();
+    const auto oldPrecision = std::cout.precision();
+    std::cout << std::scientific << std::setprecision(8);
+    for (std::size_t sweep=0; sweep<measurements.residuals.size(); ++sweep)
+    {
+        std::cout << std::setw(5) << sweep << "   "
+            << std::setw(14) << measurements.residuals[sweep] << "   ";
+        if (sweep == 0)
+        {
+            std::cout << std::setw(14) << "-" << "   "
+                << std::setw(16) << "-" << '\n';
+        }
+        else
+        {
+            const scalar ratio =
+                measurements.residuals[sweep]/measurements.residuals[sweep - 1];
+            const scalar effectiveFactor = std::pow
+            (
+                measurements.residuals[sweep]/measurements.residuals[0],
+                1.0/scalar(sweep)
+            );
+            std::cout << std::setw(14) << ratio << "   "
+                << std::setw(16) << effectiveFactor << '\n';
+        }
+    }
+    std::cout.flags(oldFlags);
+    std::cout.precision(oldPrecision);
+
+    std::cout << "\nSweep performance:\n"
+        << "sweeps: " << historySweeps
+        << "\ntotal sweep time: " << totalSeconds << " s"
+        << "\naverage sweep time: " << averageSeconds << " s"
+        << "\nns/cell/sweep: " << nsPerCellSweep
+        << "\nns/internal-face/sweep: " << nsPerFaceSweep
+        << "\nsmoothing efficiency eta: " << eta << " 1/s\n";
+
+    std::cout << "\nWavefront dependency statistics:\n"
+        << "levels: " << wavefronts.widths.size()
+        << "\ncells: " << totalLevelCells
+        << "\nmin width: " << wavefronts.minimumWidth
+        << "\nmean width: " << wavefronts.meanWidth
+        << "\nmedian width: " << wavefronts.medianWidth
+        << "\np90 width: " << wavefronts.p90Width
+        << "\np95 width: " << wavefronts.p95Width
+        << "\nmax width: " << wavefronts.maximumWidth << '\n';
+    const std::size_t shown = std::min<std::size_t>(10, wavefronts.widths.size());
+    printLevelWidths("first levels: ", wavefronts.widths, 0, shown);
+    printLevelWidths
+    (
+        "last levels: ", wavefronts.widths,
+        wavefronts.widths.size() - shown, wavefronts.widths.size()
+    );
+    std::cout << "dependency validation: PASS\n"
         << "\nfinal residual: " << final
         << "\nmaximum error: " << maxError << '\n';
     if (final > 1e-10 || maxError > 1e-10)
@@ -140,24 +360,44 @@ int runTest(const std::string& meshDirectory)
 int main(int argc, char** argv)
 {
     const std::string usage =
-        "Usage: Test-GaussSeidel <polyMesh-directory>\n";
-    if (argc == 2 && std::string(argv[1]) == "--help")
+        "Usage: Test-GaussSeidel <polyMesh-directory> "
+        "[--history-sweeps N]\n";
+    if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
         return 0;
     }
-    if (argc != 2)
+    if (argc != 2 && argc != 4)
     {
         std::cerr << usage;
         return 2;
     }
     try
     {
-        return runTest(argv[1]);
+        label historySweeps = 20;
+        if (argc == 4)
+        {
+            if (std::string(argv[2]) != "--history-sweeps")
+            {
+                std::cerr << usage;
+                return 2;
+            }
+            std::size_t parsedCharacters = 0;
+            historySweeps = std::stoi(argv[3], &parsedCharacters);
+            if (parsedCharacters != std::string(argv[3]).size()
+                || historySweeps < 1 || historySweeps > 10000)
+            {
+                throw std::runtime_error
+                (
+                    "history sweep count must be in the range [1, 10000]"
+                );
+            }
+        }
+        return runTest(argv[1], historySweeps);
     }
     catch (const std::exception& error)
     {
-        std::cerr << "Test-GaussSeidel: " << error.what() << '\n';
+        std::cerr << "FAIL: " << error.what() << '\n';
         return 1;
     }
 }
