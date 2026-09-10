@@ -247,59 +247,131 @@ WavefrontSchedule makeWavefrontSchedule(const PolyMeshTopology& mesh)
     return schedule;
 }
 
-void wavefrontSmooth
+inline void updateGatherCell
 (
+    const label cell,
     scalarField& psi,
     const lduMatrix& matrix,
     const scalarField& source,
-    const WavefrontSchedule& schedule,
-    const label nSweeps,
-    const bool parallel
+    const WavefrontSchedule& schedule
 )
 {
+    // Parallel access classification: matrix, source, and schedule are
+    // read-only; psii and indices are private; psi[cell] is the only write.
+    // Neighbouring psi entries are reads, and same-level cells have no
+    // dependency edges, so iterations within one level cannot conflict.
     const auto& ownerStarts = matrix.lduAddr().ownerStartAddr();
     const auto& neighbours = matrix.lduAddr().upperAddr();
     const scalarField& diag = matrix.diag();
     const scalarField& upper = matrix.upper();
     const scalarField& lower = matrix.lower();
 
+    scalar psii = source[cell];
+    for
+    (
+        label in=schedule.incomingStarts[cell];
+        in<schedule.incomingStarts[cell + 1];
+        ++in
+    )
+    {
+        const label face = schedule.incomingFaces[in];
+        psii -= lower[face]*psi[schedule.faceOwners[face]];
+    }
+    for
+    (
+        label face=ownerStarts[cell];
+        face<ownerStarts[cell + 1];
+        ++face
+    )
+    {
+        psii -= upper[face]*psi[neighbours[face]];
+    }
+    psi[cell] = psii/diag[cell];
+}
+
+void serialGatherSmooth
+(
+    scalarField& psi,
+    const lduMatrix& matrix,
+    const scalarField& source,
+    const WavefrontSchedule& schedule,
+    const label nSweeps
+)
+{
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+        for (const std::vector<label>& levelCells : schedule.cellsByLevel)
+            for (const label cell : levelCells)
+                updateGatherCell(cell, psi, matrix, source, schedule);
+}
+
+void perLevelOpenMpSmooth
+(
+    scalarField& psi,
+    const lduMatrix& matrix,
+    const scalarField& source,
+    const WavefrontSchedule& schedule,
+    const label nSweeps,
+    int& detectedThreads
+)
+{
     for (label sweep=0; sweep<nSweeps; ++sweep)
     {
-        for (const std::vector<label>& levelCells : schedule.cellsByLevel)
+        for (std::size_t level=0; level<schedule.cellsByLevel.size(); ++level)
         {
-            // Access classification inside the loop:
-            // read-only: matrix arrays, source, addressing, schedule;
-            // private: cell, psii, loop indices;
-            // write: psi[cell] only;
-            // neighbour access: psi[owner/neighbour] is read-only.
-            #pragma omp parallel for if(parallel) schedule(static)
-            for (std::size_t index=0; index<levelCells.size(); ++index)
+            const std::vector<label>& levelCells = schedule.cellsByLevel[level];
+            // This intentionally creates a new OpenMP team for every level.
+            #pragma omp parallel
             {
-                const label cell = levelCells[index];
-                scalar psii = source[cell];
+                #pragma omp single
+                {
+                    if (sweep == 0 && level == 0)
+                        detectedThreads = omp_get_num_threads();
+                }
+                #pragma omp for schedule(static)
+                for (std::size_t index=0; index<levelCells.size(); ++index)
+                {
+                    updateGatherCell
+                    (
+                        levelCells[index], psi, matrix, source, schedule
+                    );
+                }
+            }
+        }
+    }
+}
 
-                for
-                (
-                    label in=schedule.incomingStarts[cell];
-                    in<schedule.incomingStarts[cell + 1];
-                    ++in
-                )
+void persistentOpenMpSmooth
+(
+    scalarField& psi,
+    const lduMatrix& matrix,
+    const scalarField& source,
+    const WavefrontSchedule& schedule,
+    const label nSweeps,
+    int& detectedThreads
+)
+{
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        // One team per sweep. Each omp-for barrier orders consecutive levels.
+        #pragma omp parallel
+        {
+            #pragma omp single
+            {
+                if (sweep == 0) detectedThreads = omp_get_num_threads();
+            }
+
+            for (std::size_t level=0; level<schedule.cellsByLevel.size(); ++level)
+            {
+                const std::vector<label>& levelCells = schedule.cellsByLevel[level];
+                #pragma omp for schedule(static)
+                for (std::size_t index=0; index<levelCells.size(); ++index)
                 {
-                    const label face = schedule.incomingFaces[in];
-                    // owner is the dependency for this incoming face.
-                    const label owner = schedule.faceOwners[face];
-                    psii -= lower[face]*psi[owner];
+                    updateGatherCell
+                    (
+                        levelCells[index], psi, matrix, source, schedule
+                    );
                 }
-                for
-                (
-                    label face=ownerStarts[cell];
-                    face<ownerStarts[cell + 1];
-                    ++face
-                )
-                {
-                    psii -= upper[face]*psi[neighbours[face]];
-                }
-                psi[cell] = psii/diag[cell];
+                // No nowait: the implicit barrier is a dependency barrier.
             }
         }
     }
@@ -363,17 +435,6 @@ std::pair<scalar, scalar> l2Differences
     return {l2, l2/std::max(std::sqrt(squaredReference), 1e-300)};
 }
 
-int openMpThreadCount()
-{
-    int count = 1;
-    #pragma omp parallel
-    {
-        #pragma omp single
-        count = omp_get_num_threads();
-    }
-    return count;
-}
-
 scalar fractionInLevelsAtLeast
 (
     const std::vector<std::size_t>& widths,
@@ -433,33 +494,90 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         "psi", psiReference, matrix, source,
         interfaceCoeffs, interfaces, 0, 1
     );
-    scalarField psiWavefront = initialPsi;
-    wavefrontSmooth(psiWavefront, matrix, source, schedule, 1, true);
+    scalarField psiSerialGather = initialPsi;
+    serialGatherSmooth(psiSerialGather, matrix, source, schedule, 1);
+    int perLevelThreads = 1;
+    scalarField psiPerLevel = initialPsi;
+    perLevelOpenMpSmooth
+    (
+        psiPerLevel, matrix, source, schedule, 1, perLevelThreads
+    );
+    int persistentThreads = 1;
+    scalarField psiPersistent = initialPsi;
+    persistentOpenMpSmooth
+    (
+        psiPersistent, matrix, source, schedule, 1, persistentThreads
+    );
 
-    const scalar equivalenceMaxAbs =
-        maxAbsDifference(psiReference, psiWavefront);
-    const auto [equivalenceL2, equivalenceRelativeL2] =
-        l2Differences(psiReference, psiWavefront);
-    const scalar sequentialOneSweepResidual =
+    const scalar serialGatherMaxAbs =
+        maxAbsDifference(psiReference, psiSerialGather);
+    const scalar perLevelMaxAbs =
+        maxAbsDifference(psiReference, psiPerLevel);
+    const scalar persistentMaxAbs =
+        maxAbsDifference(psiReference, psiPersistent);
+    const auto [serialGatherL2, serialGatherRelativeL2] =
+        l2Differences(psiReference, psiSerialGather);
+    const auto [perLevelL2, perLevelRelativeL2] =
+        l2Differences(psiReference, psiPerLevel);
+    const auto [persistentL2, persistentRelativeL2] =
+        l2Differences(psiReference, psiPersistent);
+
+    const scalar referenceOneSweepResidual =
         relativeResidual(matrix, psiReference, source);
-    const scalar wavefrontOneSweepResidual =
-        relativeResidual(matrix, psiWavefront, source);
-    const scalar oneSweepResidualDifference =
-        std::abs(sequentialOneSweepResidual - wavefrontOneSweepResidual);
+    const scalar serialGatherResidual =
+        relativeResidual(matrix, psiSerialGather, source);
+    const scalar perLevelResidual =
+        relativeResidual(matrix, psiPerLevel, source);
+    const scalar persistentResidual =
+        relativeResidual(matrix, psiPersistent, source);
 
     constexpr scalar equivalenceTolerance = 1e-12;
+    const auto status = [&](const scalar difference)
+    {
+        return difference <= equivalenceTolerance ? "PASS" : "FAIL";
+    };
     std::cout << "motorBike cells: " << mesh.nCells
         << "\ninternal faces: " << mesh.nInternalFaces()
-        << "\n\nOne-sweep equivalence:"
-        << "\nmax abs difference: " << equivalenceMaxAbs
-        << "\nL2 difference: " << equivalenceL2
-        << "\nrelative L2 difference: " << equivalenceRelativeL2
-        << "\nSequential one-sweep residual: " << sequentialOneSweepResidual
-        << "\nWavefront  one-sweep residual: " << wavefrontOneSweepResidual
-        << "\nResidual difference: " << oneSweepResidualDifference
-        << "\nequivalence tolerance: " << equivalenceTolerance << "\n\n";
-    if (equivalenceMaxAbs > equivalenceTolerance)
+        << "\n\nOne-sweep correctness:"
+        << "\nReference GS residual:          " << referenceOneSweepResidual
+        << "\nSerial gather residual:         " << serialGatherResidual
+        << "\nPer-level OpenMP residual:      " << perLevelResidual
+        << "\nPersistent OpenMP residual:     " << persistentResidual
+        << "\nSerial gather residual difference:     "
+        << std::abs(referenceOneSweepResidual - serialGatherResidual)
+        << "\nPer-level OMP residual difference:     "
+        << std::abs(referenceOneSweepResidual - perLevelResidual)
+        << "\nPersistent OMP residual difference:    "
+        << std::abs(referenceOneSweepResidual - persistentResidual)
+        << "\n\nmax |reference - serial gather|:  " << serialGatherMaxAbs
+        << "\nmax |reference - per-level OMP|:  " << perLevelMaxAbs
+        << "\nmax |reference - persistent OMP|: " << persistentMaxAbs
+        << "\n\nserial gather L2 / relative L2:  "
+        << serialGatherL2 << " / " << serialGatherRelativeL2
+        << "\nper-level OMP L2 / relative L2:  "
+        << perLevelL2 << " / " << perLevelRelativeL2
+        << "\npersistent OMP L2 / relative L2: "
+        << persistentL2 << " / " << persistentRelativeL2
+        << "\n\nserial gather exact equality:    "
+        << (serialGatherMaxAbs == 0 ? "PASS" : "NO")
+        << "\nper-level OMP exact equality:    "
+        << (perLevelMaxAbs == 0 ? "PASS" : "NO")
+        << "\npersistent OMP exact equality:   "
+        << (persistentMaxAbs == 0 ? "PASS" : "NO")
+        << "\nserial gather equivalence:       " << status(serialGatherMaxAbs)
+        << "\nper-level OMP equivalence:       " << status(perLevelMaxAbs)
+        << "\npersistent OMP equivalence:      " << status(persistentMaxAbs)
+        << "\nequivalence tolerance:           " << equivalenceTolerance
+        << "\n\n";
+    if
+    (
+        serialGatherMaxAbs > equivalenceTolerance
+     || perLevelMaxAbs > equivalenceTolerance
+     || persistentMaxAbs > equivalenceTolerance
+    )
+    {
         throw std::runtime_error("one-sweep wavefront equivalence check failed");
+    }
 
     constexpr label timingRepetitions = 20;
     const ImplementationTiming sequentialTiming = timeSweepImplementation
@@ -474,15 +592,36 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
             );
         }
     );
-    const ImplementationTiming wavefrontTiming = timeSweepImplementation
+    const ImplementationTiming serialGatherTiming = timeSweepImplementation
     (
         initialPsi, mesh.nCells, timingRepetitions,
         [&](scalarField& timedPsi)
         {
-            wavefrontSmooth(timedPsi, matrix, source, schedule, 1, true);
+            serialGatherSmooth(timedPsi, matrix, source, schedule, 1);
         }
     );
-    const int openMpThreads = openMpThreadCount();
+    const ImplementationTiming perLevelTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingRepetitions,
+        [&](scalarField& timedPsi)
+        {
+            perLevelOpenMpSmooth
+            (
+                timedPsi, matrix, source, schedule, 1, perLevelThreads
+            );
+        }
+    );
+    const ImplementationTiming persistentTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingRepetitions,
+        [&](scalarField& timedPsi)
+        {
+            persistentOpenMpSmooth
+            (
+                timedPsi, matrix, source, schedule, 1, persistentThreads
+            );
+        }
+    );
 
     scalarField psi = initialPsi;
     const SweepMeasurements measurements = measureSweeps
@@ -602,18 +741,46 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     std::cout << "Wavefront widths:\n";
     for (std::size_t level=0; level<wavefronts.widths.size(); ++level)
         std::cout << "level " << level << ": " << wavefronts.widths[level] << '\n';
+    const scalar gatherSlowdown =
+        serialGatherTiming.averageSeconds/sequentialTiming.averageSeconds;
+    const scalar perLevelSpeedupGather =
+        serialGatherTiming.averageSeconds/perLevelTiming.averageSeconds;
+    const scalar perLevelSpeedupReference =
+        sequentialTiming.averageSeconds/perLevelTiming.averageSeconds;
+    const scalar persistentSpeedupGather =
+        serialGatherTiming.averageSeconds/persistentTiming.averageSeconds;
+    const scalar persistentSpeedupReference =
+        sequentialTiming.averageSeconds/persistentTiming.averageSeconds;
+    const scalar persistentVsPerLevel =
+        perLevelTiming.averageSeconds/persistentTiming.averageSeconds;
+
     std::cout << "dependency validation: PASS\n"
-        << "\nIsolated implementation timing (" << timingRepetitions
-        << " repetitions):"
-        << "\nSequential GS:"
-        << "\n  average sweep time: " << sequentialTiming.averageSeconds << " s"
+        << "\nPerformance (" << timingRepetitions << " repetitions):"
+        << "\nReference sequential GS:"
+        << "\n  avg sweep time: " << sequentialTiming.averageSeconds << " s"
         << "\n  ns/cell/sweep: " << sequentialTiming.nsPerCellSweep
-        << "\nWavefront GS:"
-        << "\n  threads: " << openMpThreads
-        << "\n  average sweep time: " << wavefrontTiming.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << wavefrontTiming.nsPerCellSweep
-        << "\n  speedup vs sequential: "
-        << sequentialTiming.averageSeconds/wavefrontTiming.averageSeconds << '\n'
+        << "\nSerial gather GS:"
+        << "\n  avg sweep time: " << serialGatherTiming.averageSeconds << " s"
+        << "\n  ns/cell/sweep: " << serialGatherTiming.nsPerCellSweep
+        << "\n  slowdown vs reference: " << gatherSlowdown << "x"
+        << "\nWavefront, per-level OpenMP:"
+        << "\n  threads: " << perLevelThreads
+        << "\n  avg sweep time: " << perLevelTiming.averageSeconds << " s"
+        << "\n  ns/cell/sweep: " << perLevelTiming.nsPerCellSweep
+        << "\n  speedup vs serial gather: " << perLevelSpeedupGather << "x"
+        << "\n  speedup vs reference: " << perLevelSpeedupReference << "x"
+        << "\nWavefront, persistent OpenMP:"
+        << "\n  threads: " << persistentThreads
+        << "\n  avg sweep time: " << persistentTiming.averageSeconds << " s"
+        << "\n  ns/cell/sweep: " << persistentTiming.nsPerCellSweep
+        << "\n  speedup vs serial gather: " << persistentSpeedupGather << "x"
+        << "\n  speedup vs reference: " << persistentSpeedupReference << "x"
+        << "\n  speedup vs per-level OpenMP: " << persistentVsPerLevel << "x"
+        << "\nRESULT variant=persistent threads=" << persistentThreads
+        << " time=" << persistentTiming.averageSeconds
+        << " nsPerCell=" << persistentTiming.nsPerCellSweep
+        << " speedupGather=" << persistentSpeedupGather
+        << " speedupRef=" << persistentSpeedupReference << '\n'
         << "\ncorrectness sweeps: " << executedCorrectnessSweeps
         << "\nfinal residual: " << final
         << "\nmaximum error: " << maxError << '\n';
