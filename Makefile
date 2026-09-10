@@ -14,6 +14,7 @@ SMOOTHER_TARGET := build/Test-GaussSeidel
 READER_TARGET := build/Test-PolyMeshReader
 COMMON_OBJECTS := build/src/PolyMeshReader.o
 SMOOTHER_OBJECTS := build/src/GaussSeidelSmoother.o \
+    build/src/WavefrontGaussSeidel.o \
     build/tests/Test-GaussSeidel.o $(COMMON_OBJECTS)
 READER_OBJECTS := build/tests/Test-PolyMeshReader.o $(COMMON_OBJECTS)
 OBJECTS := $(sort $(SMOOTHER_OBJECTS) $(READER_OBJECTS))

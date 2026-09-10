@@ -4,6 +4,7 @@
 
 #include "GaussSeidelSmoother.H"
 #include "PolyMeshReader.H"
+#include "WavefrontGaussSeidel.H"
 
 #include <algorithm>
 #include <chrono>
@@ -18,6 +19,10 @@
 using namespace Foam;
 using smootherTest::PolyMeshReader;
 using smootherTest::PolyMeshTopology;
+using smootherTest::WavefrontSchedule;
+using smootherTest::perLevelOpenMpSmooth;
+using smootherTest::persistentOpenMpSmooth;
+using smootherTest::serialGatherSmooth;
 
 namespace
 {
@@ -140,15 +145,6 @@ struct WavefrontStatistics
     std::size_t p95Width = 0;
 };
 
-struct WavefrontSchedule
-{
-    WavefrontStatistics statistics;
-    std::vector<std::vector<label>> cellsByLevel;
-    std::vector<label> incomingStarts;
-    std::vector<label> incomingFaces;
-    std::vector<label> faceOwners;
-};
-
 std::size_t percentile
 (
     const std::vector<std::size_t>& sortedValues,
@@ -216,13 +212,16 @@ WavefrontStatistics constructWavefronts(const PolyMeshTopology& mesh)
     return result;
 }
 
-WavefrontSchedule makeWavefrontSchedule(const PolyMeshTopology& mesh)
+WavefrontSchedule makeWavefrontSchedule
+(
+    const PolyMeshTopology& mesh,
+    const WavefrontStatistics& statistics
+)
 {
     WavefrontSchedule schedule;
-    schedule.statistics = constructWavefronts(mesh);
-    schedule.cellsByLevel.resize(schedule.statistics.widths.size());
+    schedule.cellsByLevel.resize(statistics.widths.size());
     for (label cell=0; cell<label(mesh.nCells); ++cell)
-        schedule.cellsByLevel[schedule.statistics.levels[cell]].push_back(cell);
+        schedule.cellsByLevel[statistics.levels[cell]].push_back(cell);
 
     // Incoming-face CSR enables a race-free gather of contributions from
     // already updated lower-index cells. Filling in global face order preserves
@@ -234,147 +233,16 @@ WavefrontSchedule makeWavefrontSchedule(const PolyMeshTopology& mesh)
         schedule.incomingStarts[cell + 1] += schedule.incomingStarts[cell];
 
     schedule.incomingFaces.resize(mesh.nInternalFaces());
-    schedule.faceOwners.assign
-    (
-        mesh.owner.begin(), mesh.owner.begin() + mesh.nInternalFaces()
-    );
+    schedule.incomingOwners.resize(mesh.nInternalFaces());
     std::vector<label> cursor = schedule.incomingStarts;
     for (label face=0; face<label(mesh.nInternalFaces()); ++face)
     {
         const label neighbour = mesh.neighbour[face];
-        schedule.incomingFaces[cursor[neighbour]++] = face;
+        const label incoming = cursor[neighbour]++;
+        schedule.incomingFaces[incoming] = face;
+        schedule.incomingOwners[incoming] = mesh.owner[face];
     }
     return schedule;
-}
-
-inline void updateGatherCell
-(
-    const label cell,
-    scalarField& psi,
-    const lduMatrix& matrix,
-    const scalarField& source,
-    const WavefrontSchedule& schedule
-)
-{
-    // Parallel access classification: matrix, source, and schedule are
-    // read-only; psii and indices are private; psi[cell] is the only write.
-    // Neighbouring psi entries are reads, and same-level cells have no
-    // dependency edges, so iterations within one level cannot conflict.
-    const auto& ownerStarts = matrix.lduAddr().ownerStartAddr();
-    const auto& neighbours = matrix.lduAddr().upperAddr();
-    const scalarField& diag = matrix.diag();
-    const scalarField& upper = matrix.upper();
-    const scalarField& lower = matrix.lower();
-
-    scalar psii = source[cell];
-    for
-    (
-        label in=schedule.incomingStarts[cell];
-        in<schedule.incomingStarts[cell + 1];
-        ++in
-    )
-    {
-        const label face = schedule.incomingFaces[in];
-        psii -= lower[face]*psi[schedule.faceOwners[face]];
-    }
-    for
-    (
-        label face=ownerStarts[cell];
-        face<ownerStarts[cell + 1];
-        ++face
-    )
-    {
-        psii -= upper[face]*psi[neighbours[face]];
-    }
-    psi[cell] = psii/diag[cell];
-}
-
-void serialGatherSmooth
-(
-    scalarField& psi,
-    const lduMatrix& matrix,
-    const scalarField& source,
-    const WavefrontSchedule& schedule,
-    const label nSweeps
-)
-{
-    for (label sweep=0; sweep<nSweeps; ++sweep)
-        for (const std::vector<label>& levelCells : schedule.cellsByLevel)
-            for (const label cell : levelCells)
-                updateGatherCell(cell, psi, matrix, source, schedule);
-}
-
-void perLevelOpenMpSmooth
-(
-    scalarField& psi,
-    const lduMatrix& matrix,
-    const scalarField& source,
-    const WavefrontSchedule& schedule,
-    const label nSweeps,
-    int& detectedThreads
-)
-{
-    for (label sweep=0; sweep<nSweeps; ++sweep)
-    {
-        for (std::size_t level=0; level<schedule.cellsByLevel.size(); ++level)
-        {
-            const std::vector<label>& levelCells = schedule.cellsByLevel[level];
-            // This intentionally creates a new OpenMP team for every level.
-            #pragma omp parallel
-            {
-                #pragma omp single
-                {
-                    if (sweep == 0 && level == 0)
-                        detectedThreads = omp_get_num_threads();
-                }
-                #pragma omp for schedule(static)
-                for (std::size_t index=0; index<levelCells.size(); ++index)
-                {
-                    updateGatherCell
-                    (
-                        levelCells[index], psi, matrix, source, schedule
-                    );
-                }
-            }
-        }
-    }
-}
-
-void persistentOpenMpSmooth
-(
-    scalarField& psi,
-    const lduMatrix& matrix,
-    const scalarField& source,
-    const WavefrontSchedule& schedule,
-    const label nSweeps,
-    int& detectedThreads
-)
-{
-    for (label sweep=0; sweep<nSweeps; ++sweep)
-    {
-        // One team per sweep. Each omp-for barrier orders consecutive levels.
-        #pragma omp parallel
-        {
-            #pragma omp single
-            {
-                if (sweep == 0) detectedThreads = omp_get_num_threads();
-            }
-
-            for (std::size_t level=0; level<schedule.cellsByLevel.size(); ++level)
-            {
-                const std::vector<label>& levelCells = schedule.cellsByLevel[level];
-                #pragma omp for schedule(static)
-                for (std::size_t index=0; index<levelCells.size(); ++index)
-                {
-                    updateGatherCell
-                    (
-                        levelCells[index], psi, matrix, source, schedule
-                    );
-                }
-                // No nowait: the implicit barrier is a dependency barrier.
-            }
-        }
-    }
 }
 
 struct ImplementationTiming
@@ -485,7 +353,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     FieldField<Field, scalar> interfaceCoeffs(0);
     lduInterfaceFieldPtrsList interfaces(0);
 
-    const WavefrontSchedule schedule = makeWavefrontSchedule(mesh);
+    // Level and incoming-CSR preprocessing is completed once, before any
+    // timed sweep. The benchmark measures only consumption of this schedule.
+    const WavefrontStatistics wavefronts = constructWavefronts(mesh);
+    const WavefrontSchedule schedule = makeWavefrontSchedule(mesh, wavefronts);
     const scalarField initialPsi(exact.size(), 0.0);
 
     scalarField psiReference = initialPsi;
@@ -649,7 +520,6 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     for (label i=0; i<label(psi.size()); ++i)
         maxError = std::max(maxError, std::abs(psi[i] - exact[i]));
 
-    const WavefrontStatistics& wavefronts = schedule.statistics;
     const std::size_t totalLevelCells =
         std::accumulate
         (
