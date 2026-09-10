@@ -28,6 +28,24 @@ void serialGatherSmooth
 
 bool avx512GatherAvailable();
 
+bool avx2GatherAvailable();
+
+void serialGatherAvx2Smooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
+void serialGatherAvx2AcrossRowsSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
 void serialGatherAvx512Smooth
 (
     Foam::scalarField& psi,
