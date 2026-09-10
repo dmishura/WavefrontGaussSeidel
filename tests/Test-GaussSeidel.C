@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <omp.h>
 #include <stdexcept>
 #include <vector>
 
@@ -139,6 +140,15 @@ struct WavefrontStatistics
     std::size_t p95Width = 0;
 };
 
+struct WavefrontSchedule
+{
+    WavefrontStatistics statistics;
+    std::vector<std::vector<label>> cellsByLevel;
+    std::vector<label> incomingStarts;
+    std::vector<label> incomingFaces;
+    std::vector<label> faceOwners;
+};
+
 std::size_t percentile
 (
     const std::vector<std::size_t>& sortedValues,
@@ -206,6 +216,177 @@ WavefrontStatistics constructWavefronts(const PolyMeshTopology& mesh)
     return result;
 }
 
+WavefrontSchedule makeWavefrontSchedule(const PolyMeshTopology& mesh)
+{
+    WavefrontSchedule schedule;
+    schedule.statistics = constructWavefronts(mesh);
+    schedule.cellsByLevel.resize(schedule.statistics.widths.size());
+    for (label cell=0; cell<label(mesh.nCells); ++cell)
+        schedule.cellsByLevel[schedule.statistics.levels[cell]].push_back(cell);
+
+    // Incoming-face CSR enables a race-free gather of contributions from
+    // already updated lower-index cells. Filling in global face order preserves
+    // the subtraction order used by the reference scatter implementation.
+    schedule.incomingStarts.assign(mesh.nCells + 1, 0);
+    for (const int neighbour : mesh.neighbour)
+        ++schedule.incomingStarts[static_cast<std::size_t>(neighbour) + 1];
+    for (std::size_t cell=0; cell<mesh.nCells; ++cell)
+        schedule.incomingStarts[cell + 1] += schedule.incomingStarts[cell];
+
+    schedule.incomingFaces.resize(mesh.nInternalFaces());
+    schedule.faceOwners.assign
+    (
+        mesh.owner.begin(), mesh.owner.begin() + mesh.nInternalFaces()
+    );
+    std::vector<label> cursor = schedule.incomingStarts;
+    for (label face=0; face<label(mesh.nInternalFaces()); ++face)
+    {
+        const label neighbour = mesh.neighbour[face];
+        schedule.incomingFaces[cursor[neighbour]++] = face;
+    }
+    return schedule;
+}
+
+void wavefrontSmooth
+(
+    scalarField& psi,
+    const lduMatrix& matrix,
+    const scalarField& source,
+    const WavefrontSchedule& schedule,
+    const label nSweeps,
+    const bool parallel
+)
+{
+    const auto& ownerStarts = matrix.lduAddr().ownerStartAddr();
+    const auto& neighbours = matrix.lduAddr().upperAddr();
+    const scalarField& diag = matrix.diag();
+    const scalarField& upper = matrix.upper();
+    const scalarField& lower = matrix.lower();
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (const std::vector<label>& levelCells : schedule.cellsByLevel)
+        {
+            // Access classification inside the loop:
+            // read-only: matrix arrays, source, addressing, schedule;
+            // private: cell, psii, loop indices;
+            // write: psi[cell] only;
+            // neighbour access: psi[owner/neighbour] is read-only.
+            #pragma omp parallel for if(parallel) schedule(static)
+            for (std::size_t index=0; index<levelCells.size(); ++index)
+            {
+                const label cell = levelCells[index];
+                scalar psii = source[cell];
+
+                for
+                (
+                    label in=schedule.incomingStarts[cell];
+                    in<schedule.incomingStarts[cell + 1];
+                    ++in
+                )
+                {
+                    const label face = schedule.incomingFaces[in];
+                    // owner is the dependency for this incoming face.
+                    const label owner = schedule.faceOwners[face];
+                    psii -= lower[face]*psi[owner];
+                }
+                for
+                (
+                    label face=ownerStarts[cell];
+                    face<ownerStarts[cell + 1];
+                    ++face
+                )
+                {
+                    psii -= upper[face]*psi[neighbours[face]];
+                }
+                psi[cell] = psii/diag[cell];
+            }
+        }
+    }
+}
+
+struct ImplementationTiming
+{
+    scalar averageSeconds = 0;
+    scalar nsPerCellSweep = 0;
+};
+
+template<class SweepFunction>
+ImplementationTiming timeSweepImplementation
+(
+    const scalarField& initialPsi,
+    const std::size_t nCells,
+    const label repetitions,
+    SweepFunction&& executeOneSweep
+)
+{
+    scalar totalSeconds = 0;
+    scalarField psi(initialPsi.size());
+    for (label repetition=0; repetition<repetitions; ++repetition)
+    {
+        // Restoring input state is deliberately outside the timed interval.
+        psi = initialPsi;
+        const auto begin = std::chrono::steady_clock::now();
+        executeOneSweep(psi);
+        const auto end = std::chrono::steady_clock::now();
+        totalSeconds += std::chrono::duration<scalar>(end - begin).count();
+    }
+    ImplementationTiming result;
+    result.averageSeconds = totalSeconds/repetitions;
+    result.nsPerCellSweep = 1e9*result.averageSeconds/nCells;
+    return result;
+}
+
+scalar maxAbsDifference(const scalarField& a, const scalarField& b)
+{
+    scalar result = 0;
+    for (label i=0; i<label(a.size()); ++i)
+        result = std::max(result, std::abs(a[i] - b[i]));
+    return result;
+}
+
+std::pair<scalar, scalar> l2Differences
+(
+    const scalarField& reference,
+    const scalarField& candidate
+)
+{
+    scalar squaredDifference = 0;
+    scalar squaredReference = 0;
+    for (label i=0; i<label(reference.size()); ++i)
+    {
+        const scalar difference = reference[i] - candidate[i];
+        squaredDifference += difference*difference;
+        squaredReference += reference[i]*reference[i];
+    }
+    const scalar l2 = std::sqrt(squaredDifference);
+    return {l2, l2/std::max(std::sqrt(squaredReference), 1e-300)};
+}
+
+int openMpThreadCount()
+{
+    int count = 1;
+    #pragma omp parallel
+    {
+        #pragma omp single
+        count = omp_get_num_threads();
+    }
+    return count;
+}
+
+scalar fractionInLevelsAtLeast
+(
+    const std::vector<std::size_t>& widths,
+    const std::size_t threshold,
+    const std::size_t nCells
+)
+{
+    std::size_t cells = 0;
+    for (const std::size_t width : widths)
+        if (width >= threshold) cells += width;
+    return scalar(cells)/nCells;
+}
+
 void printLevelWidths
 (
     const char* labelText,
@@ -238,12 +419,72 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
             + 0.1*std::cos(10.0*M_PI*position);
     }
     const scalarField source = multiply(matrix, exact);
-    scalarField psi(exact.size(), 0.0);
 
     // Serial placeholders for coupled/MPI interface data.
     FieldField<Field, scalar> interfaceCoeffs(0);
     lduInterfaceFieldPtrsList interfaces(0);
 
+    const WavefrontSchedule schedule = makeWavefrontSchedule(mesh);
+    const scalarField initialPsi(exact.size(), 0.0);
+
+    scalarField psiReference = initialPsi;
+    GaussSeidelSmoother::smooth
+    (
+        "psi", psiReference, matrix, source,
+        interfaceCoeffs, interfaces, 0, 1
+    );
+    scalarField psiWavefront = initialPsi;
+    wavefrontSmooth(psiWavefront, matrix, source, schedule, 1, true);
+
+    const scalar equivalenceMaxAbs =
+        maxAbsDifference(psiReference, psiWavefront);
+    const auto [equivalenceL2, equivalenceRelativeL2] =
+        l2Differences(psiReference, psiWavefront);
+    const scalar sequentialOneSweepResidual =
+        relativeResidual(matrix, psiReference, source);
+    const scalar wavefrontOneSweepResidual =
+        relativeResidual(matrix, psiWavefront, source);
+    const scalar oneSweepResidualDifference =
+        std::abs(sequentialOneSweepResidual - wavefrontOneSweepResidual);
+
+    constexpr scalar equivalenceTolerance = 1e-12;
+    std::cout << "motorBike cells: " << mesh.nCells
+        << "\ninternal faces: " << mesh.nInternalFaces()
+        << "\n\nOne-sweep equivalence:"
+        << "\nmax abs difference: " << equivalenceMaxAbs
+        << "\nL2 difference: " << equivalenceL2
+        << "\nrelative L2 difference: " << equivalenceRelativeL2
+        << "\nSequential one-sweep residual: " << sequentialOneSweepResidual
+        << "\nWavefront  one-sweep residual: " << wavefrontOneSweepResidual
+        << "\nResidual difference: " << oneSweepResidualDifference
+        << "\nequivalence tolerance: " << equivalenceTolerance << "\n\n";
+    if (equivalenceMaxAbs > equivalenceTolerance)
+        throw std::runtime_error("one-sweep wavefront equivalence check failed");
+
+    constexpr label timingRepetitions = 20;
+    const ImplementationTiming sequentialTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingRepetitions,
+        [&](scalarField& timedPsi)
+        {
+            GaussSeidelSmoother::smooth
+            (
+                "psi", timedPsi, matrix, source,
+                interfaceCoeffs, interfaces, 0, 1
+            );
+        }
+    );
+    const ImplementationTiming wavefrontTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingRepetitions,
+        [&](scalarField& timedPsi)
+        {
+            wavefrontSmooth(timedPsi, matrix, source, schedule, 1, true);
+        }
+    );
+    const int openMpThreads = openMpThreadCount();
+
+    scalarField psi = initialPsi;
     const SweepMeasurements measurements = measureSweeps
     (
         psi, matrix, source, historySweeps, interfaceCoeffs, interfaces
@@ -269,7 +510,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     for (label i=0; i<label(psi.size()); ++i)
         maxError = std::max(maxError, std::abs(psi[i] - exact[i]));
 
-    const WavefrontStatistics wavefronts = constructWavefronts(mesh);
+    const WavefrontStatistics& wavefronts = schedule.statistics;
     const std::size_t totalLevelCells =
         std::accumulate
         (
@@ -291,9 +532,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         measurements.residuals.back()/measurements.residuals.front()
     )/totalSeconds;
 
-    std::cout << "motorBike cells: " << mesh.nCells
-        << "\ninternal faces: " << mesh.nInternalFaces()
-        << "\ninitial residual: " << initial
+    std::cout << "initial residual: " << initial
         << "\none-sweep residual: " << afterOne << "\n\n";
 
     std::cout << "Residual history (first " << historySweeps
@@ -343,7 +582,16 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmedian width: " << wavefronts.medianWidth
         << "\np90 width: " << wavefronts.p90Width
         << "\np95 width: " << wavefronts.p95Width
-        << "\nmax width: " << wavefronts.maximumWidth << '\n';
+        << "\nmax width: " << wavefronts.maximumWidth
+        << "\naverage available parallelism: " << wavefronts.meanWidth
+        << "\nfraction in levels with width >= 2: "
+        << fractionInLevelsAtLeast(wavefronts.widths, 2, mesh.nCells)
+        << "\nfraction in levels with width >= 4: "
+        << fractionInLevelsAtLeast(wavefronts.widths, 4, mesh.nCells)
+        << "\nfraction in levels with width >= 8: "
+        << fractionInLevelsAtLeast(wavefronts.widths, 8, mesh.nCells)
+        << "\nfraction in levels with width >= 16: "
+        << fractionInLevelsAtLeast(wavefronts.widths, 16, mesh.nCells) << '\n';
     const std::size_t shown = std::min<std::size_t>(10, wavefronts.widths.size());
     printLevelWidths("first levels: ", wavefronts.widths, 0, shown);
     printLevelWidths
@@ -351,7 +599,21 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         "last levels: ", wavefronts.widths,
         wavefronts.widths.size() - shown, wavefronts.widths.size()
     );
+    std::cout << "Wavefront widths:\n";
+    for (std::size_t level=0; level<wavefronts.widths.size(); ++level)
+        std::cout << "level " << level << ": " << wavefronts.widths[level] << '\n';
     std::cout << "dependency validation: PASS\n"
+        << "\nIsolated implementation timing (" << timingRepetitions
+        << " repetitions):"
+        << "\nSequential GS:"
+        << "\n  average sweep time: " << sequentialTiming.averageSeconds << " s"
+        << "\n  ns/cell/sweep: " << sequentialTiming.nsPerCellSweep
+        << "\nWavefront GS:"
+        << "\n  threads: " << openMpThreads
+        << "\n  average sweep time: " << wavefrontTiming.averageSeconds << " s"
+        << "\n  ns/cell/sweep: " << wavefrontTiming.nsPerCellSweep
+        << "\n  speedup vs sequential: "
+        << sequentialTiming.averageSeconds/wavefrontTiming.averageSeconds << '\n'
         << "\ncorrectness sweeps: " << executedCorrectnessSweeps
         << "\nfinal residual: " << final
         << "\nmaximum error: " << maxError << '\n';

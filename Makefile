@@ -1,6 +1,6 @@
 CXX ?= c++
 CXXFLAGS ?= -O2 -g
-CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -Icompat -Isrc
+CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -fopenmp -Icompat -Isrc
 HISTORY_SWEEPS ?= 20
 
 OPENFOAM_DIR ?= ../OpenFOAM-14
