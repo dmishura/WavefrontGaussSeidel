@@ -37,22 +37,12 @@ void serialGatherSmooth
             {
                 const label cell = cells[index];
                 scalar psii = source[cell];
-                for
-                (
-                    label in=incomingStarts[cell];
-                    in<incomingStarts[cell + 1];
-                    ++in
-                )
+                for ( label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
                 {
                     const label face = incomingFaces[in];
                     psii -= lower[face]*psi[incomingOwners[in]];
                 }
-                for
-                (
-                    label face=ownerStarts[cell];
-                    face<ownerStarts[cell + 1];
-                    ++face
-                )
+                for ( label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
                 {
                     psii -= upper[face]*psi[neighbours[face]];
                 }
@@ -102,22 +92,12 @@ void perLevelOpenMpSmooth
                 {
                     const label cell = cells[index];
                     scalar psii = source[cell];
-                    for
-                    (
-                        label in=incomingStarts[cell];
-                        in<incomingStarts[cell + 1];
-                        ++in
-                    )
+                    for ( label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
                     {
                         const label face = incomingFaces[in];
                         psii -= lower[face]*psi[incomingOwners[in]];
                     }
-                    for
-                    (
-                        label face=ownerStarts[cell];
-                        face<ownerStarts[cell + 1];
-                        ++face
-                    )
+                    for ( label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
                     {
                         psii -= upper[face]*psi[neighbours[face]];
                     }
@@ -168,22 +148,12 @@ void persistentOpenMpSmooth
                 {
                     const label cell = cells[index];
                     scalar psii = source[cell];
-                    for
-                    (
-                        label in=incomingStarts[cell];
-                        in<incomingStarts[cell + 1];
-                        ++in
-                    )
+                    for ( label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
                     {
                         const label face = incomingFaces[in];
                         psii -= lower[face]*psi[incomingOwners[in]];
                     }
-                    for
-                    (
-                        label face=ownerStarts[cell];
-                        face<ownerStarts[cell + 1];
-                        ++face
-                    )
+                    for ( label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
                     {
                         psii -= upper[face]*psi[neighbours[face]];
                     }
