@@ -117,51 +117,48 @@ void serialGatherAvx512AcrossRowsSmooth
             const label levelEnd = levelStarts[level + 1];
             for (label firstRow=levelStarts[level]; firstRow<levelEnd; firstRow += 8)
             {
-                const unsigned rows = static_cast<unsigned>(levelEnd - firstRow);
-                const __mmask8 rowMask = rows >= 8
+                const label rows = std::min<label>(8, levelEnd - firstRow);
+                const __mmask8 rowMask = rows == 8
                     ? __mmask8(0xff)
                     : __mmask8((1u << rows) - 1u);
-                const __m256i cells =
-                    _mm256_maskz_loadu_epi32(rowMask, waveCells + firstRow);
-                const __m256i starts =
-                    _mm256_maskz_loadu_epi32(rowMask, rowStarts + firstRow);
-                const __m256i ends =
-                    _mm256_maskz_loadu_epi32(rowMask, rowStarts + firstRow + 1);
-                const __m256i lengths = _mm256_sub_epi32(ends, starts);
-                __m512d psii = _mm512_mask_i32gather_pd
-                (
-                    _mm512_setzero_pd(), rowMask, cells, source, sizeof(scalar)
-                );
+                alignas(64) label cells[8]{};
+                alignas(64) label starts[8]{};
+                alignas(64) label lengths[8]{};
+                alignas(64) scalar sourceLanes[8]{};
+                alignas(64) scalar coefficientLanes[8]{};
+                alignas(64) scalar neighbourLanes[8]{};
+                alignas(64) scalar resultLanes[8]{};
+                label maxLength = 0;
+                // Irregular sparse accesses are deliberately ordinary scalar
+                // loads/stores. AVX-512 is used only for the lane accumulators.
+                for (label lane=0; lane<rows; ++lane)
+                {
+                    const label row = firstRow + lane;
+                    cells[lane] = waveCells[row];
+                    starts[lane] = rowStarts[row];
+                    lengths[lane] = rowStarts[row + 1] - starts[lane];
+                    sourceLanes[lane] = source[cells[lane]];
+                    maxLength = std::max(maxLength, lengths[lane]);
+                }
+                __m512d psii = _mm512_load_pd(sourceLanes);
                 const __m512d diagonal =
                     _mm512_maskz_loadu_pd(rowMask, diag + firstRow);
 
-                const label maxLength = _mm512_mask_reduce_max_epi32
-                (
-                    __mmask16(rowMask), _mm512_zextsi256_si512(lengths)
-                );
                 for (label k=0; k<maxLength; ++k)
                 {
-                    const __mmask8 active = rowMask & _mm256_cmp_epi32_mask
-                    (
-                        lengths, _mm256_set1_epi32(k), _MM_CMPINT_GT
-                    );
-                    const __m256i positions =
-                        _mm256_add_epi32(starts, _mm256_set1_epi32(k));
-                    const __m512d coefficient = _mm512_mask_i32gather_pd
-                    (
-                        _mm512_setzero_pd(), active, positions,
-                        coeffs, sizeof(scalar)
-                    );
-                    const __m256i columns = _mm256_mmask_i32gather_epi32
-                    (
-                        _mm256_setzero_si256(), active, positions,
-                        cols, sizeof(label)
-                    );
-                    const __m512d neighbour = _mm512_mask_i32gather_pd
-                    (
-                        _mm512_setzero_pd(), active, columns,
-                        psi, sizeof(scalar)
-                    );
+                    __mmask8 active = 0;
+                    for (label lane=0; lane<rows; ++lane)
+                    {
+                        if (k >= lengths[lane]) continue;
+                        const label p = starts[lane] + k;
+                        coefficientLanes[lane] = coeffs[p];
+                        neighbourLanes[lane] = psi[cols[p]];
+                        active |= __mmask8(1u << lane);
+                    }
+                    const __m512d coefficient =
+                        _mm512_maskz_load_pd(active, coefficientLanes);
+                    const __m512d neighbour =
+                        _mm512_maskz_load_pd(active, neighbourLanes);
                     psii = _mm512_mask_sub_pd
                     (
                         psii, active, psii,
@@ -172,10 +169,9 @@ void serialGatherAvx512AcrossRowsSmooth
                 (
                     rowMask, psii, diagonal
                 );
-                _mm512_mask_i32scatter_pd
-                (
-                    psi, rowMask, cells, result, sizeof(scalar)
-                );
+                _mm512_store_pd(resultLanes, result);
+                for (label lane=0; lane<rows; ++lane)
+                    psi[cells[lane]] = resultLanes[lane];
             }
         }
     }
