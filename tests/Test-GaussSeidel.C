@@ -293,8 +293,14 @@ WavefrontSchedule makeWavefrontSchedule
 
 struct ImplementationTiming
 {
-    scalar averageSeconds = 0;
-    scalar nsPerCellSweep = 0;
+    label samples = 0;
+    label sweepsPerSample = 0;
+    scalar minimumSeconds = 0;
+    scalar medianSeconds = 0;
+    scalar meanSeconds = 0;
+    scalar stddevSeconds = 0;
+    scalar cvPercent = 0;
+    scalar medianNsPerCellSweep = 0;
 };
 
 template<class SweepFunction>
@@ -302,25 +308,68 @@ ImplementationTiming timeSweepImplementation
 (
     const scalarField& initialPsi,
     const std::size_t nCells,
-    const label repetitions,
-    SweepFunction&& executeOneSweep
+    const label samples,
+    const label sweepsPerSample,
+    const label warmupSweeps,
+    SweepFunction&& executeSweeps
 )
 {
-    scalar totalSeconds = 0;
+    scalarField warmupPsi = initialPsi;
+    executeSweeps(warmupPsi, warmupSweeps);
+
+    std::vector<scalar> secondsPerSweep;
+    secondsPerSweep.reserve(samples);
     scalarField psi(initialPsi.size());
-    for (label repetition=0; repetition<repetitions; ++repetition)
+    for (label sample=0; sample<samples; ++sample)
     {
-        // Restoring input state is deliberately outside the timed interval.
+        // Sample initialization is deliberately outside the timed interval.
         psi = initialPsi;
         const auto begin = std::chrono::steady_clock::now();
-        executeOneSweep(psi);
+        executeSweeps(psi, sweepsPerSample);
         const auto end = std::chrono::steady_clock::now();
-        totalSeconds += std::chrono::duration<scalar>(end - begin).count();
+        secondsPerSweep.push_back
+        (
+            std::chrono::duration<scalar>(end - begin).count()/sweepsPerSample
+        );
     }
+
+    std::vector<scalar> sorted = secondsPerSweep;
+    std::sort(sorted.begin(), sorted.end());
     ImplementationTiming result;
-    result.averageSeconds = totalSeconds/repetitions;
-    result.nsPerCellSweep = 1e9*result.averageSeconds/nCells;
+    result.samples = samples;
+    result.sweepsPerSample = sweepsPerSample;
+    result.minimumSeconds = sorted.front();
+    result.medianSeconds = sorted[sorted.size()/2];
+    result.meanSeconds = std::accumulate
+    (
+        secondsPerSweep.begin(), secondsPerSweep.end(), scalar(0)
+    )/samples;
+    scalar squaredDeviation = 0;
+    for (const scalar seconds : secondsPerSweep)
+    {
+        const scalar deviation = seconds - result.meanSeconds;
+        squaredDeviation += deviation*deviation;
+    }
+    result.stddevSeconds = std::sqrt(squaredDeviation/samples);
+    result.cvPercent = 100*result.stddevSeconds/result.meanSeconds;
+    result.medianNsPerCellSweep = 1e9*result.medianSeconds/nCells;
     return result;
+}
+
+void printTiming(const char* variant, const ImplementationTiming& timing)
+{
+    std::cout << "\nVariant: " << variant
+        << "\n  samples: " << timing.samples
+        << "\n  sweeps/sample: " << timing.sweepsPerSample
+        << "\n  min: " << timing.minimumSeconds << " s/sweep"
+        << "\n  median: " << timing.medianSeconds << " s/sweep"
+        << "\n  mean: " << timing.meanSeconds << " s/sweep"
+        << "\n  stddev: " << timing.stddevSeconds << " s/sweep"
+        << "\n  CV: " << timing.cvPercent << " %"
+        << "\n  median sample duration: "
+        << timing.medianSeconds*timing.sweepsPerSample << " s"
+        << "\n  median ns/cell/sweep: "
+        << timing.medianNsPerCellSweep << '\n';
 }
 
 scalar maxAbsDifference(const scalarField& a, const scalarField& b)
@@ -651,81 +700,86 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         throw std::runtime_error("one-sweep wavefront equivalence check failed");
     }
 
-    constexpr label timingRepetitions = 20;
+    constexpr label timingSamples = 7;
+    constexpr label timingSweepsPerSample = 250;
+    constexpr label warmupSweeps = 10;
     const ImplementationTiming sequentialTiming = timeSweepImplementation
     (
-        initialPsi, mesh.nCells, timingRepetitions,
-        [&](scalarField& timedPsi)
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
             GaussSeidelSmoother::smooth
             (
                 "psi", timedPsi, matrix, source,
-                interfaceCoeffs, interfaces, 0, 1
+                interfaceCoeffs, interfaces, 0, nSweeps
             );
         }
     );
     const ImplementationTiming serialGatherTiming = timeSweepImplementation
     (
-        initialPsi, mesh.nCells, timingRepetitions,
-        [&](scalarField& timedPsi)
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
-            serialGatherSmooth(timedPsi, source, schedule, 1);
+            serialGatherSmooth(timedPsi, source, schedule, nSweeps);
         }
     );
     const ImplementationTiming avx2Timing = timeSweepImplementation
     (
-        initialPsi, mesh.nCells, timingRepetitions,
-        [&](scalarField& timedPsi)
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
-            serialGatherAvx2Smooth(timedPsi, source, schedule, 1);
+            serialGatherAvx2Smooth(timedPsi, source, schedule, nSweeps);
         }
     );
     const ImplementationTiming avx2AcrossRowsTiming = timeSweepImplementation
     (
-        initialPsi, mesh.nCells, timingRepetitions,
-        [&](scalarField& timedPsi)
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
-            serialGatherAvx2AcrossRowsSmooth(timedPsi, source, schedule, 1);
+            serialGatherAvx2AcrossRowsSmooth
+            (
+                timedPsi, source, schedule, nSweeps
+            );
         }
     );
     const ImplementationTiming avx512Timing = timeSweepImplementation
     (
-        initialPsi, mesh.nCells, timingRepetitions,
-        [&](scalarField& timedPsi)
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
-            serialGatherAvx512Smooth(timedPsi, source, schedule, 1);
+            serialGatherAvx512Smooth(timedPsi, source, schedule, nSweeps);
         }
     );
     const ImplementationTiming avx512AcrossRowsTiming = timeSweepImplementation
     (
-        initialPsi, mesh.nCells, timingRepetitions,
-        [&](scalarField& timedPsi)
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
             serialGatherAvx512AcrossRowsSmooth
             (
-                timedPsi, source, schedule, 1
+                timedPsi, source, schedule, nSweeps
             );
         }
     );
     const ImplementationTiming perLevelTiming = timeSweepImplementation
     (
-        initialPsi, mesh.nCells, timingRepetitions,
-        [&](scalarField& timedPsi)
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
             perLevelOpenMpSmooth
             (
-                timedPsi, source, schedule, 1, perLevelThreads
+                timedPsi, source, schedule, nSweeps, perLevelThreads
             );
         }
     );
     const ImplementationTiming persistentTiming = timeSweepImplementation
     (
-        initialPsi, mesh.nCells, timingRepetitions,
-        [&](scalarField& timedPsi)
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
             persistentOpenMpSmooth
             (
-                timedPsi, source, schedule, 1, persistentThreads
+                timedPsi, source, schedule, nSweeps, persistentThreads
             );
         }
     );
@@ -811,7 +865,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     std::cout.flags(oldFlags);
     std::cout.precision(oldPrecision);
 
-    std::cout << "\nSweep performance:\n"
+    std::cout << "\nResidual-history reference timing "
+        << "(diagnostic, not used for comparisons):\n"
         << "history/timed sweeps: " << historySweeps
         << "\ntotal sweep time: " << totalSeconds << " s"
         << "\naverage sweep time: " << averageSeconds << " s"
@@ -858,96 +913,77 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     for (std::size_t level=0; level<wavefronts.widths.size(); ++level)
         std::cout << "level " << level << ": " << wavefronts.widths[level] << '\n';
     const scalar gatherSlowdown =
-        serialGatherTiming.averageSeconds/sequentialTiming.averageSeconds;
+        serialGatherTiming.medianSeconds/sequentialTiming.medianSeconds;
     const scalar avx2SpeedupScalar =
-        serialGatherTiming.averageSeconds/avx2Timing.averageSeconds;
+        serialGatherTiming.medianSeconds/avx2Timing.medianSeconds;
     const scalar avx2SpeedupReference =
-        sequentialTiming.averageSeconds/avx2Timing.averageSeconds;
+        sequentialTiming.medianSeconds/avx2Timing.medianSeconds;
     const scalar avx2AcrossRowsSpeedupScalar =
-        serialGatherTiming.averageSeconds/avx2AcrossRowsTiming.averageSeconds;
+        serialGatherTiming.medianSeconds/avx2AcrossRowsTiming.medianSeconds;
     const scalar avx2AcrossRowsSpeedupReference =
-        sequentialTiming.averageSeconds/avx2AcrossRowsTiming.averageSeconds;
+        sequentialTiming.medianSeconds/avx2AcrossRowsTiming.medianSeconds;
     const scalar avx2AcrossRowsSpeedupIntra =
-        avx2Timing.averageSeconds/avx2AcrossRowsTiming.averageSeconds;
+        avx2Timing.medianSeconds/avx2AcrossRowsTiming.medianSeconds;
     const scalar avx512SpeedupScalar =
-        serialGatherTiming.averageSeconds/avx512Timing.averageSeconds;
+        serialGatherTiming.medianSeconds/avx512Timing.medianSeconds;
     const scalar avx512SpeedupReference =
-        sequentialTiming.averageSeconds/avx512Timing.averageSeconds;
+        sequentialTiming.medianSeconds/avx512Timing.medianSeconds;
     const scalar avx512AcrossRowsSpeedupScalar =
-        serialGatherTiming.averageSeconds
-       /avx512AcrossRowsTiming.averageSeconds;
+        serialGatherTiming.medianSeconds
+       /avx512AcrossRowsTiming.medianSeconds;
     const scalar avx512AcrossRowsSpeedupReference =
-        sequentialTiming.averageSeconds
-       /avx512AcrossRowsTiming.averageSeconds;
+        sequentialTiming.medianSeconds
+       /avx512AcrossRowsTiming.medianSeconds;
     const scalar avx512AcrossRowsSpeedupIntra =
-        avx512Timing.averageSeconds
-       /avx512AcrossRowsTiming.averageSeconds;
+        avx512Timing.medianSeconds
+       /avx512AcrossRowsTiming.medianSeconds;
     const scalar perLevelSpeedupGather =
-        serialGatherTiming.averageSeconds/perLevelTiming.averageSeconds;
+        serialGatherTiming.medianSeconds/perLevelTiming.medianSeconds;
     const scalar perLevelSpeedupReference =
-        sequentialTiming.averageSeconds/perLevelTiming.averageSeconds;
+        sequentialTiming.medianSeconds/perLevelTiming.medianSeconds;
     const scalar persistentSpeedupGather =
-        serialGatherTiming.averageSeconds/persistentTiming.averageSeconds;
+        serialGatherTiming.medianSeconds/persistentTiming.medianSeconds;
     const scalar persistentSpeedupReference =
-        sequentialTiming.averageSeconds/persistentTiming.averageSeconds;
+        sequentialTiming.medianSeconds/persistentTiming.medianSeconds;
     const scalar persistentVsPerLevel =
-        perLevelTiming.averageSeconds/persistentTiming.averageSeconds;
+        perLevelTiming.medianSeconds/persistentTiming.medianSeconds;
 
     std::cout << "dependency validation: PASS\n"
-        << "\nPerformance (" << timingRepetitions << " repetitions):"
-        << "\nReference sequential GS:"
-        << "\n  avg sweep time: " << sequentialTiming.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << sequentialTiming.nsPerCellSweep
-        << "\nSerial gather GS:"
-        << "\n  avg sweep time: " << serialGatherTiming.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << serialGatherTiming.nsPerCellSweep
-        << "\n  slowdown vs reference: " << gatherSlowdown << "x"
-        << "\nSerial packed AVX2:"
-        << "\n  available: " << (avx2Available ? "YES" : "NO (scalar fallback)")
-        << "\n  avg sweep time: " << avx2Timing.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << avx2Timing.nsPerCellSweep
-        << "\n  speedup vs serial packed scalar: " << avx2SpeedupScalar << "x"
-        << "\n  speedup vs reference: " << avx2SpeedupReference << "x"
-        << "\nSerial packed AVX2 across rows:"
-        << "\n  available: " << (avx2Available ? "YES" : "NO (scalar fallback)")
-        << "\n  avg sweep time: " << avx2AcrossRowsTiming.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << avx2AcrossRowsTiming.nsPerCellSweep
-        << "\n  speedup vs serial packed scalar: "
-        << avx2AcrossRowsSpeedupScalar << "x"
-        << "\n  speedup vs reference: " << avx2AcrossRowsSpeedupReference << "x"
-        << "\n  speedup vs AVX2 intra-row: " << avx2AcrossRowsSpeedupIntra << "x"
-        << "\nSerial packed AVX-512:"
-        << "\n  available: " << (avx512Available ? "YES" : "NO (scalar fallback)")
-        << "\n  avg sweep time: " << avx512Timing.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << avx512Timing.nsPerCellSweep
-        << "\n  speedup vs serial packed scalar: " << avx512SpeedupScalar << "x"
-        << "\n  speedup vs reference: " << avx512SpeedupReference << "x"
-        << "\nSerial packed AVX-512 across rows:"
-        << "\n  available: " << (avx512Available ? "YES" : "NO (scalar fallback)")
-        << "\n  avg sweep time: " << avx512AcrossRowsTiming.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << avx512AcrossRowsTiming.nsPerCellSweep
-        << "\n  speedup vs serial packed scalar: "
-        << avx512AcrossRowsSpeedupScalar << "x"
-        << "\n  speedup vs reference: "
-        << avx512AcrossRowsSpeedupReference << "x"
-        << "\n  speedup vs AVX-512 intra-row: "
+        << "\nStable performance benchmark:"
+        << "\n  warm-up sweeps per variant: " << warmupSweeps
+        << "\n  OpenMP threads detected: " << persistentThreads
+        << "\n  primary comparison statistic: median\n";
+    printTiming("Reference sequential GS", sequentialTiming);
+    printTiming("Serial packed scalar", serialGatherTiming);
+    printTiming("Serial packed AVX2", avx2Timing);
+    printTiming("Serial packed AVX2 across rows", avx2AcrossRowsTiming);
+    printTiming("Serial packed AVX-512", avx512Timing);
+    printTiming("Serial packed AVX-512 across rows", avx512AcrossRowsTiming);
+    printTiming("Wavefront per-level OpenMP", perLevelTiming);
+    printTiming("Wavefront persistent OpenMP", persistentTiming);
+
+    std::cout << "\nMedian-based comparisons:"
+        << "\n  serial packed slowdown vs reference: " << gatherSlowdown << "x"
+        << "\n  AVX2 speedup vs scalar/reference: "
+        << avx2SpeedupScalar << "x / " << avx2SpeedupReference << "x"
+        << "\n  AVX2 rows speedup vs scalar/reference/intra-row: "
+        << avx2AcrossRowsSpeedupScalar << "x / "
+        << avx2AcrossRowsSpeedupReference << "x / "
+        << avx2AcrossRowsSpeedupIntra << "x"
+        << "\n  AVX-512 speedup vs scalar/reference: "
+        << avx512SpeedupScalar << "x / " << avx512SpeedupReference << "x"
+        << "\n  AVX-512 rows speedup vs scalar/reference/intra-row: "
+        << avx512AcrossRowsSpeedupScalar << "x / "
+        << avx512AcrossRowsSpeedupReference << "x / "
         << avx512AcrossRowsSpeedupIntra << "x"
-        << "\nWavefront, per-level OpenMP:"
-        << "\n  threads: " << perLevelThreads
-        << "\n  avg sweep time: " << perLevelTiming.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << perLevelTiming.nsPerCellSweep
-        << "\n  speedup vs serial gather: " << perLevelSpeedupGather << "x"
-        << "\n  speedup vs reference: " << perLevelSpeedupReference << "x"
-        << "\nWavefront, persistent OpenMP:"
-        << "\n  threads: " << persistentThreads
-        << "\n  avg sweep time: " << persistentTiming.averageSeconds << " s"
-        << "\n  ns/cell/sweep: " << persistentTiming.nsPerCellSweep
-        << "\n  speedup vs serial gather: " << persistentSpeedupGather << "x"
-        << "\n  speedup vs reference: " << persistentSpeedupReference << "x"
-        << "\n  speedup vs per-level OpenMP: " << persistentVsPerLevel << "x"
+        << "\n  per-level OMP speedup vs scalar/reference: "
+        << perLevelSpeedupGather << "x / " << perLevelSpeedupReference << "x"
+        << "\n  persistent OMP speedup vs scalar/reference/per-level: "
+        << persistentSpeedupGather << "x / "
+        << persistentSpeedupReference << "x / " << persistentVsPerLevel << "x"
         << "\nRESULT variant=persistent threads=" << persistentThreads
-        << " time=" << persistentTiming.averageSeconds
-        << " nsPerCell=" << persistentTiming.nsPerCellSweep
+        << " medianTime=" << persistentTiming.medianSeconds
+        << " medianNsPerCell=" << persistentTiming.medianNsPerCellSweep
         << " speedupGather=" << persistentSpeedupGather
         << " speedupRef=" << persistentSpeedupReference << '\n'
         << "\ncorrectness sweeps: " << executedCorrectnessSweeps
