@@ -263,6 +263,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         );
     }
     const scalar final = relativeResidual(matrix, psi, source);
+    const label executedCorrectnessSweeps =
+        std::max(historySweeps, totalCorrectnessSweeps);
     scalar maxError = 0;
     for (label i=0; i<label(psi.size()); ++i)
         maxError = std::max(maxError, std::abs(psi[i] - exact[i]));
@@ -294,7 +296,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\ninitial residual: " << initial
         << "\none-sweep residual: " << afterOne << "\n\n";
 
-    std::cout << "Residual history:\n"
+    std::cout << "Residual history (first " << historySweeps
+        << " individually timed sweeps):\n"
         << "sweep   residual        ratio           effective-factor\n";
     const auto oldFlags = std::cout.flags();
     const auto oldPrecision = std::cout.precision();
@@ -325,7 +328,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     std::cout.precision(oldPrecision);
 
     std::cout << "\nSweep performance:\n"
-        << "sweeps: " << historySweeps
+        << "history/timed sweeps: " << historySweeps
         << "\ntotal sweep time: " << totalSeconds << " s"
         << "\naverage sweep time: " << averageSeconds << " s"
         << "\nns/cell/sweep: " << nsPerCellSweep
@@ -349,6 +352,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         wavefronts.widths.size() - shown, wavefronts.widths.size()
     );
     std::cout << "dependency validation: PASS\n"
+        << "\ncorrectness sweeps: " << executedCorrectnessSweeps
         << "\nfinal residual: " << final
         << "\nmaximum error: " << maxError << '\n';
     if (final > 1e-10 || maxError > 1e-10)
