@@ -291,6 +291,71 @@ WavefrontSchedule makeWavefrontSchedule
     return schedule;
 }
 
+WavefrontSchedule makeLocalityReorderedSchedule
+(
+    const WavefrontSchedule& original
+)
+{
+    WavefrontSchedule reordered;
+    reordered.levelStarts = original.levelStarts;
+    reordered.waveCells.reserve(original.waveCells.size());
+    reordered.rowStarts.reserve(original.rowStarts.size());
+    reordered.cols.reserve(original.cols.size());
+    reordered.coeffs.reserve(original.coeffs.size());
+    reordered.diag.reserve(original.diag.size());
+    reordered.rowStarts.push_back(0);
+
+    for (std::size_t level=0; level + 1<original.levelStarts.size(); ++level)
+    {
+        std::vector<label> rows;
+        for (label row=original.levelStarts[level]; row<original.levelStarts[level + 1]; ++row)
+        {
+            rows.push_back(row);
+        }
+        const auto localityKey = [&](const label row)
+        {
+            long long sum = 0;
+            const label begin = original.rowStarts[row];
+            const label end = original.rowStarts[row + 1];
+            for (label p=begin; p<end; ++p) sum += original.cols[p];
+            return end == begin ? static_cast<long long>(original.waveCells[row])
+                : sum/(end - begin);
+        };
+        std::stable_sort
+        (
+            rows.begin(), rows.end(), [&](const label a, const label b)
+            {
+                const long long keyA = localityKey(a);
+                const long long keyB = localityKey(b);
+                return keyA == keyB
+                    ? original.waveCells[a] < original.waveCells[b]
+                    : keyA < keyB;
+            }
+        );
+
+        for (const label row : rows)
+        {
+            reordered.waveCells.push_back(original.waveCells[row]);
+            reordered.diag.push_back(original.diag[row]);
+            std::vector<std::pair<label, scalar>> contributions;
+            for (label p=original.rowStarts[row]; p<original.rowStarts[row + 1]; ++p)
+                contributions.emplace_back(original.cols[p], original.coeffs[p]);
+            std::stable_sort
+            (
+                contributions.begin(), contributions.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; }
+            );
+            for (const auto& [column, coefficient] : contributions)
+            {
+                reordered.cols.push_back(column);
+                reordered.coeffs.push_back(coefficient);
+            }
+            reordered.rowStarts.push_back(reordered.cols.size());
+        }
+    }
+    return reordered;
+}
+
 struct ImplementationTiming
 {
     label samples = 0;
@@ -516,6 +581,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const WavefrontStatistics wavefronts = constructWavefronts(mesh);
     const WavefrontSchedule schedule =
         makeWavefrontSchedule(mesh, matrix, wavefronts);
+    const WavefrontSchedule localitySchedule =
+        makeLocalityReorderedSchedule(schedule);
     const auto preprocessingEnd = std::chrono::steady_clock::now();
     const scalar preprocessingSeconds =
         std::chrono::duration<scalar>
@@ -531,6 +598,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     );
     scalarField psiSerialGather = initialPsi;
     serialGatherSmooth(psiSerialGather, source, schedule, 1);
+    scalarField psiLocality = initialPsi;
+    serialGatherSmooth(psiLocality, source, localitySchedule, 1);
     const bool avx512Available = avx512GatherAvailable();
     const bool avx2Available = avx2GatherAvailable();
     scalarField psiAvx2 = initialPsi;
@@ -559,6 +628,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
 
     const scalar serialGatherMaxAbs =
         maxAbsDifference(psiReference, psiSerialGather);
+    const scalar localityMaxAbs = maxAbsDifference(psiReference, psiLocality);
     const scalar avx512MaxAbs = maxAbsDifference(psiReference, psiAvx512);
     const scalar avx2MaxAbs = maxAbsDifference(psiReference, psiAvx2);
     const scalar avx2AcrossRowsMaxAbs =
@@ -571,6 +641,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         maxAbsDifference(psiReference, psiPersistent);
     const auto [serialGatherL2, serialGatherRelativeL2] =
         l2Differences(psiReference, psiSerialGather);
+    const auto [localityL2, localityRelativeL2] =
+        l2Differences(psiReference, psiLocality);
     const auto [avx512L2, avx512RelativeL2] =
         l2Differences(psiReference, psiAvx512);
     const auto [avx2L2, avx2RelativeL2] =
@@ -588,6 +660,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         relativeResidual(matrix, psiReference, source);
     const scalar serialGatherResidual =
         relativeResidual(matrix, psiSerialGather, source);
+    const scalar localityResidual = relativeResidual(matrix, psiLocality, source);
     const scalar avx512Residual = relativeResidual(matrix, psiAvx512, source);
     const scalar avx2Residual = relativeResidual(matrix, psiAvx2, source);
     const scalar avx2AcrossRowsResidual =
@@ -606,6 +679,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::abs(referenceOneSweepResidual - avx2AcrossRowsResidual);
     const scalar avx512AcrossRowsResidualDifference =
         std::abs(referenceOneSweepResidual - avx512AcrossRowsResidual);
+    const scalar localityResidualDifference =
+        std::abs(referenceOneSweepResidual - localityResidual);
 
     constexpr scalar equivalenceTolerance = 1e-12;
     const auto status = [&](const scalar difference)
@@ -617,6 +692,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n\nOne-sweep correctness:"
         << "\nReference GS residual:          " << referenceOneSweepResidual
         << "\nSerial gather residual:         " << serialGatherResidual
+        << "\nLocality-reordered residual:    " << localityResidual
         << "\nSerial packed AVX2 residual:    " << avx2Residual
         << "\nAVX2 across-rows residual:      " << avx2AcrossRowsResidual
         << "\nSerial packed AVX-512 residual: " << avx512Residual
@@ -625,6 +701,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nPersistent OpenMP residual:     " << persistentResidual
         << "\nSerial gather residual difference:     "
         << std::abs(referenceOneSweepResidual - serialGatherResidual)
+        << "\nLocality-reordered residual difference: "
+        << localityResidualDifference
         << "\nAVX-512 residual difference:           "
         << avx512ResidualDifference
         << "\nAVX2 residual difference:              "
@@ -638,6 +716,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nPersistent OMP residual difference:    "
         << std::abs(referenceOneSweepResidual - persistentResidual)
         << "\n\nmax |reference - serial gather|:  " << serialGatherMaxAbs
+        << "\nmax |reference - locality|:       " << localityMaxAbs
         << "\nmax |reference - AVX-512|:        " << avx512MaxAbs
         << "\nmax |reference - AVX2|:           " << avx2MaxAbs
         << "\nmax |reference - AVX2 rows|:      " << avx2AcrossRowsMaxAbs
@@ -646,6 +725,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmax |reference - persistent OMP|: " << persistentMaxAbs
         << "\n\nserial gather L2 / relative L2:  "
         << serialGatherL2 << " / " << serialGatherRelativeL2
+        << "\nlocality L2 / relative L2:       "
+        << localityL2 << " / " << localityRelativeL2
         << "\nAVX-512 L2 / relative L2:        "
         << avx512L2 << " / " << avx512RelativeL2
         << "\nAVX2 L2 / relative L2:           "
@@ -669,6 +750,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\npersistent OMP exact equality:   "
         << (persistentMaxAbs == 0 ? "PASS" : "NO")
         << "\nserial gather equivalence:       " << status(serialGatherMaxAbs)
+        << "\nlocality-reordered equivalence:  " << status(localityMaxAbs)
         << "\nAVX-512 equivalence:             " << status(avx512MaxAbs)
         << "\nAVX2 equivalence:                " << status(avx2MaxAbs)
         << "\nAVX2 across-rows equivalence:    " << status(avx2AcrossRowsMaxAbs)
@@ -685,6 +767,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     if
     (
         serialGatherMaxAbs > equivalenceTolerance
+     || localityMaxAbs > equivalenceTolerance
+     || localityResidualDifference > equivalenceTolerance
      || avx2MaxAbs > equivalenceTolerance
      || avx2ResidualDifference > equivalenceTolerance
      || avx2AcrossRowsMaxAbs > equivalenceTolerance
@@ -721,6 +805,17 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
         {
             serialGatherSmooth(timedPsi, source, schedule, nSweeps);
+        }
+    );
+    const ImplementationTiming localityTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
+        {
+            serialGatherSmooth
+            (
+                timedPsi, source, localitySchedule, nSweeps
+            );
         }
     );
     const ImplementationTiming avx2Timing = timeSweepImplementation
@@ -914,6 +1009,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::cout << "level " << level << ": " << wavefronts.widths[level] << '\n';
     const scalar gatherSlowdown =
         serialGatherTiming.medianSeconds/sequentialTiming.medianSeconds;
+    const scalar localitySpeedupScalar =
+        serialGatherTiming.medianSeconds/localityTiming.medianSeconds;
+    const scalar localitySpeedupReference =
+        sequentialTiming.medianSeconds/localityTiming.medianSeconds;
     const scalar avx2SpeedupScalar =
         serialGatherTiming.medianSeconds/avx2Timing.medianSeconds;
     const scalar avx2SpeedupReference =
@@ -955,6 +1054,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  primary comparison statistic: median\n";
     printTiming("Reference sequential GS", sequentialTiming);
     printTiming("Serial packed scalar", serialGatherTiming);
+    printTiming("Serial packed locality-reordered", localityTiming);
     printTiming("Serial packed AVX2", avx2Timing);
     printTiming("Serial packed AVX2 across rows", avx2AcrossRowsTiming);
     printTiming("Serial packed AVX-512", avx512Timing);
@@ -964,6 +1064,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
 
     std::cout << "\nMedian-based comparisons:"
         << "\n  serial packed slowdown vs reference: " << gatherSlowdown << "x"
+        << "\n  locality-reordered speedup vs scalar/reference: "
+        << localitySpeedupScalar << "x / " << localitySpeedupReference << "x"
         << "\n  AVX2 speedup vs scalar/reference: "
         << avx2SpeedupScalar << "x / " << avx2SpeedupReference << "x"
         << "\n  AVX2 rows speedup vs scalar/reference/intra-row: "
