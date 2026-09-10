@@ -2,6 +2,7 @@ CXX ?= c++
 CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -fopenmp -Icompat -Isrc
 HISTORY_SWEEPS ?= 20
+AVX512_FLAGS ?= -mavx512f -mavx512vl
 
 OPENFOAM_DIR ?= ../OpenFOAM-14
 GS_DIR := $(OPENFOAM_DIR)/src/OpenFOAM/matrices/lduMatrix/smoothers/GaussSeidel
@@ -15,6 +16,7 @@ READER_TARGET := build/Test-PolyMeshReader
 COMMON_OBJECTS := build/src/PolyMeshReader.o
 SMOOTHER_OBJECTS := build/src/GaussSeidelSmoother.o \
     build/src/WavefrontGaussSeidel.o \
+    build/src/WavefrontGaussSeidelAVX512.o \
     build/tests/Test-GaussSeidel.o $(COMMON_OBJECTS)
 READER_OBJECTS := build/tests/Test-PolyMeshReader.o $(COMMON_OBJECTS)
 OBJECTS := $(sort $(SMOOTHER_OBJECTS) $(READER_OBJECTS))
@@ -45,6 +47,10 @@ $(MESH_STAMP): $(MESH_ARCHIVE)
 build/%.o: %.C
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+build/src/WavefrontGaussSeidelAVX512.o: src/WavefrontGaussSeidelAVX512.C
+	mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(AVX512_FLAGS) -MMD -MP -c $< -o $@
 
 # Replace both files with pristine OpenFOAM sources.  OPENFOAM_DIR may point
 # at another checkout/version; the compatibility layer is intentionally local.

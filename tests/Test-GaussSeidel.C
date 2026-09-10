@@ -20,8 +20,10 @@ using namespace Foam;
 using smootherTest::PolyMeshReader;
 using smootherTest::PolyMeshTopology;
 using smootherTest::WavefrontSchedule;
+using smootherTest::avx512GatherAvailable;
 using smootherTest::perLevelOpenMpSmooth;
 using smootherTest::persistentOpenMpSmooth;
+using smootherTest::serialGatherAvx512Smooth;
 using smootherTest::serialGatherSmooth;
 
 namespace
@@ -356,6 +358,41 @@ scalar fractionInLevelsAtLeast
     return scalar(cells)/nCells;
 }
 
+struct RowLengthStatistics
+{
+    scalar mean = 0;
+    scalar median = 0;
+    label maximum = 0;
+    scalar fractionAtMost8 = 0;
+    scalar fractionAtMost16 = 0;
+};
+
+RowLengthStatistics rowLengthStatistics(const WavefrontSchedule& schedule)
+{
+    std::vector<label> lengths(schedule.waveCells.size());
+    std::size_t atMost8 = 0;
+    std::size_t atMost16 = 0;
+    std::size_t total = 0;
+    for (std::size_t row=0; row<lengths.size(); ++row)
+    {
+        lengths[row] = schedule.rowStarts[row + 1] - schedule.rowStarts[row];
+        total += lengths[row];
+        if (lengths[row] <= 8) ++atMost8;
+        if (lengths[row] <= 16) ++atMost16;
+    }
+    std::sort(lengths.begin(), lengths.end());
+    const std::size_t middle = lengths.size()/2;
+    RowLengthStatistics result;
+    result.mean = scalar(total)/lengths.size();
+    result.median = lengths.size() % 2
+        ? scalar(lengths[middle])
+        : 0.5*scalar(lengths[middle - 1] + lengths[middle]);
+    result.maximum = lengths.back();
+    result.fractionAtMost8 = scalar(atMost8)/lengths.size();
+    result.fractionAtMost16 = scalar(atMost16)/lengths.size();
+    return result;
+}
+
 void printLevelWidths
 (
     const char* labelText,
@@ -403,6 +440,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar preprocessingSeconds =
         std::chrono::duration<scalar>
         (preprocessingEnd - preprocessingBegin).count();
+    const RowLengthStatistics rowLengths = rowLengthStatistics(schedule);
     const scalarField initialPsi(exact.size(), 0.0);
 
     scalarField psiReference = initialPsi;
@@ -413,6 +451,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     );
     scalarField psiSerialGather = initialPsi;
     serialGatherSmooth(psiSerialGather, source, schedule, 1);
+    const bool avx512Available = avx512GatherAvailable();
+    scalarField psiAvx512 = initialPsi;
+    serialGatherAvx512Smooth(psiAvx512, source, schedule, 1);
     int perLevelThreads = 1;
     scalarField psiPerLevel = initialPsi;
     perLevelOpenMpSmooth
@@ -428,12 +469,15 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
 
     const scalar serialGatherMaxAbs =
         maxAbsDifference(psiReference, psiSerialGather);
+    const scalar avx512MaxAbs = maxAbsDifference(psiReference, psiAvx512);
     const scalar perLevelMaxAbs =
         maxAbsDifference(psiReference, psiPerLevel);
     const scalar persistentMaxAbs =
         maxAbsDifference(psiReference, psiPersistent);
     const auto [serialGatherL2, serialGatherRelativeL2] =
         l2Differences(psiReference, psiSerialGather);
+    const auto [avx512L2, avx512RelativeL2] =
+        l2Differences(psiReference, psiAvx512);
     const auto [perLevelL2, perLevelRelativeL2] =
         l2Differences(psiReference, psiPerLevel);
     const auto [persistentL2, persistentRelativeL2] =
@@ -443,10 +487,13 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         relativeResidual(matrix, psiReference, source);
     const scalar serialGatherResidual =
         relativeResidual(matrix, psiSerialGather, source);
+    const scalar avx512Residual = relativeResidual(matrix, psiAvx512, source);
     const scalar perLevelResidual =
         relativeResidual(matrix, psiPerLevel, source);
     const scalar persistentResidual =
         relativeResidual(matrix, psiPersistent, source);
+    const scalar avx512ResidualDifference =
+        std::abs(referenceOneSweepResidual - avx512Residual);
 
     constexpr scalar equivalenceTolerance = 1e-12;
     const auto status = [&](const scalar difference)
@@ -458,19 +505,25 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n\nOne-sweep correctness:"
         << "\nReference GS residual:          " << referenceOneSweepResidual
         << "\nSerial gather residual:         " << serialGatherResidual
+        << "\nSerial packed AVX-512 residual: " << avx512Residual
         << "\nPer-level OpenMP residual:      " << perLevelResidual
         << "\nPersistent OpenMP residual:     " << persistentResidual
         << "\nSerial gather residual difference:     "
         << std::abs(referenceOneSweepResidual - serialGatherResidual)
+        << "\nAVX-512 residual difference:           "
+        << avx512ResidualDifference
         << "\nPer-level OMP residual difference:     "
         << std::abs(referenceOneSweepResidual - perLevelResidual)
         << "\nPersistent OMP residual difference:    "
         << std::abs(referenceOneSweepResidual - persistentResidual)
         << "\n\nmax |reference - serial gather|:  " << serialGatherMaxAbs
+        << "\nmax |reference - AVX-512|:        " << avx512MaxAbs
         << "\nmax |reference - per-level OMP|:  " << perLevelMaxAbs
         << "\nmax |reference - persistent OMP|: " << persistentMaxAbs
         << "\n\nserial gather L2 / relative L2:  "
         << serialGatherL2 << " / " << serialGatherRelativeL2
+        << "\nAVX-512 L2 / relative L2:        "
+        << avx512L2 << " / " << avx512RelativeL2
         << "\nper-level OMP L2 / relative L2:  "
         << perLevelL2 << " / " << perLevelRelativeL2
         << "\npersistent OMP L2 / relative L2: "
@@ -482,6 +535,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\npersistent OMP exact equality:   "
         << (persistentMaxAbs == 0 ? "PASS" : "NO")
         << "\nserial gather equivalence:       " << status(serialGatherMaxAbs)
+        << "\nAVX-512 equivalence:             " << status(avx512MaxAbs)
+        << "\nAVX-512 kernel available:        "
+        << (avx512Available ? "YES" : "NO (scalar fallback)")
         << "\nper-level OMP equivalence:       " << status(perLevelMaxAbs)
         << "\npersistent OMP equivalence:      " << status(persistentMaxAbs)
         << "\nequivalence tolerance:           " << equivalenceTolerance
@@ -489,6 +545,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     if
     (
         serialGatherMaxAbs > equivalenceTolerance
+     || avx512MaxAbs > equivalenceTolerance
+     || avx512ResidualDifference > equivalenceTolerance
      || perLevelMaxAbs > equivalenceTolerance
      || persistentMaxAbs > equivalenceTolerance
     )
@@ -515,6 +573,14 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         [&](scalarField& timedPsi)
         {
             serialGatherSmooth(timedPsi, source, schedule, 1);
+        }
+    );
+    const ImplementationTiming avx512Timing = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingRepetitions,
+        [&](scalarField& timedPsi)
+        {
+            serialGatherAvx512Smooth(timedPsi, source, schedule, 1);
         }
     );
     const ImplementationTiming perLevelTiming = timeSweepImplementation
@@ -639,6 +705,11 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\np90 width: " << wavefronts.p90Width
         << "\np95 width: " << wavefronts.p95Width
         << "\nmax width: " << wavefronts.maximumWidth
+        << "\nmean packed row length: " << rowLengths.mean
+        << "\nmedian packed row length: " << rowLengths.median
+        << "\nmax packed row length: " << rowLengths.maximum
+        << "\nfraction of rows with <= 8 entries: " << rowLengths.fractionAtMost8
+        << "\nfraction of rows with <= 16 entries: " << rowLengths.fractionAtMost16
         << "\naverage available parallelism: " << wavefronts.meanWidth
         << "\nfraction in levels with width >= 2: "
         << fractionInLevelsAtLeast(wavefronts.widths, 2, mesh.nCells)
@@ -660,6 +731,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::cout << "level " << level << ": " << wavefronts.widths[level] << '\n';
     const scalar gatherSlowdown =
         serialGatherTiming.averageSeconds/sequentialTiming.averageSeconds;
+    const scalar avx512SpeedupScalar =
+        serialGatherTiming.averageSeconds/avx512Timing.averageSeconds;
+    const scalar avx512SpeedupReference =
+        sequentialTiming.averageSeconds/avx512Timing.averageSeconds;
     const scalar perLevelSpeedupGather =
         serialGatherTiming.averageSeconds/perLevelTiming.averageSeconds;
     const scalar perLevelSpeedupReference =
@@ -680,6 +755,12 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  avg sweep time: " << serialGatherTiming.averageSeconds << " s"
         << "\n  ns/cell/sweep: " << serialGatherTiming.nsPerCellSweep
         << "\n  slowdown vs reference: " << gatherSlowdown << "x"
+        << "\nSerial packed AVX-512:"
+        << "\n  available: " << (avx512Available ? "YES" : "NO (scalar fallback)")
+        << "\n  avg sweep time: " << avx512Timing.averageSeconds << " s"
+        << "\n  ns/cell/sweep: " << avx512Timing.nsPerCellSweep
+        << "\n  speedup vs serial packed scalar: " << avx512SpeedupScalar << "x"
+        << "\n  speedup vs reference: " << avx512SpeedupReference << "x"
         << "\nWavefront, per-level OpenMP:"
         << "\n  threads: " << perLevelThreads
         << "\n  avg sweep time: " << perLevelTiming.averageSeconds << " s"
