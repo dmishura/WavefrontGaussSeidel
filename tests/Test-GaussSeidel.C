@@ -24,6 +24,7 @@ using smootherTest::avx512GatherAvailable;
 using smootherTest::perLevelOpenMpSmooth;
 using smootherTest::persistentOpenMpSmooth;
 using smootherTest::serialGatherAvx512Smooth;
+using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherSmooth;
 
 namespace
@@ -365,6 +366,9 @@ struct RowLengthStatistics
     label maximum = 0;
     scalar fractionAtMost8 = 0;
     scalar fractionAtMost16 = 0;
+    std::size_t fullBatches = 0;
+    std::size_t partialBatches = 0;
+    scalar averageActiveLanes = 0;
 };
 
 RowLengthStatistics rowLengthStatistics(const WavefrontSchedule& schedule)
@@ -390,6 +394,30 @@ RowLengthStatistics rowLengthStatistics(const WavefrontSchedule& schedule)
     result.maximum = lengths.back();
     result.fractionAtMost8 = scalar(atMost8)/lengths.size();
     result.fractionAtMost16 = scalar(atMost16)/lengths.size();
+    std::size_t activeContributions = 0;
+    std::size_t neighbourSteps = 0;
+    for (std::size_t level=0; level + 1<schedule.levelStarts.size(); ++level)
+    {
+        const label levelEnd = schedule.levelStarts[level + 1];
+        for (label first=schedule.levelStarts[level]; first<levelEnd; first += 8)
+        {
+            const label batchRows = std::min<label>(8, levelEnd - first);
+            if (batchRows == 8) ++result.fullBatches;
+            else ++result.partialBatches;
+            label maximumLength = 0;
+            for (label lane=0; lane<batchRows; ++lane)
+            {
+                const label length = schedule.rowStarts[first + lane + 1]
+                    - schedule.rowStarts[first + lane];
+                activeContributions += length;
+                maximumLength = std::max(maximumLength, length);
+            }
+            neighbourSteps += maximumLength;
+        }
+    }
+    result.averageActiveLanes = neighbourSteps
+        ? scalar(activeContributions)/neighbourSteps
+        : 0;
     return result;
 }
 
@@ -454,6 +482,11 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const bool avx512Available = avx512GatherAvailable();
     scalarField psiAvx512 = initialPsi;
     serialGatherAvx512Smooth(psiAvx512, source, schedule, 1);
+    scalarField psiAvx512AcrossRows = initialPsi;
+    serialGatherAvx512AcrossRowsSmooth
+    (
+        psiAvx512AcrossRows, source, schedule, 1
+    );
     int perLevelThreads = 1;
     scalarField psiPerLevel = initialPsi;
     perLevelOpenMpSmooth
@@ -470,6 +503,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar serialGatherMaxAbs =
         maxAbsDifference(psiReference, psiSerialGather);
     const scalar avx512MaxAbs = maxAbsDifference(psiReference, psiAvx512);
+    const scalar avx512AcrossRowsMaxAbs =
+        maxAbsDifference(psiReference, psiAvx512AcrossRows);
     const scalar perLevelMaxAbs =
         maxAbsDifference(psiReference, psiPerLevel);
     const scalar persistentMaxAbs =
@@ -478,6 +513,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         l2Differences(psiReference, psiSerialGather);
     const auto [avx512L2, avx512RelativeL2] =
         l2Differences(psiReference, psiAvx512);
+    const auto [avx512AcrossRowsL2, avx512AcrossRowsRelativeL2] =
+        l2Differences(psiReference, psiAvx512AcrossRows);
     const auto [perLevelL2, perLevelRelativeL2] =
         l2Differences(psiReference, psiPerLevel);
     const auto [persistentL2, persistentRelativeL2] =
@@ -488,12 +525,16 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar serialGatherResidual =
         relativeResidual(matrix, psiSerialGather, source);
     const scalar avx512Residual = relativeResidual(matrix, psiAvx512, source);
+    const scalar avx512AcrossRowsResidual =
+        relativeResidual(matrix, psiAvx512AcrossRows, source);
     const scalar perLevelResidual =
         relativeResidual(matrix, psiPerLevel, source);
     const scalar persistentResidual =
         relativeResidual(matrix, psiPersistent, source);
     const scalar avx512ResidualDifference =
         std::abs(referenceOneSweepResidual - avx512Residual);
+    const scalar avx512AcrossRowsResidualDifference =
+        std::abs(referenceOneSweepResidual - avx512AcrossRowsResidual);
 
     constexpr scalar equivalenceTolerance = 1e-12;
     const auto status = [&](const scalar difference)
@@ -506,36 +547,46 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nReference GS residual:          " << referenceOneSweepResidual
         << "\nSerial gather residual:         " << serialGatherResidual
         << "\nSerial packed AVX-512 residual: " << avx512Residual
+        << "\nAVX-512 across-rows residual:   " << avx512AcrossRowsResidual
         << "\nPer-level OpenMP residual:      " << perLevelResidual
         << "\nPersistent OpenMP residual:     " << persistentResidual
         << "\nSerial gather residual difference:     "
         << std::abs(referenceOneSweepResidual - serialGatherResidual)
         << "\nAVX-512 residual difference:           "
         << avx512ResidualDifference
+        << "\nAVX-512 across-rows residual difference: "
+        << avx512AcrossRowsResidualDifference
         << "\nPer-level OMP residual difference:     "
         << std::abs(referenceOneSweepResidual - perLevelResidual)
         << "\nPersistent OMP residual difference:    "
         << std::abs(referenceOneSweepResidual - persistentResidual)
         << "\n\nmax |reference - serial gather|:  " << serialGatherMaxAbs
         << "\nmax |reference - AVX-512|:        " << avx512MaxAbs
+        << "\nmax |reference - AVX-512 rows|:   " << avx512AcrossRowsMaxAbs
         << "\nmax |reference - per-level OMP|:  " << perLevelMaxAbs
         << "\nmax |reference - persistent OMP|: " << persistentMaxAbs
         << "\n\nserial gather L2 / relative L2:  "
         << serialGatherL2 << " / " << serialGatherRelativeL2
         << "\nAVX-512 L2 / relative L2:        "
         << avx512L2 << " / " << avx512RelativeL2
+        << "\nAVX-512 rows L2 / relative L2:   "
+        << avx512AcrossRowsL2 << " / " << avx512AcrossRowsRelativeL2
         << "\nper-level OMP L2 / relative L2:  "
         << perLevelL2 << " / " << perLevelRelativeL2
         << "\npersistent OMP L2 / relative L2: "
         << persistentL2 << " / " << persistentRelativeL2
         << "\n\nserial gather exact equality:    "
         << (serialGatherMaxAbs == 0 ? "PASS" : "NO")
+        << "\nAVX-512 rows exact equality:     "
+        << (avx512AcrossRowsMaxAbs == 0 ? "PASS" : "NO")
         << "\nper-level OMP exact equality:    "
         << (perLevelMaxAbs == 0 ? "PASS" : "NO")
         << "\npersistent OMP exact equality:   "
         << (persistentMaxAbs == 0 ? "PASS" : "NO")
         << "\nserial gather equivalence:       " << status(serialGatherMaxAbs)
         << "\nAVX-512 equivalence:             " << status(avx512MaxAbs)
+        << "\nAVX-512 across-rows equivalence: "
+        << status(avx512AcrossRowsMaxAbs)
         << "\nAVX-512 kernel available:        "
         << (avx512Available ? "YES" : "NO (scalar fallback)")
         << "\nper-level OMP equivalence:       " << status(perLevelMaxAbs)
@@ -547,6 +598,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         serialGatherMaxAbs > equivalenceTolerance
      || avx512MaxAbs > equivalenceTolerance
      || avx512ResidualDifference > equivalenceTolerance
+     || avx512AcrossRowsMaxAbs > equivalenceTolerance
+     || avx512AcrossRowsResidualDifference > equivalenceTolerance
      || perLevelMaxAbs > equivalenceTolerance
      || persistentMaxAbs > equivalenceTolerance
     )
@@ -581,6 +634,17 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         [&](scalarField& timedPsi)
         {
             serialGatherAvx512Smooth(timedPsi, source, schedule, 1);
+        }
+    );
+    const ImplementationTiming avx512AcrossRowsTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingRepetitions,
+        [&](scalarField& timedPsi)
+        {
+            serialGatherAvx512AcrossRowsSmooth
+            (
+                timedPsi, source, schedule, 1
+            );
         }
     );
     const ImplementationTiming perLevelTiming = timeSweepImplementation
@@ -710,6 +774,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmax packed row length: " << rowLengths.maximum
         << "\nfraction of rows with <= 8 entries: " << rowLengths.fractionAtMost8
         << "\nfraction of rows with <= 16 entries: " << rowLengths.fractionAtMost16
+        << "\nfull 8-row SIMD batches: " << rowLengths.fullBatches
+        << "\npartial SIMD batches: " << rowLengths.partialBatches
+        << "\naverage active SIMD lanes per neighbour step: "
+        << rowLengths.averageActiveLanes
         << "\naverage available parallelism: " << wavefronts.meanWidth
         << "\nfraction in levels with width >= 2: "
         << fractionInLevelsAtLeast(wavefronts.widths, 2, mesh.nCells)
@@ -735,6 +803,15 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         serialGatherTiming.averageSeconds/avx512Timing.averageSeconds;
     const scalar avx512SpeedupReference =
         sequentialTiming.averageSeconds/avx512Timing.averageSeconds;
+    const scalar avx512AcrossRowsSpeedupScalar =
+        serialGatherTiming.averageSeconds
+       /avx512AcrossRowsTiming.averageSeconds;
+    const scalar avx512AcrossRowsSpeedupReference =
+        sequentialTiming.averageSeconds
+       /avx512AcrossRowsTiming.averageSeconds;
+    const scalar avx512AcrossRowsSpeedupIntra =
+        avx512Timing.averageSeconds
+       /avx512AcrossRowsTiming.averageSeconds;
     const scalar perLevelSpeedupGather =
         serialGatherTiming.averageSeconds/perLevelTiming.averageSeconds;
     const scalar perLevelSpeedupReference =
@@ -761,6 +838,16 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  ns/cell/sweep: " << avx512Timing.nsPerCellSweep
         << "\n  speedup vs serial packed scalar: " << avx512SpeedupScalar << "x"
         << "\n  speedup vs reference: " << avx512SpeedupReference << "x"
+        << "\nSerial packed AVX-512 across rows:"
+        << "\n  available: " << (avx512Available ? "YES" : "NO (scalar fallback)")
+        << "\n  avg sweep time: " << avx512AcrossRowsTiming.averageSeconds << " s"
+        << "\n  ns/cell/sweep: " << avx512AcrossRowsTiming.nsPerCellSweep
+        << "\n  speedup vs serial packed scalar: "
+        << avx512AcrossRowsSpeedupScalar << "x"
+        << "\n  speedup vs reference: "
+        << avx512AcrossRowsSpeedupReference << "x"
+        << "\n  speedup vs AVX-512 intra-row: "
+        << avx512AcrossRowsSpeedupIntra << "x"
         << "\nWavefront, per-level OpenMP:"
         << "\n  threads: " << perLevelThreads
         << "\n  avg sweep time: " << perLevelTiming.averageSeconds << " s"

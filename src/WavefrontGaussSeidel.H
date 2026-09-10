@@ -36,6 +36,14 @@ void serialGatherAvx512Smooth
     Foam::label nSweeps
 );
 
+void serialGatherAvx512AcrossRowsSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
 void perLevelOpenMpSmooth
 (
     Foam::scalarField& psi,
