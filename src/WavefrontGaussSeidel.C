@@ -11,42 +11,32 @@ using Foam::scalar;
 void serialGatherSmooth
 (
     Foam::scalarField& psiField,
-    const Foam::lduMatrix& matrix,
     const Foam::scalarField& sourceField,
     const WavefrontSchedule& schedule,
     const label nSweeps
 )
 {
-    const label* const ownerStarts = matrix.lduAddr().ownerStartAddr().data();
-    const label* const neighbours = matrix.lduAddr().upperAddr().data();
-    const scalar* const diag = matrix.diag().data();
-    const scalar* const upper = matrix.upper().data();
-    const scalar* const lower = matrix.lower().data();
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
     const scalar* const source = sourceField.data();
     scalar* const psi = psiField.data();
-    const label* const incomingStarts = schedule.incomingStarts.data();
-    const label* const incomingFaces = schedule.incomingFaces.data();
-    const label* const incomingOwners = schedule.incomingOwners.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
 
     for (label sweep=0; sweep<nSweeps; ++sweep)
     {
-        for (const std::vector<label>& levelCells : schedule.cellsByLevel)
+        for (std::size_t level=0; level<nLevels; ++level)
         {
-            const label* const cells = levelCells.data();
-            for (std::size_t index=0; index<levelCells.size(); ++index)
+            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
             {
-                const label cell = cells[index];
+                const label cell = waveCells[row];
                 scalar psii = source[cell];
-                for ( label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
-                {
-                    const label face = incomingFaces[in];
-                    psii -= lower[face]*psi[incomingOwners[in]];
-                }
-                for ( label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
-                {
-                    psii -= upper[face]*psi[neighbours[face]];
-                }
-                psi[cell] = psii/diag[cell];
+                for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                    psii -= coeffs[p]*psi[cols[p]];
+                psi[cell] = psii/diag[row];
             }
         }
     }
@@ -55,31 +45,26 @@ void serialGatherSmooth
 void perLevelOpenMpSmooth
 (
     Foam::scalarField& psiField,
-    const Foam::lduMatrix& matrix,
     const Foam::scalarField& sourceField,
     const WavefrontSchedule& schedule,
     const label nSweeps,
     int& detectedThreads
 )
 {
-    const label* const ownerStarts = matrix.lduAddr().ownerStartAddr().data();
-    const label* const neighbours = matrix.lduAddr().upperAddr().data();
-    const scalar* const diag = matrix.diag().data();
-    const scalar* const upper = matrix.upper().data();
-    const scalar* const lower = matrix.lower().data();
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
     const scalar* const source = sourceField.data();
     scalar* const psi = psiField.data();
-    const label* const incomingStarts = schedule.incomingStarts.data();
-    const label* const incomingFaces = schedule.incomingFaces.data();
-    const label* const incomingOwners = schedule.incomingOwners.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
 
     for (label sweep=0; sweep<nSweeps; ++sweep)
     {
-        for (std::size_t level=0; level<schedule.cellsByLevel.size(); ++level)
+        for (std::size_t level=0; level<nLevels; ++level)
         {
-            const std::vector<label>& levelCells = schedule.cellsByLevel[level];
-            const label* const cells = levelCells.data();
-            // This intentionally creates a new OpenMP team for every level.
             #pragma omp parallel
             {
                 #pragma omp single
@@ -88,20 +73,13 @@ void perLevelOpenMpSmooth
                         detectedThreads = omp_get_num_threads();
                 }
                 #pragma omp for schedule(static)
-                for (std::size_t index=0; index<levelCells.size(); ++index)
+                for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
                 {
-                    const label cell = cells[index];
+                    const label cell = waveCells[row];
                     scalar psii = source[cell];
-                    for ( label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
-                    {
-                        const label face = incomingFaces[in];
-                        psii -= lower[face]*psi[incomingOwners[in]];
-                    }
-                    for ( label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
-                    {
-                        psii -= upper[face]*psi[neighbours[face]];
-                    }
-                    psi[cell] = psii/diag[cell];
+                    for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                        psii -= coeffs[p]*psi[cols[p]];
+                    psi[cell] = psii/diag[row];
                 }
             }
         }
@@ -111,26 +89,22 @@ void perLevelOpenMpSmooth
 void persistentOpenMpSmooth
 (
     Foam::scalarField& psiField,
-    const Foam::lduMatrix& matrix,
     const Foam::scalarField& sourceField,
     const WavefrontSchedule& schedule,
     const label nSweeps,
     int& detectedThreads
 )
 {
-    const label* const ownerStarts = matrix.lduAddr().ownerStartAddr().data();
-    const label* const neighbours = matrix.lduAddr().upperAddr().data();
-    const scalar* const diag = matrix.diag().data();
-    const scalar* const upper = matrix.upper().data();
-    const scalar* const lower = matrix.lower().data();
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
     const scalar* const source = sourceField.data();
     scalar* const psi = psiField.data();
-    const label* const incomingStarts = schedule.incomingStarts.data();
-    const label* const incomingFaces = schedule.incomingFaces.data();
-    const label* const incomingOwners = schedule.incomingOwners.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
 
-    // Read-only arrays are shared, loop indices and psii are private, and
-    // every iteration writes only psi[cell]. Same-level cells have no edges.
     #pragma omp parallel
     {
         #pragma omp single
@@ -138,26 +112,16 @@ void persistentOpenMpSmooth
 
         for (label sweep=0; sweep<nSweeps; ++sweep)
         {
-            for (std::size_t level=0; level<schedule.cellsByLevel.size(); ++level)
+            for (std::size_t level=0; level<nLevels; ++level)
             {
-                const std::vector<label>& levelCells =
-                    schedule.cellsByLevel[level];
-                const label* const cells = levelCells.data();
                 #pragma omp for schedule(static)
-                for (std::size_t index=0; index<levelCells.size(); ++index)
+                for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
                 {
-                    const label cell = cells[index];
+                    const label cell = waveCells[row];
                     scalar psii = source[cell];
-                    for ( label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
-                    {
-                        const label face = incomingFaces[in];
-                        psii -= lower[face]*psi[incomingOwners[in]];
-                    }
-                    for ( label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
-                    {
-                        psii -= upper[face]*psi[neighbours[face]];
-                    }
-                    psi[cell] = psii/diag[cell];
+                    for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                        psii -= coeffs[p]*psi[cols[p]];
+                    psi[cell] = psii/diag[row];
                 }
                 // No nowait: the implicit barrier orders dependency levels.
             }

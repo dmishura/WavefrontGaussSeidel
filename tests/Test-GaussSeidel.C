@@ -215,32 +215,72 @@ WavefrontStatistics constructWavefronts(const PolyMeshTopology& mesh)
 WavefrontSchedule makeWavefrontSchedule
 (
     const PolyMeshTopology& mesh,
+    const lduMatrix& matrix,
     const WavefrontStatistics& statistics
 )
 {
     WavefrontSchedule schedule;
-    schedule.cellsByLevel.resize(statistics.widths.size());
+    schedule.levelStarts.resize(statistics.widths.size() + 1, 0);
+    for (std::size_t level=0; level<statistics.widths.size(); ++level)
+        schedule.levelStarts[level + 1] =
+            schedule.levelStarts[level] + statistics.widths[level];
+
+    schedule.waveCells.resize(mesh.nCells);
+    std::vector<label> levelCursor = schedule.levelStarts;
     for (label cell=0; cell<label(mesh.nCells); ++cell)
-        schedule.cellsByLevel[statistics.levels[cell]].push_back(cell);
+        schedule.waveCells[levelCursor[statistics.levels[cell]]++] = cell;
 
-    // Incoming-face CSR enables a race-free gather of contributions from
-    // already updated lower-index cells. Filling in global face order preserves
-    // the subtraction order used by the reference scatter implementation.
-    schedule.incomingStarts.assign(mesh.nCells + 1, 0);
+    // This temporary incoming-face index is used only while packing rows.
+    // Global face insertion order preserves the reference subtraction order.
+    std::vector<label> incomingStarts(mesh.nCells + 1, 0);
     for (const int neighbour : mesh.neighbour)
-        ++schedule.incomingStarts[static_cast<std::size_t>(neighbour) + 1];
+        ++incomingStarts[static_cast<std::size_t>(neighbour) + 1];
     for (std::size_t cell=0; cell<mesh.nCells; ++cell)
-        schedule.incomingStarts[cell + 1] += schedule.incomingStarts[cell];
+        incomingStarts[cell + 1] += incomingStarts[cell];
 
-    schedule.incomingFaces.resize(mesh.nInternalFaces());
-    schedule.incomingOwners.resize(mesh.nInternalFaces());
-    std::vector<label> cursor = schedule.incomingStarts;
+    std::vector<label> incomingFaces(mesh.nInternalFaces());
+    std::vector<label> cursor = incomingStarts;
     for (label face=0; face<label(mesh.nInternalFaces()); ++face)
     {
         const label neighbour = mesh.neighbour[face];
-        const label incoming = cursor[neighbour]++;
-        schedule.incomingFaces[incoming] = face;
-        schedule.incomingOwners[incoming] = mesh.owner[face];
+        incomingFaces[cursor[neighbour]++] = face;
+    }
+
+    const labelField& ownerStarts = matrix.lduAddr().ownerStartAddr();
+    const labelField& neighbours = matrix.lduAddr().upperAddr();
+    const scalarField& lower = matrix.lower();
+    const scalarField& upper = matrix.upper();
+    schedule.rowStarts.reserve(mesh.nCells + 1);
+    schedule.cols.reserve(2*mesh.nInternalFaces());
+    schedule.coeffs.reserve(2*mesh.nInternalFaces());
+    schedule.diag.reserve(mesh.nCells);
+    schedule.rowStarts.push_back(0);
+    for (const label cell : schedule.waveCells)
+    {
+        // Pack incoming/lower first, then outgoing/upper, without reordering.
+        for (label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
+        {
+            const label face = incomingFaces[in];
+            schedule.cols.push_back(mesh.owner[face]);
+            schedule.coeffs.push_back(lower[face]);
+        }
+        for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+        {
+            schedule.cols.push_back(neighbours[face]);
+            schedule.coeffs.push_back(upper[face]);
+        }
+        schedule.diag.push_back(matrix.diag()[cell]);
+        schedule.rowStarts.push_back(schedule.cols.size());
+    }
+    if
+    (
+        schedule.rowStarts.size() != mesh.nCells + 1
+     || schedule.cols.size() != 2*mesh.nInternalFaces()
+     || schedule.coeffs.size() != schedule.cols.size()
+     || schedule.diag.size() != mesh.nCells
+    )
+    {
+        throw std::runtime_error("invalid packed wavefront schedule size");
     }
     return schedule;
 }
@@ -355,8 +395,14 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
 
     // Level and incoming-CSR preprocessing is completed once, before any
     // timed sweep. The benchmark measures only consumption of this schedule.
+    const auto preprocessingBegin = std::chrono::steady_clock::now();
     const WavefrontStatistics wavefronts = constructWavefronts(mesh);
-    const WavefrontSchedule schedule = makeWavefrontSchedule(mesh, wavefronts);
+    const WavefrontSchedule schedule =
+        makeWavefrontSchedule(mesh, matrix, wavefronts);
+    const auto preprocessingEnd = std::chrono::steady_clock::now();
+    const scalar preprocessingSeconds =
+        std::chrono::duration<scalar>
+        (preprocessingEnd - preprocessingBegin).count();
     const scalarField initialPsi(exact.size(), 0.0);
 
     scalarField psiReference = initialPsi;
@@ -366,18 +412,18 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         interfaceCoeffs, interfaces, 0, 1
     );
     scalarField psiSerialGather = initialPsi;
-    serialGatherSmooth(psiSerialGather, matrix, source, schedule, 1);
+    serialGatherSmooth(psiSerialGather, source, schedule, 1);
     int perLevelThreads = 1;
     scalarField psiPerLevel = initialPsi;
     perLevelOpenMpSmooth
     (
-        psiPerLevel, matrix, source, schedule, 1, perLevelThreads
+        psiPerLevel, source, schedule, 1, perLevelThreads
     );
     int persistentThreads = 1;
     scalarField psiPersistent = initialPsi;
     persistentOpenMpSmooth
     (
-        psiPersistent, matrix, source, schedule, 1, persistentThreads
+        psiPersistent, source, schedule, 1, persistentThreads
     );
 
     const scalar serialGatherMaxAbs =
@@ -468,7 +514,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         initialPsi, mesh.nCells, timingRepetitions,
         [&](scalarField& timedPsi)
         {
-            serialGatherSmooth(timedPsi, matrix, source, schedule, 1);
+            serialGatherSmooth(timedPsi, source, schedule, 1);
         }
     );
     const ImplementationTiming perLevelTiming = timeSweepImplementation
@@ -478,7 +524,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         {
             perLevelOpenMpSmooth
             (
-                timedPsi, matrix, source, schedule, 1, perLevelThreads
+                timedPsi, source, schedule, 1, perLevelThreads
             );
         }
     );
@@ -489,7 +535,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         {
             persistentOpenMpSmooth
             (
-                timedPsi, matrix, source, schedule, 1, persistentThreads
+                timedPsi, source, schedule, 1, persistentThreads
             );
         }
     );
@@ -584,6 +630,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nsmoothing efficiency eta: " << eta << " 1/s\n";
 
     std::cout << "\nWavefront dependency statistics:\n"
+        << "preprocessing time: " << preprocessingSeconds << " s\n"
         << "levels: " << wavefronts.widths.size()
         << "\ncells: " << totalLevelCells
         << "\nmin width: " << wavefronts.minimumWidth

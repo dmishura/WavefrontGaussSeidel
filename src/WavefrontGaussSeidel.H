@@ -10,16 +10,17 @@ namespace smootherTest
 
 struct WavefrontSchedule
 {
-    std::vector<std::vector<Foam::label>> cellsByLevel;
-    std::vector<Foam::label> incomingStarts;
-    std::vector<Foam::label> incomingFaces;
-    std::vector<Foam::label> incomingOwners;
+    std::vector<Foam::label> levelStarts;
+    std::vector<Foam::label> waveCells;
+    std::vector<Foam::label> rowStarts;
+    std::vector<Foam::label> cols;
+    std::vector<Foam::scalar> coeffs;
+    std::vector<Foam::scalar> diag;
 };
 
 void serialGatherSmooth
 (
     Foam::scalarField& psi,
-    const Foam::lduMatrix& matrix,
     const Foam::scalarField& source,
     const WavefrontSchedule& schedule,
     Foam::label nSweeps
@@ -28,7 +29,6 @@ void serialGatherSmooth
 void perLevelOpenMpSmooth
 (
     Foam::scalarField& psi,
-    const Foam::lduMatrix& matrix,
     const Foam::scalarField& source,
     const WavefrontSchedule& schedule,
     Foam::label nSweeps,
@@ -38,7 +38,6 @@ void perLevelOpenMpSmooth
 void persistentOpenMpSmooth
 (
     Foam::scalarField& psi,
-    const Foam::lduMatrix& matrix,
     const Foam::scalarField& source,
     const WavefrontSchedule& schedule,
     Foam::label nSweeps,
