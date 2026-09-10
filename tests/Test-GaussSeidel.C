@@ -29,6 +29,7 @@ using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
+using smootherTest::serialReorderedPsiSmooth;
 
 namespace
 {
@@ -235,6 +236,9 @@ WavefrontSchedule makeWavefrontSchedule
     std::vector<label> levelCursor = schedule.levelStarts;
     for (label cell=0; cell<label(mesh.nCells); ++cell)
         schedule.waveCells[levelCursor[statistics.levels[cell]]++] = cell;
+    std::vector<label> cellToWaveRow(mesh.nCells);
+    for (label row=0; row<label(mesh.nCells); ++row)
+        cellToWaveRow[schedule.waveCells[row]] = row;
 
     // This temporary incoming-face index is used only while packing rows.
     // Global face insertion order preserves the reference subtraction order.
@@ -260,10 +264,15 @@ WavefrontSchedule makeWavefrontSchedule
     schedule.cols.reserve(2*mesh.nInternalFaces());
     schedule.coeffs.reserve(2*mesh.nInternalFaces());
     schedule.diag.reserve(mesh.nCells);
+    schedule.incomingCounts.reserve(mesh.nCells);
     schedule.rowStarts.push_back(0);
     for (const label cell : schedule.waveCells)
     {
         // Pack incoming/lower first, then outgoing/upper, without reordering.
+        schedule.incomingCounts.push_back
+        (
+            incomingStarts[cell + 1] - incomingStarts[cell]
+        );
         for (label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
         {
             const label face = incomingFaces[in];
@@ -278,12 +287,17 @@ WavefrontSchedule makeWavefrontSchedule
         schedule.diag.push_back(matrix.diag()[cell]);
         schedule.rowStarts.push_back(schedule.cols.size());
     }
+    schedule.localCols.resize(schedule.cols.size());
+    for (std::size_t p=0; p<schedule.cols.size(); ++p)
+        schedule.localCols[p] = cellToWaveRow[schedule.cols[p]];
     if
     (
         schedule.rowStarts.size() != mesh.nCells + 1
      || schedule.cols.size() != 2*mesh.nInternalFaces()
      || schedule.coeffs.size() != schedule.cols.size()
+     || schedule.localCols.size() != schedule.cols.size()
      || schedule.diag.size() != mesh.nCells
+     || schedule.incomingCounts.size() != mesh.nCells
     )
     {
         throw std::runtime_error("invalid packed wavefront schedule size");
@@ -784,6 +798,43 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         throw std::runtime_error("one-sweep wavefront equivalence check failed");
     }
 
+    constexpr label reorderedValidationSweeps = 20;
+    scalarField psiReorderedReference = initialPsi;
+    GaussSeidelSmoother::smooth
+    (
+        "psi", psiReorderedReference, matrix, source,
+        interfaceCoeffs, interfaces, 0, reorderedValidationSweeps
+    );
+    scalarField psiReorderedOriginal = initialPsi;
+    scalarField psiReorderedWorkspace(initialPsi.size());
+    serialReorderedPsiSmooth
+    (
+        psiReorderedOriginal, psiReorderedWorkspace, source, schedule,
+        reorderedValidationSweeps
+    );
+    const scalar reorderedPsiMaxAbs =
+        maxAbsDifference(psiReorderedReference, psiReorderedOriginal);
+    const scalar reorderedPsiResidualDifference = std::abs
+    (
+        relativeResidual(matrix, psiReorderedReference, source)
+      - relativeResidual(matrix, psiReorderedOriginal, source)
+    );
+    std::cout << "Reordered-psi correctness (" << reorderedValidationSweeps
+        << " sweeps):"
+        << "\nmax |reference - reordered psi|: " << reorderedPsiMaxAbs
+        << "\nresidual difference:              "
+        << reorderedPsiResidualDifference
+        << "\nequivalence:                     "
+        << status(reorderedPsiMaxAbs) << "\n\n";
+    if
+    (
+        reorderedPsiMaxAbs > equivalenceTolerance
+     || reorderedPsiResidualDifference > equivalenceTolerance
+    )
+    {
+        throw std::runtime_error("reordered-psi equivalence check failed");
+    }
+
     constexpr label timingSamples = 7;
     constexpr label timingSweepsPerSample = 250;
     constexpr label warmupSweeps = 10;
@@ -815,6 +866,18 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
             serialGatherSmooth
             (
                 timedPsi, source, localitySchedule, nSweeps
+            );
+        }
+    );
+    scalarField reorderedTimingWorkspace(initialPsi.size());
+    const ImplementationTiming reorderedPsiTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
+        {
+            serialReorderedPsiSmooth
+            (
+                timedPsi, reorderedTimingWorkspace, source, schedule, nSweeps
             );
         }
     );
@@ -1013,6 +1076,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         serialGatherTiming.medianSeconds/localityTiming.medianSeconds;
     const scalar localitySpeedupReference =
         sequentialTiming.medianSeconds/localityTiming.medianSeconds;
+    const scalar reorderedPsiSpeedupScalar =
+        serialGatherTiming.medianSeconds/reorderedPsiTiming.medianSeconds;
+    const scalar reorderedPsiSpeedupReference =
+        sequentialTiming.medianSeconds/reorderedPsiTiming.medianSeconds;
     const scalar avx2SpeedupScalar =
         serialGatherTiming.medianSeconds/avx2Timing.medianSeconds;
     const scalar avx2SpeedupReference =
@@ -1055,6 +1122,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     printTiming("Reference sequential GS", sequentialTiming);
     printTiming("Serial packed scalar", serialGatherTiming);
     printTiming("Serial packed locality-reordered", localityTiming);
+    printTiming("Serial packed reordered psi", reorderedPsiTiming);
     printTiming("Serial packed AVX2", avx2Timing);
     printTiming("Serial packed AVX2 across rows", avx2AcrossRowsTiming);
     printTiming("Serial packed AVX-512", avx512Timing);
@@ -1066,6 +1134,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  serial packed slowdown vs reference: " << gatherSlowdown << "x"
         << "\n  locality-reordered speedup vs scalar/reference: "
         << localitySpeedupScalar << "x / " << localitySpeedupReference << "x"
+        << "\n  reordered-psi speedup vs scalar/reference: "
+        << reorderedPsiSpeedupScalar << "x / "
+        << reorderedPsiSpeedupReference << "x"
         << "\n  AVX2 speedup vs scalar/reference: "
         << avx2SpeedupScalar << "x / " << avx2SpeedupReference << "x"
         << "\n  AVX2 rows speedup vs scalar/reference/intra-row: "

@@ -14,6 +14,8 @@ struct WavefrontSchedule
     std::vector<Foam::label> waveCells;
     std::vector<Foam::label> rowStarts;
     std::vector<Foam::label> cols;
+    std::vector<Foam::label> localCols;
+    std::vector<Foam::label> incomingCounts;
     std::vector<Foam::scalar> coeffs;
     std::vector<Foam::scalar> diag;
 };
@@ -21,6 +23,15 @@ struct WavefrontSchedule
 void serialGatherSmooth
 (
     Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
+void serialReorderedPsiSmooth
+(
+    Foam::scalarField& originalPsi,
+    Foam::scalarField& reorderedPsi,
     const Foam::scalarField& source,
     const WavefrontSchedule& schedule,
     Foam::label nSweeps
