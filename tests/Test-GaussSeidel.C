@@ -7,6 +7,7 @@
 #include "WavefrontGaussSeidel.H"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -29,6 +30,7 @@ using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
+using smootherTest::serialGatherPrefetchSmooth;
 using smootherTest::serialReorderedPsiSmooth;
 
 namespace
@@ -612,6 +614,16 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     );
     scalarField psiSerialGather = initialPsi;
     serialGatherSmooth(psiSerialGather, source, schedule, 1);
+    scalarField psiPrefetchFirst = initialPsi;
+    serialGatherPrefetchSmooth
+    (
+        psiPrefetchFirst, source, schedule, 1, 8, 1
+    );
+    scalarField psiPrefetchTwo = initialPsi;
+    serialGatherPrefetchSmooth
+    (
+        psiPrefetchTwo, source, schedule, 1, 8, 2
+    );
     scalarField psiLocality = initialPsi;
     serialGatherSmooth(psiLocality, source, localitySchedule, 1);
     const bool avx512Available = avx512GatherAvailable();
@@ -643,6 +655,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar serialGatherMaxAbs =
         maxAbsDifference(psiReference, psiSerialGather);
     const scalar localityMaxAbs = maxAbsDifference(psiReference, psiLocality);
+    const scalar prefetchFirstMaxAbs =
+        maxAbsDifference(psiReference, psiPrefetchFirst);
+    const scalar prefetchTwoMaxAbs =
+        maxAbsDifference(psiReference, psiPrefetchTwo);
     const scalar avx512MaxAbs = maxAbsDifference(psiReference, psiAvx512);
     const scalar avx2MaxAbs = maxAbsDifference(psiReference, psiAvx2);
     const scalar avx2AcrossRowsMaxAbs =
@@ -657,6 +673,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         l2Differences(psiReference, psiSerialGather);
     const auto [localityL2, localityRelativeL2] =
         l2Differences(psiReference, psiLocality);
+    const auto [prefetchFirstL2, prefetchFirstRelativeL2] =
+        l2Differences(psiReference, psiPrefetchFirst);
+    const auto [prefetchTwoL2, prefetchTwoRelativeL2] =
+        l2Differences(psiReference, psiPrefetchTwo);
     const auto [avx512L2, avx512RelativeL2] =
         l2Differences(psiReference, psiAvx512);
     const auto [avx2L2, avx2RelativeL2] =
@@ -675,6 +695,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar serialGatherResidual =
         relativeResidual(matrix, psiSerialGather, source);
     const scalar localityResidual = relativeResidual(matrix, psiLocality, source);
+    const scalar prefetchFirstResidual =
+        relativeResidual(matrix, psiPrefetchFirst, source);
+    const scalar prefetchTwoResidual =
+        relativeResidual(matrix, psiPrefetchTwo, source);
     const scalar avx512Residual = relativeResidual(matrix, psiAvx512, source);
     const scalar avx2Residual = relativeResidual(matrix, psiAvx2, source);
     const scalar avx2AcrossRowsResidual =
@@ -695,6 +719,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::abs(referenceOneSweepResidual - avx512AcrossRowsResidual);
     const scalar localityResidualDifference =
         std::abs(referenceOneSweepResidual - localityResidual);
+    const scalar prefetchFirstResidualDifference =
+        std::abs(referenceOneSweepResidual - prefetchFirstResidual);
+    const scalar prefetchTwoResidualDifference =
+        std::abs(referenceOneSweepResidual - prefetchTwoResidual);
 
     constexpr scalar equivalenceTolerance = 1e-12;
     const auto status = [&](const scalar difference)
@@ -706,6 +734,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n\nOne-sweep correctness:"
         << "\nReference GS residual:          " << referenceOneSweepResidual
         << "\nSerial gather residual:         " << serialGatherResidual
+        << "\nPrefetch (8, first) residual:   " << prefetchFirstResidual
+        << "\nPrefetch (8, first 2) residual: " << prefetchTwoResidual
         << "\nLocality-reordered residual:    " << localityResidual
         << "\nSerial packed AVX2 residual:    " << avx2Residual
         << "\nAVX2 across-rows residual:      " << avx2AcrossRowsResidual
@@ -715,6 +745,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nPersistent OpenMP residual:     " << persistentResidual
         << "\nSerial gather residual difference:     "
         << std::abs(referenceOneSweepResidual - serialGatherResidual)
+        << "\nPrefetch first residual difference:    "
+        << prefetchFirstResidualDifference
+        << "\nPrefetch first 2 residual difference:  "
+        << prefetchTwoResidualDifference
         << "\nLocality-reordered residual difference: "
         << localityResidualDifference
         << "\nAVX-512 residual difference:           "
@@ -730,6 +764,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nPersistent OMP residual difference:    "
         << std::abs(referenceOneSweepResidual - persistentResidual)
         << "\n\nmax |reference - serial gather|:  " << serialGatherMaxAbs
+        << "\nmax |reference - prefetch first|: " << prefetchFirstMaxAbs
+        << "\nmax |reference - prefetch first 2|: " << prefetchTwoMaxAbs
         << "\nmax |reference - locality|:       " << localityMaxAbs
         << "\nmax |reference - AVX-512|:        " << avx512MaxAbs
         << "\nmax |reference - AVX2|:           " << avx2MaxAbs
@@ -739,6 +775,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmax |reference - persistent OMP|: " << persistentMaxAbs
         << "\n\nserial gather L2 / relative L2:  "
         << serialGatherL2 << " / " << serialGatherRelativeL2
+        << "\nprefetch first L2 / relative L2: "
+        << prefetchFirstL2 << " / " << prefetchFirstRelativeL2
+        << "\nprefetch first 2 L2 / relative L2: "
+        << prefetchTwoL2 << " / " << prefetchTwoRelativeL2
         << "\nlocality L2 / relative L2:       "
         << localityL2 << " / " << localityRelativeL2
         << "\nAVX-512 L2 / relative L2:        "
@@ -755,6 +795,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << persistentL2 << " / " << persistentRelativeL2
         << "\n\nserial gather exact equality:    "
         << (serialGatherMaxAbs == 0 ? "PASS" : "NO")
+        << "\nprefetch first exact equality:   "
+        << (prefetchFirstMaxAbs == 0 ? "PASS" : "NO")
+        << "\nprefetch first 2 exact equality: "
+        << (prefetchTwoMaxAbs == 0 ? "PASS" : "NO")
         << "\nAVX-512 rows exact equality:     "
         << (avx512AcrossRowsMaxAbs == 0 ? "PASS" : "NO")
         << "\nAVX2 rows exact equality:        "
@@ -764,6 +808,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\npersistent OMP exact equality:   "
         << (persistentMaxAbs == 0 ? "PASS" : "NO")
         << "\nserial gather equivalence:       " << status(serialGatherMaxAbs)
+        << "\nprefetch first equivalence:      " << status(prefetchFirstMaxAbs)
+        << "\nprefetch first 2 equivalence:    " << status(prefetchTwoMaxAbs)
         << "\nlocality-reordered equivalence:  " << status(localityMaxAbs)
         << "\nAVX-512 equivalence:             " << status(avx512MaxAbs)
         << "\nAVX2 equivalence:                " << status(avx2MaxAbs)
@@ -781,6 +827,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     if
     (
         serialGatherMaxAbs > equivalenceTolerance
+     || prefetchFirstMaxAbs > equivalenceTolerance
+     || prefetchFirstResidualDifference > equivalenceTolerance
+     || prefetchTwoMaxAbs > equivalenceTolerance
+     || prefetchTwoResidualDifference > equivalenceTolerance
      || localityMaxAbs > equivalenceTolerance
      || localityResidualDifference > equivalenceTolerance
      || avx2MaxAbs > equivalenceTolerance
@@ -858,6 +908,48 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
             serialGatherSmooth(timedPsi, source, schedule, nSweeps);
         }
     );
+    constexpr std::array<label, 4> prefetchDistances{{4, 8, 16, 32}};
+    std::array<ImplementationTiming, prefetchDistances.size()>
+        prefetchFirstTimings;
+    for (std::size_t i=0; i<prefetchDistances.size(); ++i)
+    {
+        const label distance = prefetchDistances[i];
+        prefetchFirstTimings[i] = timeSweepImplementation
+        (
+            initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+            warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
+            {
+                serialGatherPrefetchSmooth
+                (
+                    timedPsi, source, schedule, nSweeps, distance, 1
+                );
+            }
+        );
+    }
+    const auto bestPrefetchIterator = std::min_element
+    (
+        prefetchFirstTimings.begin(), prefetchFirstTimings.end(),
+        [](const ImplementationTiming& left, const ImplementationTiming& right)
+        {
+            return left.medianSeconds < right.medianSeconds;
+        }
+    );
+    const std::size_t bestPrefetchIndex = static_cast<std::size_t>
+    (
+        std::distance(prefetchFirstTimings.begin(), bestPrefetchIterator)
+    );
+    const label bestPrefetchDistance = prefetchDistances[bestPrefetchIndex];
+    const ImplementationTiming prefetchTwoTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
+        {
+            serialGatherPrefetchSmooth
+            (
+                timedPsi, source, schedule, nSweeps, bestPrefetchDistance, 2
+            );
+        }
+    );
     const ImplementationTiming localityTiming = timeSweepImplementation
     (
         initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
@@ -866,18 +958,6 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
             serialGatherSmooth
             (
                 timedPsi, source, localitySchedule, nSweeps
-            );
-        }
-    );
-    scalarField reorderedTimingWorkspace(initialPsi.size());
-    const ImplementationTiming reorderedPsiTiming = timeSweepImplementation
-    (
-        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
-        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
-        {
-            serialReorderedPsiSmooth
-            (
-                timedPsi, reorderedTimingWorkspace, source, schedule, nSweeps
             );
         }
     );
@@ -942,51 +1022,6 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         }
     );
 
-    constexpr label shortCallSweeps = 3;
-    constexpr label shortCallsPerSample = 100;
-    constexpr label shortTimedSweeps = shortCallSweeps*shortCallsPerSample;
-    constexpr label shortWarmupSweeps = 12;
-    const ImplementationTiming shortReferenceTiming = timeSweepImplementation
-    (
-        initialPsi, mesh.nCells, timingSamples, shortTimedSweeps,
-        shortWarmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
-        {
-            for (label sweep=0; sweep<nSweeps; sweep += shortCallSweeps)
-            {
-                GaussSeidelSmoother::smooth
-                (
-                    "psi", timedPsi, matrix, source,
-                    interfaceCoeffs, interfaces, 0, shortCallSweeps
-                );
-            }
-        }
-    );
-    const ImplementationTiming shortScalarTiming = timeSweepImplementation
-    (
-        initialPsi, mesh.nCells, timingSamples, shortTimedSweeps,
-        shortWarmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
-        {
-            for (label sweep=0; sweep<nSweeps; sweep += shortCallSweeps)
-                serialGatherSmooth
-                (
-                    timedPsi, source, schedule, shortCallSweeps
-                );
-        }
-    );
-    scalarField shortReorderedWorkspace(initialPsi.size());
-    const ImplementationTiming shortReorderedTiming = timeSweepImplementation
-    (
-        initialPsi, mesh.nCells, timingSamples, shortTimedSweeps,
-        shortWarmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
-        {
-            for (label sweep=0; sweep<nSweeps; sweep += shortCallSweeps)
-                serialReorderedPsiSmooth
-                (
-                    timedPsi, shortReorderedWorkspace, source, schedule,
-                    shortCallSweeps
-                );
-        }
-    );
 
     scalarField psi = initialPsi;
     const SweepMeasurements measurements = measureSweeps
@@ -1122,10 +1157,6 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         serialGatherTiming.medianSeconds/localityTiming.medianSeconds;
     const scalar localitySpeedupReference =
         sequentialTiming.medianSeconds/localityTiming.medianSeconds;
-    const scalar reorderedPsiSpeedupScalar =
-        serialGatherTiming.medianSeconds/reorderedPsiTiming.medianSeconds;
-    const scalar reorderedPsiSpeedupReference =
-        sequentialTiming.medianSeconds/reorderedPsiTiming.medianSeconds;
     const scalar avx2SpeedupScalar =
         serialGatherTiming.medianSeconds/avx2Timing.medianSeconds;
     const scalar avx2SpeedupReference =
@@ -1159,10 +1190,6 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         sequentialTiming.medianSeconds/persistentTiming.medianSeconds;
     const scalar persistentVsPerLevel =
         perLevelTiming.medianSeconds/persistentTiming.medianSeconds;
-    const scalar shortReorderedSpeedupScalar =
-        shortScalarTiming.medianSeconds/shortReorderedTiming.medianSeconds;
-    const scalar shortReorderedSpeedupReference =
-        shortReferenceTiming.medianSeconds/shortReorderedTiming.medianSeconds;
 
     std::cout << "dependency validation: PASS\n"
         << "\nStable performance benchmark:"
@@ -1171,8 +1198,18 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  primary comparison statistic: median\n";
     printTiming("Reference sequential GS", sequentialTiming);
     printTiming("Serial packed scalar", serialGatherTiming);
+    for (std::size_t i=0; i<prefetchDistances.size(); ++i)
+    {
+        const std::string name =
+            "Serial packed scalar prefetch first, distance "
+          + std::to_string(prefetchDistances[i]);
+        printTiming(name.c_str(), prefetchFirstTimings[i]);
+    }
+    const std::string prefetchTwoName =
+        "Serial packed scalar prefetch first 2, distance "
+      + std::to_string(bestPrefetchDistance);
+    printTiming(prefetchTwoName.c_str(), prefetchTwoTiming);
     printTiming("Serial packed locality-reordered", localityTiming);
-    printTiming("Serial packed reordered psi", reorderedPsiTiming);
     printTiming("Serial packed AVX2", avx2Timing);
     printTiming("Serial packed AVX2 across rows", avx2AcrossRowsTiming);
     printTiming("Serial packed AVX-512", avx512Timing);
@@ -1180,23 +1217,33 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     printTiming("Wavefront per-level OpenMP", perLevelTiming);
     printTiming("Wavefront persistent OpenMP", persistentTiming);
 
-    std::cout << "\nThree-sweep call benchmark:"
-        << "\n  calls/sample: " << shortCallsPerSample
-        << "\n  sweeps/call: " << shortCallSweeps << '\n';
-    printTiming("3-sweep Reference GS", shortReferenceTiming);
-    printTiming("3-sweep Serial packed scalar", shortScalarTiming);
-    printTiming("3-sweep Serial packed reordered psi", shortReorderedTiming);
-    std::cout << "\n  3-sweep reordered-psi speedup vs scalar/reference: "
-        << shortReorderedSpeedupScalar << "x / "
-        << shortReorderedSpeedupReference << "x\n";
+    std::cout << "\nPrefetch summary (median):"
+        << "\nvariant          distance  neighbours  median(s)  ns/cell  "
+           "speedup  CV(%)"
+        << "\nno prefetch      -         0           "
+        << serialGatherTiming.medianSeconds << "  "
+        << serialGatherTiming.medianNsPerCellSweep << "  1  "
+        << serialGatherTiming.cvPercent;
+    for (std::size_t i=0; i<prefetchDistances.size(); ++i)
+    {
+        const ImplementationTiming& timing = prefetchFirstTimings[i];
+        std::cout << "\nfirst neighbour  " << prefetchDistances[i]
+            << "         1           " << timing.medianSeconds << "  "
+            << timing.medianNsPerCellSweep << "  "
+            << serialGatherTiming.medianSeconds/timing.medianSeconds << "  "
+            << timing.cvPercent;
+    }
+    std::cout << "\nfirst 2          " << bestPrefetchDistance
+        << "         2           " << prefetchTwoTiming.medianSeconds << "  "
+        << prefetchTwoTiming.medianNsPerCellSweep << "  "
+        << serialGatherTiming.medianSeconds/prefetchTwoTiming.medianSeconds
+        << "  " << prefetchTwoTiming.cvPercent
+        << "\n  best first-neighbour distance: " << bestPrefetchDistance << '\n';
 
     std::cout << "\nMedian-based comparisons:"
         << "\n  serial packed slowdown vs reference: " << gatherSlowdown << "x"
         << "\n  locality-reordered speedup vs scalar/reference: "
         << localitySpeedupScalar << "x / " << localitySpeedupReference << "x"
-        << "\n  reordered-psi speedup vs scalar/reference: "
-        << reorderedPsiSpeedupScalar << "x / "
-        << reorderedPsiSpeedupReference << "x"
         << "\n  AVX2 speedup vs scalar/reference: "
         << avx2SpeedupScalar << "x / " << avx2SpeedupReference << "x"
         << "\n  AVX2 rows speedup vs scalar/reference/intra-row: "

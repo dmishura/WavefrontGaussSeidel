@@ -28,6 +28,16 @@ void serialGatherSmooth
     Foam::label nSweeps
 );
 
+void serialGatherPrefetchSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WavefrontSchedule& schedule,
+    Foam::label nSweeps,
+    Foam::label rowDistance,
+    Foam::label neighboursToPrefetch
+);
+
 void serialReorderedPsiSmooth
 (
     Foam::scalarField& originalPsi,

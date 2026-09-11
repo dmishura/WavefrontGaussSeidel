@@ -42,6 +42,59 @@ void serialGatherSmooth
     }
 }
 
+void serialGatherPrefetchSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const WavefrontSchedule& schedule,
+    const label nSweeps,
+    const label rowDistance,
+    const label neighboursToPrefetch
+)
+{
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            const label levelEnd = levelStarts[level + 1];
+            for (label row=levelStarts[level]; row<levelEnd; ++row)
+            {
+                const label futureRow = row + rowDistance;
+                if (futureRow < levelEnd)
+                {
+                    const label futureBegin = rowStarts[futureRow];
+                    const label futureCount = std::min
+                    (
+                        neighboursToPrefetch,
+                        rowStarts[futureRow + 1] - futureBegin
+                    );
+                    for (label neighbour=0; neighbour<futureCount; ++neighbour)
+                        __builtin_prefetch
+                        (
+                            psi + cols[futureBegin + neighbour], 0, 3
+                        );
+                }
+
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                    psii -= coeffs[p]*psi[cols[p]];
+                psi[cell] = psii/diag[row];
+            }
+        }
+    }
+}
+
 void serialReorderedPsiSmooth
 (
     Foam::scalarField& originalPsiField,
