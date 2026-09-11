@@ -30,6 +30,7 @@ using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
+using smootherTest::serialGatherInterleavedRowsSmooth;
 using smootherTest::serialGatherPrefetchSmooth;
 using smootherTest::serialReorderedPsiSmooth;
 
@@ -614,6 +615,11 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     );
     scalarField psiSerialGather = initialPsi;
     serialGatherSmooth(psiSerialGather, source, schedule, 1);
+    scalarField psiInterleavedRows = initialPsi;
+    serialGatherInterleavedRowsSmooth
+    (
+        psiInterleavedRows, source, schedule, 1
+    );
     scalarField psiPrefetchFirst = initialPsi;
     serialGatherPrefetchSmooth
     (
@@ -654,6 +660,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
 
     const scalar serialGatherMaxAbs =
         maxAbsDifference(psiReference, psiSerialGather);
+    const scalar interleavedRowsMaxAbs =
+        maxAbsDifference(psiReference, psiInterleavedRows);
+    const scalar interleavedRowsVsPackedMaxAbs =
+        maxAbsDifference(psiSerialGather, psiInterleavedRows);
     const scalar localityMaxAbs = maxAbsDifference(psiReference, psiLocality);
     const scalar prefetchFirstMaxAbs =
         maxAbsDifference(psiReference, psiPrefetchFirst);
@@ -671,6 +681,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         maxAbsDifference(psiReference, psiPersistent);
     const auto [serialGatherL2, serialGatherRelativeL2] =
         l2Differences(psiReference, psiSerialGather);
+    const auto [interleavedRowsL2, interleavedRowsRelativeL2] =
+        l2Differences(psiReference, psiInterleavedRows);
     const auto [localityL2, localityRelativeL2] =
         l2Differences(psiReference, psiLocality);
     const auto [prefetchFirstL2, prefetchFirstRelativeL2] =
@@ -694,6 +706,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         relativeResidual(matrix, psiReference, source);
     const scalar serialGatherResidual =
         relativeResidual(matrix, psiSerialGather, source);
+    const scalar interleavedRowsResidual =
+        relativeResidual(matrix, psiInterleavedRows, source);
     const scalar localityResidual = relativeResidual(matrix, psiLocality, source);
     const scalar prefetchFirstResidual =
         relativeResidual(matrix, psiPrefetchFirst, source);
@@ -723,6 +737,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::abs(referenceOneSweepResidual - prefetchFirstResidual);
     const scalar prefetchTwoResidualDifference =
         std::abs(referenceOneSweepResidual - prefetchTwoResidual);
+    const scalar interleavedRowsResidualDifference =
+        std::abs(referenceOneSweepResidual - interleavedRowsResidual);
 
     constexpr scalar equivalenceTolerance = 1e-12;
     const auto status = [&](const scalar difference)
@@ -734,6 +750,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n\nOne-sweep correctness:"
         << "\nReference GS residual:          " << referenceOneSweepResidual
         << "\nSerial gather residual:         " << serialGatherResidual
+        << "\nInterleaved rows residual:      " << interleavedRowsResidual
         << "\nPrefetch (8, first) residual:   " << prefetchFirstResidual
         << "\nPrefetch (8, first 2) residual: " << prefetchTwoResidual
         << "\nLocality-reordered residual:    " << localityResidual
@@ -745,6 +762,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nPersistent OpenMP residual:     " << persistentResidual
         << "\nSerial gather residual difference:     "
         << std::abs(referenceOneSweepResidual - serialGatherResidual)
+        << "\nInterleaved rows residual difference: "
+        << interleavedRowsResidualDifference
         << "\nPrefetch first residual difference:    "
         << prefetchFirstResidualDifference
         << "\nPrefetch first 2 residual difference:  "
@@ -764,6 +783,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nPersistent OMP residual difference:    "
         << std::abs(referenceOneSweepResidual - persistentResidual)
         << "\n\nmax |reference - serial gather|:  " << serialGatherMaxAbs
+        << "\nmax |reference - interleaved|:    " << interleavedRowsMaxAbs
+        << "\nmax |packed - interleaved|:       "
+        << interleavedRowsVsPackedMaxAbs
         << "\nmax |reference - prefetch first|: " << prefetchFirstMaxAbs
         << "\nmax |reference - prefetch first 2|: " << prefetchTwoMaxAbs
         << "\nmax |reference - locality|:       " << localityMaxAbs
@@ -775,6 +797,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmax |reference - persistent OMP|: " << persistentMaxAbs
         << "\n\nserial gather L2 / relative L2:  "
         << serialGatherL2 << " / " << serialGatherRelativeL2
+        << "\ninterleaved L2 / relative L2:   "
+        << interleavedRowsL2 << " / " << interleavedRowsRelativeL2
         << "\nprefetch first L2 / relative L2: "
         << prefetchFirstL2 << " / " << prefetchFirstRelativeL2
         << "\nprefetch first 2 L2 / relative L2: "
@@ -795,6 +819,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << persistentL2 << " / " << persistentRelativeL2
         << "\n\nserial gather exact equality:    "
         << (serialGatherMaxAbs == 0 ? "PASS" : "NO")
+        << "\ninterleaved rows exact equality: "
+        << (interleavedRowsMaxAbs == 0 ? "PASS" : "NO")
         << "\nprefetch first exact equality:   "
         << (prefetchFirstMaxAbs == 0 ? "PASS" : "NO")
         << "\nprefetch first 2 exact equality: "
@@ -808,6 +834,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\npersistent OMP exact equality:   "
         << (persistentMaxAbs == 0 ? "PASS" : "NO")
         << "\nserial gather equivalence:       " << status(serialGatherMaxAbs)
+        << "\ninterleaved rows equivalence:    " << status(interleavedRowsMaxAbs)
         << "\nprefetch first equivalence:      " << status(prefetchFirstMaxAbs)
         << "\nprefetch first 2 equivalence:    " << status(prefetchTwoMaxAbs)
         << "\nlocality-reordered equivalence:  " << status(localityMaxAbs)
@@ -827,6 +854,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     if
     (
         serialGatherMaxAbs > equivalenceTolerance
+     || interleavedRowsMaxAbs > equivalenceTolerance
+     || interleavedRowsVsPackedMaxAbs > equivalenceTolerance
+     || interleavedRowsResidualDifference > equivalenceTolerance
      || prefetchFirstMaxAbs > equivalenceTolerance
      || prefetchFirstResidualDifference > equivalenceTolerance
      || prefetchTwoMaxAbs > equivalenceTolerance
@@ -1022,6 +1052,62 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         }
     );
 
+    constexpr label productionSweepsPerCall = 3;
+    constexpr label productionCallsPerSample = 100;
+    constexpr label productionSweepsPerSample =
+        productionSweepsPerCall*productionCallsPerSample;
+    constexpr label productionWarmupSweeps = 12;
+    const ImplementationTiming productionReferenceTiming =
+        timeSweepImplementation
+        (
+            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
+            productionWarmupSweeps,
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    GaussSeidelSmoother::smooth
+                    (
+                        "psi", timedPsi, matrix, source,
+                        interfaceCoeffs, interfaces, 0,
+                        productionSweepsPerCall
+                    );
+                }
+            }
+        );
+    const ImplementationTiming productionPackedTiming =
+        timeSweepImplementation
+        (
+            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
+            productionWarmupSweeps,
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialGatherSmooth
+                    (
+                        timedPsi, source, schedule, productionSweepsPerCall
+                    );
+                }
+            }
+        );
+    const ImplementationTiming productionInterleavedTiming =
+        timeSweepImplementation
+        (
+            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
+            productionWarmupSweeps,
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialGatherInterleavedRowsSmooth
+                    (
+                        timedPsi, source, schedule, productionSweepsPerCall
+                    );
+                }
+            }
+        );
+
 
     scalarField psi = initialPsi;
     const SweepMeasurements measurements = measureSweeps
@@ -1216,6 +1302,38 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     printTiming("Serial packed AVX-512 across rows", avx512AcrossRowsTiming);
     printTiming("Wavefront per-level OpenMP", perLevelTiming);
     printTiming("Wavefront persistent OpenMP", persistentTiming);
+
+    const scalar productionInterleavedSpeedupPacked =
+        productionPackedTiming.medianSeconds
+       /productionInterleavedTiming.medianSeconds;
+    const scalar productionInterleavedSpeedupReference =
+        productionReferenceTiming.medianSeconds
+       /productionInterleavedTiming.medianSeconds;
+    std::cout << "\nProduction-like scalar ILP benchmark:"
+        << "\n  calls/sample: " << productionCallsPerSample
+        << "\n  sweeps/call: " << productionSweepsPerCall
+        << "\n  OpenMP threads detected: " << persistentThreads << '\n';
+    printTiming("3-sweep Reference GS", productionReferenceTiming);
+    printTiming("3-sweep Packed scalar", productionPackedTiming);
+    printTiming
+    (
+        "3-sweep Packed scalar interleaved rows",
+        productionInterleavedTiming
+    );
+    std::cout << "\nInterleaved rows summary (median):"
+        << "\nvariant          median(s)  ns/cell  CV(%)"
+        << "\nreference        " << productionReferenceTiming.medianSeconds
+        << "  " << productionReferenceTiming.medianNsPerCellSweep
+        << "  " << productionReferenceTiming.cvPercent
+        << "\npacked scalar    " << productionPackedTiming.medianSeconds
+        << "  " << productionPackedTiming.medianNsPerCellSweep
+        << "  " << productionPackedTiming.cvPercent
+        << "\ninterleaved rows " << productionInterleavedTiming.medianSeconds
+        << "  " << productionInterleavedTiming.medianNsPerCellSweep
+        << "  " << productionInterleavedTiming.cvPercent
+        << "\n  speedup vs packed/reference: "
+        << productionInterleavedSpeedupPacked << "x / "
+        << productionInterleavedSpeedupReference << "x\n";
 
     std::cout << "\nPrefetch summary (median):"
         << "\nvariant          distance  neighbours  median(s)  ns/cell  "
