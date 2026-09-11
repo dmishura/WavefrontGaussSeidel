@@ -31,6 +31,8 @@ using smootherTest::serialGatherAvx2AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
 using smootherTest::serialGatherInterleavedRowsSmooth;
+using smootherTest::serialGatherDegree6Smooth;
+using smootherTest::serialGatherDegree6InterleavedRowsSmooth;
 using smootherTest::serialGatherPrefetchSmooth;
 using smootherTest::serialReorderedPsiSmooth;
 
@@ -555,6 +557,17 @@ RowLengthStatistics rowLengthStatistics(const WavefrontSchedule& schedule)
     return result;
 }
 
+std::vector<std::size_t> rowLengthHistogram(const WavefrontSchedule& schedule)
+{
+    label maximum = 0;
+    for (std::size_t row=0; row<schedule.waveCells.size(); ++row)
+        maximum = std::max(maximum, schedule.rowStarts[row + 1] - schedule.rowStarts[row]);
+    std::vector<std::size_t> histogram(static_cast<std::size_t>(maximum) + 1, 0);
+    for (std::size_t row=0; row<schedule.waveCells.size(); ++row)
+        ++histogram[schedule.rowStarts[row + 1] - schedule.rowStarts[row]];
+    return histogram;
+}
+
 void printLevelWidths
 (
     const char* labelText,
@@ -605,6 +618,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::chrono::duration<scalar>
         (preprocessingEnd - preprocessingBegin).count();
     const RowLengthStatistics rowLengths = rowLengthStatistics(schedule);
+    const std::vector<std::size_t> contributionHistogram =
+        rowLengthHistogram(schedule);
     const scalarField initialPsi(exact.size(), 0.0);
 
     scalarField psiReference = initialPsi;
@@ -619,6 +634,13 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     serialGatherInterleavedRowsSmooth
     (
         psiInterleavedRows, source, schedule, 1
+    );
+    scalarField psiDegree6 = initialPsi;
+    serialGatherDegree6Smooth(psiDegree6, source, schedule, 1);
+    scalarField psiDegree6Interleaved = initialPsi;
+    serialGatherDegree6InterleavedRowsSmooth
+    (
+        psiDegree6Interleaved, source, schedule, 1
     );
     scalarField psiPrefetchFirst = initialPsi;
     serialGatherPrefetchSmooth
@@ -664,6 +686,13 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         maxAbsDifference(psiReference, psiInterleavedRows);
     const scalar interleavedRowsVsPackedMaxAbs =
         maxAbsDifference(psiSerialGather, psiInterleavedRows);
+    const scalar degree6MaxAbs = maxAbsDifference(psiReference, psiDegree6);
+    const scalar degree6VsPackedMaxAbs =
+        maxAbsDifference(psiSerialGather, psiDegree6);
+    const scalar degree6InterleavedMaxAbs =
+        maxAbsDifference(psiReference, psiDegree6Interleaved);
+    const scalar degree6InterleavedVsPackedMaxAbs =
+        maxAbsDifference(psiSerialGather, psiDegree6Interleaved);
     const scalar localityMaxAbs = maxAbsDifference(psiReference, psiLocality);
     const scalar prefetchFirstMaxAbs =
         maxAbsDifference(psiReference, psiPrefetchFirst);
@@ -683,6 +712,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         l2Differences(psiReference, psiSerialGather);
     const auto [interleavedRowsL2, interleavedRowsRelativeL2] =
         l2Differences(psiReference, psiInterleavedRows);
+    const auto [degree6L2, degree6RelativeL2] =
+        l2Differences(psiReference, psiDegree6);
+    const auto [degree6InterleavedL2, degree6InterleavedRelativeL2] =
+        l2Differences(psiReference, psiDegree6Interleaved);
     const auto [localityL2, localityRelativeL2] =
         l2Differences(psiReference, psiLocality);
     const auto [prefetchFirstL2, prefetchFirstRelativeL2] =
@@ -708,6 +741,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         relativeResidual(matrix, psiSerialGather, source);
     const scalar interleavedRowsResidual =
         relativeResidual(matrix, psiInterleavedRows, source);
+    const scalar degree6Residual = relativeResidual(matrix, psiDegree6, source);
+    const scalar degree6InterleavedResidual =
+        relativeResidual(matrix, psiDegree6Interleaved, source);
     const scalar localityResidual = relativeResidual(matrix, psiLocality, source);
     const scalar prefetchFirstResidual =
         relativeResidual(matrix, psiPrefetchFirst, source);
@@ -739,6 +775,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::abs(referenceOneSweepResidual - prefetchTwoResidual);
     const scalar interleavedRowsResidualDifference =
         std::abs(referenceOneSweepResidual - interleavedRowsResidual);
+    const scalar degree6ResidualDifference =
+        std::abs(referenceOneSweepResidual - degree6Residual);
+    const scalar degree6InterleavedResidualDifference =
+        std::abs(referenceOneSweepResidual - degree6InterleavedResidual);
 
     constexpr scalar equivalenceTolerance = 1e-12;
     const auto status = [&](const scalar difference)
@@ -751,6 +791,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nReference GS residual:          " << referenceOneSweepResidual
         << "\nSerial gather residual:         " << serialGatherResidual
         << "\nInterleaved rows residual:      " << interleavedRowsResidual
+        << "\nDegree-6 scalar residual:       " << degree6Residual
+        << "\nDegree-6 interleaved residual:  " << degree6InterleavedResidual
         << "\nPrefetch (8, first) residual:   " << prefetchFirstResidual
         << "\nPrefetch (8, first 2) residual: " << prefetchTwoResidual
         << "\nLocality-reordered residual:    " << localityResidual
@@ -764,6 +806,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << std::abs(referenceOneSweepResidual - serialGatherResidual)
         << "\nInterleaved rows residual difference: "
         << interleavedRowsResidualDifference
+        << "\nDegree-6 residual difference:         "
+        << degree6ResidualDifference
+        << "\nDegree-6 interleaved residual difference: "
+        << degree6InterleavedResidualDifference
         << "\nPrefetch first residual difference:    "
         << prefetchFirstResidualDifference
         << "\nPrefetch first 2 residual difference:  "
@@ -786,6 +832,11 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmax |reference - interleaved|:    " << interleavedRowsMaxAbs
         << "\nmax |packed - interleaved|:       "
         << interleavedRowsVsPackedMaxAbs
+        << "\nmax |reference - degree-6|:      " << degree6MaxAbs
+        << "\nmax |packed - degree-6|:         " << degree6VsPackedMaxAbs
+        << "\nmax |reference - degree-6 ILP|:  " << degree6InterleavedMaxAbs
+        << "\nmax |packed - degree-6 ILP|:     "
+        << degree6InterleavedVsPackedMaxAbs
         << "\nmax |reference - prefetch first|: " << prefetchFirstMaxAbs
         << "\nmax |reference - prefetch first 2|: " << prefetchTwoMaxAbs
         << "\nmax |reference - locality|:       " << localityMaxAbs
@@ -799,6 +850,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << serialGatherL2 << " / " << serialGatherRelativeL2
         << "\ninterleaved L2 / relative L2:   "
         << interleavedRowsL2 << " / " << interleavedRowsRelativeL2
+        << "\ndegree-6 L2 / relative L2:     "
+        << degree6L2 << " / " << degree6RelativeL2
+        << "\ndegree-6 ILP L2 / relative L2: "
+        << degree6InterleavedL2 << " / " << degree6InterleavedRelativeL2
         << "\nprefetch first L2 / relative L2: "
         << prefetchFirstL2 << " / " << prefetchFirstRelativeL2
         << "\nprefetch first 2 L2 / relative L2: "
@@ -821,6 +876,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << (serialGatherMaxAbs == 0 ? "PASS" : "NO")
         << "\ninterleaved rows exact equality: "
         << (interleavedRowsMaxAbs == 0 ? "PASS" : "NO")
+        << "\ndegree-6 exact equality:        "
+        << (degree6MaxAbs == 0 ? "PASS" : "NO")
+        << "\ndegree-6 ILP exact equality:    "
+        << (degree6InterleavedMaxAbs == 0 ? "PASS" : "NO")
         << "\nprefetch first exact equality:   "
         << (prefetchFirstMaxAbs == 0 ? "PASS" : "NO")
         << "\nprefetch first 2 exact equality: "
@@ -835,6 +894,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << (persistentMaxAbs == 0 ? "PASS" : "NO")
         << "\nserial gather equivalence:       " << status(serialGatherMaxAbs)
         << "\ninterleaved rows equivalence:    " << status(interleavedRowsMaxAbs)
+        << "\ndegree-6 equivalence:           " << status(degree6MaxAbs)
+        << "\ndegree-6 ILP equivalence:       "
+        << status(degree6InterleavedMaxAbs)
         << "\nprefetch first equivalence:      " << status(prefetchFirstMaxAbs)
         << "\nprefetch first 2 equivalence:    " << status(prefetchTwoMaxAbs)
         << "\nlocality-reordered equivalence:  " << status(localityMaxAbs)
@@ -857,6 +919,12 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
      || interleavedRowsMaxAbs > equivalenceTolerance
      || interleavedRowsVsPackedMaxAbs > equivalenceTolerance
      || interleavedRowsResidualDifference > equivalenceTolerance
+     || degree6MaxAbs > equivalenceTolerance
+     || degree6VsPackedMaxAbs > equivalenceTolerance
+     || degree6ResidualDifference > equivalenceTolerance
+     || degree6InterleavedMaxAbs > equivalenceTolerance
+     || degree6InterleavedVsPackedMaxAbs > equivalenceTolerance
+     || degree6InterleavedResidualDifference > equivalenceTolerance
      || prefetchFirstMaxAbs > equivalenceTolerance
      || prefetchFirstResidualDifference > equivalenceTolerance
      || prefetchTwoMaxAbs > equivalenceTolerance
@@ -1107,6 +1175,38 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                 }
             }
         );
+    const ImplementationTiming productionDegree6Timing =
+        timeSweepImplementation
+        (
+            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
+            productionWarmupSweeps,
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialGatherDegree6Smooth
+                    (
+                        timedPsi, source, schedule, productionSweepsPerCall
+                    );
+                }
+            }
+        );
+    const ImplementationTiming productionDegree6InterleavedTiming =
+        timeSweepImplementation
+        (
+            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
+            productionWarmupSweeps,
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialGatherDegree6InterleavedRowsSmooth
+                    (
+                        timedPsi, source, schedule, productionSweepsPerCall
+                    );
+                }
+            }
+        );
 
 
     scalarField psi = initialPsi;
@@ -1227,6 +1327,13 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << fractionInLevelsAtLeast(wavefronts.widths, 8, mesh.nCells)
         << "\nfraction in levels with width >= 16: "
         << fractionInLevelsAtLeast(wavefronts.widths, 16, mesh.nCells) << '\n';
+    std::cout << "Packed row contribution histogram:\n";
+    for (std::size_t degree=0; degree<contributionHistogram.size(); ++degree)
+    {
+        if (contributionHistogram[degree] != 0)
+            std::cout << "degree " << degree << ": "
+                << contributionHistogram[degree] << '\n';
+    }
     const std::size_t shown = std::min<std::size_t>(10, wavefronts.widths.size());
     printLevelWidths("first levels: ", wavefronts.widths, 0, shown);
     printLevelWidths
@@ -1309,6 +1416,16 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar productionInterleavedSpeedupReference =
         productionReferenceTiming.medianSeconds
        /productionInterleavedTiming.medianSeconds;
+    const scalar productionDegree6SpeedupPacked =
+        productionPackedTiming.medianSeconds/productionDegree6Timing.medianSeconds;
+    const scalar productionDegree6SpeedupReference =
+        productionReferenceTiming.medianSeconds/productionDegree6Timing.medianSeconds;
+    const scalar productionDegree6InterleavedSpeedupPacked =
+        productionPackedTiming.medianSeconds
+       /productionDegree6InterleavedTiming.medianSeconds;
+    const scalar productionDegree6InterleavedSpeedupReference =
+        productionReferenceTiming.medianSeconds
+       /productionDegree6InterleavedTiming.medianSeconds;
     std::cout << "\nProduction-like scalar ILP benchmark:"
         << "\n  calls/sample: " << productionCallsPerSample
         << "\n  sweeps/call: " << productionSweepsPerCall
@@ -1319,6 +1436,12 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     (
         "3-sweep Packed scalar interleaved rows",
         productionInterleavedTiming
+    );
+    printTiming("3-sweep Packed scalar degree-6", productionDegree6Timing);
+    printTiming
+    (
+        "3-sweep Packed scalar degree-6 4-way interleaved",
+        productionDegree6InterleavedTiming
     );
     std::cout << "\nInterleaved rows summary (median):"
         << "\nvariant          median(s)  ns/cell  CV(%)"
@@ -1331,9 +1454,22 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\ninterleaved rows " << productionInterleavedTiming.medianSeconds
         << "  " << productionInterleavedTiming.medianNsPerCellSweep
         << "  " << productionInterleavedTiming.cvPercent
-        << "\n  speedup vs packed/reference: "
+        << "\ndegree-6         " << productionDegree6Timing.medianSeconds
+        << "  " << productionDegree6Timing.medianNsPerCellSweep
+        << "  " << productionDegree6Timing.cvPercent
+        << "\ndegree-6 ILP     "
+        << productionDegree6InterleavedTiming.medianSeconds
+        << "  " << productionDegree6InterleavedTiming.medianNsPerCellSweep
+        << "  " << productionDegree6InterleavedTiming.cvPercent
+        << "\n  generic interleaved speedup vs packed/reference: "
         << productionInterleavedSpeedupPacked << "x / "
-        << productionInterleavedSpeedupReference << "x\n";
+        << productionInterleavedSpeedupReference << "x"
+        << "\n  degree-6 speedup vs packed/reference: "
+        << productionDegree6SpeedupPacked << "x / "
+        << productionDegree6SpeedupReference << "x"
+        << "\n  degree-6 ILP speedup vs packed/reference: "
+        << productionDegree6InterleavedSpeedupPacked << "x / "
+        << productionDegree6InterleavedSpeedupReference << "x\n";
 
     std::cout << "\nPrefetch summary (median):"
         << "\nvariant          distance  neighbours  median(s)  ns/cell  "

@@ -36,6 +36,22 @@ void serialGatherInterleavedRowsSmooth
     Foam::label nSweeps
 );
 
+void serialGatherDegree6Smooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
+void serialGatherDegree6InterleavedRowsSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
 void serialGatherPrefetchSmooth
 (
     Foam::scalarField& psi,

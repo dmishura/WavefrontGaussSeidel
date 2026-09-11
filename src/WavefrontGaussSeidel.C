@@ -168,6 +168,144 @@ void serialGatherInterleavedRowsSmooth
     }
 }
 
+void serialGatherDegree6Smooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const WavefrontSchedule& schedule,
+    const label nSweeps
+)
+{
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                const label begin = rowStarts[row];
+                if (rowStarts[row + 1] - begin == 6)
+                {
+                    psii -= coeffs[begin]*psi[cols[begin]];
+                    psii -= coeffs[begin + 1]*psi[cols[begin + 1]];
+                    psii -= coeffs[begin + 2]*psi[cols[begin + 2]];
+                    psii -= coeffs[begin + 3]*psi[cols[begin + 3]];
+                    psii -= coeffs[begin + 4]*psi[cols[begin + 4]];
+                    psii -= coeffs[begin + 5]*psi[cols[begin + 5]];
+                }
+                else
+                {
+                    for (label p=begin; p<rowStarts[row + 1]; ++p)
+                        psii -= coeffs[p]*psi[cols[p]];
+                }
+                psi[cell] = psii/diag[row];
+            }
+        }
+    }
+}
+
+void serialGatherDegree6InterleavedRowsSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const WavefrontSchedule& schedule,
+    const label nSweeps
+)
+{
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            const label levelEnd = levelStarts[level + 1];
+            label row = levelStarts[level];
+            while (row < levelEnd)
+            {
+                const bool fourDegree6 = row + 3 < levelEnd
+                    && rowStarts[row + 1] - rowStarts[row] == 6
+                    && rowStarts[row + 2] - rowStarts[row + 1] == 6
+                    && rowStarts[row + 3] - rowStarts[row + 2] == 6
+                    && rowStarts[row + 4] - rowStarts[row + 3] == 6;
+                if (fourDegree6)
+                {
+                    const label cell0 = waveCells[row];
+                    const label cell1 = waveCells[row + 1];
+                    const label cell2 = waveCells[row + 2];
+                    const label cell3 = waveCells[row + 3];
+                    const label p0 = rowStarts[row];
+                    const label p1 = rowStarts[row + 1];
+                    const label p2 = rowStarts[row + 2];
+                    const label p3 = rowStarts[row + 3];
+                    scalar s0 = source[cell0];
+                    scalar s1 = source[cell1];
+                    scalar s2 = source[cell2];
+                    scalar s3 = source[cell3];
+
+                    s0 -= coeffs[p0]*psi[cols[p0]];
+                    s1 -= coeffs[p1]*psi[cols[p1]];
+                    s2 -= coeffs[p2]*psi[cols[p2]];
+                    s3 -= coeffs[p3]*psi[cols[p3]];
+                    s0 -= coeffs[p0 + 1]*psi[cols[p0 + 1]];
+                    s1 -= coeffs[p1 + 1]*psi[cols[p1 + 1]];
+                    s2 -= coeffs[p2 + 1]*psi[cols[p2 + 1]];
+                    s3 -= coeffs[p3 + 1]*psi[cols[p3 + 1]];
+                    s0 -= coeffs[p0 + 2]*psi[cols[p0 + 2]];
+                    s1 -= coeffs[p1 + 2]*psi[cols[p1 + 2]];
+                    s2 -= coeffs[p2 + 2]*psi[cols[p2 + 2]];
+                    s3 -= coeffs[p3 + 2]*psi[cols[p3 + 2]];
+                    s0 -= coeffs[p0 + 3]*psi[cols[p0 + 3]];
+                    s1 -= coeffs[p1 + 3]*psi[cols[p1 + 3]];
+                    s2 -= coeffs[p2 + 3]*psi[cols[p2 + 3]];
+                    s3 -= coeffs[p3 + 3]*psi[cols[p3 + 3]];
+                    s0 -= coeffs[p0 + 4]*psi[cols[p0 + 4]];
+                    s1 -= coeffs[p1 + 4]*psi[cols[p1 + 4]];
+                    s2 -= coeffs[p2 + 4]*psi[cols[p2 + 4]];
+                    s3 -= coeffs[p3 + 4]*psi[cols[p3 + 4]];
+                    s0 -= coeffs[p0 + 5]*psi[cols[p0 + 5]];
+                    s1 -= coeffs[p1 + 5]*psi[cols[p1 + 5]];
+                    s2 -= coeffs[p2 + 5]*psi[cols[p2 + 5]];
+                    s3 -= coeffs[p3 + 5]*psi[cols[p3 + 5]];
+
+                    psi[cell0] = s0/diag[row];
+                    psi[cell1] = s1/diag[row + 1];
+                    psi[cell2] = s2/diag[row + 2];
+                    psi[cell3] = s3/diag[row + 3];
+                    row += 4;
+                }
+                else
+                {
+                    const label cell = waveCells[row];
+                    scalar psii = source[cell];
+                    for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                        psii -= coeffs[p]*psi[cols[p]];
+                    psi[cell] = psii/diag[row];
+                    ++row;
+                }
+            }
+        }
+    }
+}
+
 void serialReorderedPsiSmooth
 (
     Foam::scalarField& originalPsiField,
