@@ -10,10 +10,13 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <omp.h>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -380,12 +383,47 @@ struct ImplementationTiming
     label samples = 0;
     label sweepsPerSample = 0;
     scalar minimumSeconds = 0;
+    scalar maximumSeconds = 0;
     scalar medianSeconds = 0;
     scalar meanSeconds = 0;
     scalar stddevSeconds = 0;
     scalar cvPercent = 0;
     scalar medianNsPerCellSweep = 0;
 };
+
+ImplementationTiming summarizeTimings
+(
+    const std::vector<scalar>& secondsPerSweep,
+    const std::size_t nCells,
+    const label sweepsPerSample
+)
+{
+    std::vector<scalar> sorted = secondsPerSweep;
+    std::sort(sorted.begin(), sorted.end());
+    ImplementationTiming result;
+    result.samples = static_cast<label>(secondsPerSweep.size());
+    result.sweepsPerSample = sweepsPerSample;
+    result.minimumSeconds = sorted.front();
+    result.maximumSeconds = sorted.back();
+    result.medianSeconds = sorted[sorted.size()/2];
+    result.meanSeconds = std::accumulate
+    (
+        secondsPerSweep.begin(), secondsPerSweep.end(), scalar(0)
+    )/secondsPerSweep.size();
+    scalar squaredDeviation = 0;
+    for (const scalar seconds : secondsPerSweep)
+    {
+        const scalar deviation = seconds - result.meanSeconds;
+        squaredDeviation += deviation*deviation;
+    }
+    result.stddevSeconds = std::sqrt
+    (
+        squaredDeviation/secondsPerSweep.size()
+    );
+    result.cvPercent = 100*result.stddevSeconds/result.meanSeconds;
+    result.medianNsPerCellSweep = 1e9*result.medianSeconds/nCells;
+    return result;
+}
 
 template<class SweepFunction>
 ImplementationTiming timeSweepImplementation
@@ -417,26 +455,59 @@ ImplementationTiming timeSweepImplementation
         );
     }
 
-    std::vector<scalar> sorted = secondsPerSweep;
-    std::sort(sorted.begin(), sorted.end());
-    ImplementationTiming result;
-    result.samples = samples;
-    result.sweepsPerSample = sweepsPerSample;
-    result.minimumSeconds = sorted.front();
-    result.medianSeconds = sorted[sorted.size()/2];
-    result.meanSeconds = std::accumulate
-    (
-        secondsPerSweep.begin(), secondsPerSweep.end(), scalar(0)
-    )/samples;
-    scalar squaredDeviation = 0;
-    for (const scalar seconds : secondsPerSweep)
+    return summarizeTimings(secondsPerSweep, nCells, sweepsPerSample);
+}
+
+struct RandomizedBenchmarkVariant
+{
+    const char* name;
+    std::function<void(scalarField&, label)> executeSweeps;
+};
+
+std::vector<ImplementationTiming> timeRandomizedImplementations
+(
+    const scalarField& initialPsi,
+    const std::size_t nCells,
+    const label samples,
+    const label sweepsPerSample,
+    const label warmupSweeps,
+    const std::uint32_t seed,
+    const std::vector<RandomizedBenchmarkVariant>& variants
+)
+{
+    std::vector<std::vector<scalar>> secondsPerSweep(variants.size());
+    for (std::vector<scalar>& timings : secondsPerSweep) timings.reserve(samples);
+    scalarField psi(initialPsi.size());
+    for (const RandomizedBenchmarkVariant& variant : variants)
     {
-        const scalar deviation = seconds - result.meanSeconds;
-        squaredDeviation += deviation*deviation;
+        psi = initialPsi;
+        variant.executeSweeps(psi, warmupSweeps);
     }
-    result.stddevSeconds = std::sqrt(squaredDeviation/samples);
-    result.cvPercent = 100*result.stddevSeconds/result.meanSeconds;
-    result.medianNsPerCellSweep = 1e9*result.medianSeconds/nCells;
+
+    std::vector<std::size_t> order(variants.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::mt19937 random(seed);
+    for (label sample=0; sample<samples; ++sample)
+    {
+        std::shuffle(order.begin(), order.end(), random);
+        for (const std::size_t variantIndex : order)
+        {
+            psi = initialPsi;
+            const auto begin = std::chrono::steady_clock::now();
+            variants[variantIndex].executeSweeps(psi, sweepsPerSample);
+            const auto end = std::chrono::steady_clock::now();
+            secondsPerSweep[variantIndex].push_back
+            (
+                std::chrono::duration<scalar>(end - begin).count()
+               /sweepsPerSample
+            );
+        }
+    }
+
+    std::vector<ImplementationTiming> result;
+    result.reserve(variants.size());
+    for (const std::vector<scalar>& timings : secondsPerSweep)
+        result.push_back(summarizeTimings(timings, nCells, sweepsPerSample));
     return result;
 }
 
@@ -446,6 +517,7 @@ void printTiming(const char* variant, const ImplementationTiming& timing)
         << "\n  samples: " << timing.samples
         << "\n  sweeps/sample: " << timing.sweepsPerSample
         << "\n  min: " << timing.minimumSeconds << " s/sweep"
+        << "\n  max: " << timing.maximumSeconds << " s/sweep"
         << "\n  median: " << timing.medianSeconds << " s/sweep"
         << "\n  mean: " << timing.meanSeconds << " s/sweep"
         << "\n  stddev: " << timing.stddevSeconds << " s/sweep"
@@ -1125,11 +1197,11 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     constexpr label productionSweepsPerSample =
         productionSweepsPerCall*productionCallsPerSample;
     constexpr label productionWarmupSweeps = 12;
-    const ImplementationTiming productionReferenceTiming =
-        timeSweepImplementation
-        (
-            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
-            productionWarmupSweeps,
+    constexpr std::uint32_t productionBenchmarkSeed = 0x5EED1234u;
+    const std::vector<RandomizedBenchmarkVariant> productionVariants
+    {
+        {
+            "Reference GS",
             [&](scalarField& timedPsi, const label nSweeps)
             {
                 for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
@@ -1142,12 +1214,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                     );
                 }
             }
-        );
-    const ImplementationTiming productionPackedTiming =
-        timeSweepImplementation
-        (
-            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
-            productionWarmupSweeps,
+        },
+        {
+            "Packed scalar",
             [&](scalarField& timedPsi, const label nSweeps)
             {
                 for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
@@ -1158,12 +1227,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                     );
                 }
             }
-        );
-    const ImplementationTiming productionInterleavedTiming =
-        timeSweepImplementation
-        (
-            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
-            productionWarmupSweeps,
+        },
+        {
+            "Generic 4-way",
             [&](scalarField& timedPsi, const label nSweeps)
             {
                 for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
@@ -1174,12 +1240,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                     );
                 }
             }
-        );
-    const ImplementationTiming productionDegree6Timing =
-        timeSweepImplementation
-        (
-            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
-            productionWarmupSweeps,
+        },
+        {
+            "Degree-6 scalar",
             [&](scalarField& timedPsi, const label nSweeps)
             {
                 for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
@@ -1190,12 +1253,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                     );
                 }
             }
-        );
-    const ImplementationTiming productionDegree6InterleavedTiming =
-        timeSweepImplementation
-        (
-            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
-            productionWarmupSweeps,
+        },
+        {
+            "Degree-6 4-way",
             [&](scalarField& timedPsi, const label nSweeps)
             {
                 for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
@@ -1206,7 +1266,21 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                     );
                 }
             }
+        }
+    };
+    const std::vector<ImplementationTiming> productionTimings =
+        timeRandomizedImplementations
+        (
+            initialPsi, mesh.nCells, timingSamples, productionSweepsPerSample,
+            productionWarmupSweeps, productionBenchmarkSeed,
+            productionVariants
         );
+    const ImplementationTiming& productionReferenceTiming = productionTimings[0];
+    const ImplementationTiming& productionPackedTiming = productionTimings[1];
+    const ImplementationTiming& productionInterleavedTiming = productionTimings[2];
+    const ImplementationTiming& productionDegree6Timing = productionTimings[3];
+    const ImplementationTiming& productionDegree6InterleavedTiming =
+        productionTimings[4];
 
 
     scalarField psi = initialPsi;
@@ -1429,6 +1503,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     std::cout << "\nProduction-like scalar ILP benchmark:"
         << "\n  calls/sample: " << productionCallsPerSample
         << "\n  sweeps/call: " << productionSweepsPerCall
+        << "\n  randomized variant-order seed: " << productionBenchmarkSeed
         << "\n  OpenMP threads detected: " << persistentThreads << '\n';
     printTiming("3-sweep Reference GS", productionReferenceTiming);
     printTiming("3-sweep Packed scalar", productionPackedTiming);
@@ -1469,7 +1544,17 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << productionDegree6SpeedupReference << "x"
         << "\n  degree-6 ILP speedup vs packed/reference: "
         << productionDegree6InterleavedSpeedupPacked << "x / "
-        << productionDegree6InterleavedSpeedupReference << "x\n";
+        << productionDegree6InterleavedSpeedupReference << "x"
+        << "\n  speedup vs packed, reference: "
+        << productionPackedTiming.medianSeconds
+           /productionReferenceTiming.medianSeconds << "x"
+        << "\n  speedup vs packed, packed scalar: 1x"
+        << "\n  speedup vs packed, generic 4-way: "
+        << productionInterleavedSpeedupPacked << "x"
+        << "\n  speedup vs packed, degree-6 scalar: "
+        << productionDegree6SpeedupPacked << "x"
+        << "\n  speedup vs packed, degree-6 4-way: "
+        << productionDegree6InterleavedSpeedupPacked << "x\n";
 
     std::cout << "\nPrefetch summary (median):"
         << "\nvariant          distance  neighbours  median(s)  ns/cell  "
