@@ -593,6 +593,92 @@ struct PackedIndexStatistics
     std::uint64_t maximumSpan = 0;
 };
 
+struct AddressSequenceStatistics
+{
+    std::size_t elements = 0;
+    std::size_t consecutiveEqual = 0;
+    std::size_t runs = 0;
+    std::size_t runsLength1 = 0;
+    std::size_t runsLength2 = 0;
+    std::size_t runsLength3 = 0;
+    std::size_t runsLength4Plus = 0;
+    std::size_t maximumRunLength = 0;
+};
+
+template<class Sequence>
+AddressSequenceStatistics addressSequenceStatistics(const Sequence& values)
+{
+    AddressSequenceStatistics result;
+    result.elements = values.size();
+    if (values.empty()) return result;
+    const auto recordRun = [&](const std::size_t length)
+    {
+        ++result.runs;
+        result.maximumRunLength = std::max(result.maximumRunLength, length);
+        if (length == 1) ++result.runsLength1;
+        else if (length == 2) ++result.runsLength2;
+        else if (length == 3) ++result.runsLength3;
+        else ++result.runsLength4Plus;
+    };
+    std::size_t runLength = 1;
+    for (std::size_t i=1; i<values.size(); ++i)
+    {
+        if (values[i] == values[i - 1])
+        {
+            ++result.consecutiveEqual;
+            ++runLength;
+        }
+        else
+        {
+            recordRun(runLength);
+            runLength = 1;
+        }
+    }
+    recordRun(runLength);
+    return result;
+}
+
+template<class Sequence>
+void printAddressSequenceDiagnostics
+(
+    const char* name,
+    const char* mapping,
+    const Sequence& values,
+    const AddressSequenceStatistics& statistics
+)
+{
+    constexpr std::size_t sampleSize = 64;
+    std::cout << name << ":"
+        << "\n  mapping: " << mapping
+        << "\n  elements: " << statistics.elements
+        << "\n  consecutive equal: " << statistics.consecutiveEqual
+        << " (" << 100*scalar(statistics.consecutiveEqual)
+           /statistics.elements << " %)"
+        << "\n  runs: " << statistics.runs << "/" << statistics.elements
+        << "\n  runs length 1: " << statistics.runsLength1
+        << "\n  runs length 2: " << statistics.runsLength2
+        << "\n  runs length 3: " << statistics.runsLength3
+        << "\n  runs length 4+: " << statistics.runsLength4Plus
+        << "\n  maximum run length: " << statistics.maximumRunLength
+        << "\n  first " << std::min(sampleSize, values.size()) << " values:";
+    for (std::size_t i=0; i<std::min(sampleSize, values.size()); ++i)
+        std::cout << ' ' << values[i];
+    std::cout << '\n';
+}
+
+std::vector<label> makeLosortAddressing(const PolyMeshTopology& mesh)
+{
+    std::vector<label> starts(mesh.nCells + 1, 0);
+    for (const int neighbour : mesh.neighbour) ++starts[neighbour + 1];
+    for (std::size_t cell=0; cell<mesh.nCells; ++cell)
+        starts[cell + 1] += starts[cell];
+    std::vector<label> cursor = starts;
+    std::vector<label> losort(mesh.nInternalFaces());
+    for (label face=0; face<label(mesh.nInternalFaces()); ++face)
+        losort[cursor[mesh.neighbour[face]]++] = face;
+    return losort;
+}
+
 struct PsiAccessStatistics
 {
     std::size_t contributions = 0;
@@ -839,6 +925,19 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const RowLengthStatistics rowLengths = rowLengthStatistics(schedule);
     const PackedIndexStatistics packedIndices = packedIndexStatistics(schedule);
     const PsiAccessStatistics psiAccesses = psiAccessStatistics(schedule);
+    const std::vector<int> lowerAddressing
+    (
+        mesh.owner.begin(), mesh.owner.begin() + mesh.nInternalFaces()
+    );
+    const std::vector<label> losortAddressing = makeLosortAddressing(mesh);
+    const AddressSequenceStatistics lowerAddressingStatistics =
+        addressSequenceStatistics(lowerAddressing);
+    const AddressSequenceStatistics upperAddressingStatistics =
+        addressSequenceStatistics(mesh.neighbour);
+    const AddressSequenceStatistics losortAddressingStatistics =
+        addressSequenceStatistics(losortAddressing);
+    const AddressSequenceStatistics packedColsStatistics =
+        addressSequenceStatistics(schedule.cols);
     const std::vector<std::size_t> contributionHistogram =
         rowLengthHistogram(schedule);
     const scalarField initialPsi(exact.size(), 0.0);
@@ -1610,6 +1709,35 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << 100*psiAccesses.deltaAtMost256/deltaCount << " %"
         << "\n  adjacent-column delta <= 4096: "
         << 100*psiAccesses.deltaAtMost4096/deltaCount << " %\n";
+    std::cout << "LDU addressing sequence diagnostics:\n";
+    printAddressSequenceDiagnostics
+    (
+        "lowerAddr",
+        "face -> owner/current cell; the smoother does not load psi through "
+        "this array in its owner-grouped forward loop",
+        lowerAddressing, lowerAddressingStatistics
+    );
+    printAddressSequenceDiagnostics
+    (
+        "upperAddr",
+        "face -> neighbour cell; the reference smoother loads "
+        "psi[upperAddr[face]]",
+        mesh.neighbour, upperAddressingStatistics
+    );
+    printAddressSequenceDiagnostics
+    (
+        "losortAddr",
+        "neighbour-grouped position -> original face; psi owner would be "
+        "lowerAddr[losortAddr[position]] (not used by this forward kernel)",
+        losortAddressing, losortAddressingStatistics
+    );
+    printAddressSequenceDiagnostics
+    (
+        "packed cols",
+        "packed contribution -> original neighbour/owner cell; packed "
+        "kernels load psi[cols[p]]",
+        schedule.cols, packedColsStatistics
+    );
     const std::size_t shown = std::min<std::size_t>(10, wavefronts.widths.size());
     printLevelWidths("first levels: ", wavefronts.widths, 0, shown);
     printLevelWidths
