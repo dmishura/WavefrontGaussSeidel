@@ -1,5 +1,5 @@
 CXX ?= c++
-CXXFLAGS ?= -O2 -g
+CXXFLAGS ?= -O3 -g
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -fopenmp -Icompat -Isrc
 HISTORY_SWEEPS ?= 20
 AVX512_FLAGS ?= -mavx512f -mavx512vl
