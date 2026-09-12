@@ -378,6 +378,66 @@ WavefrontSchedule makeLocalityReorderedSchedule
     return reordered;
 }
 
+WavefrontSchedule makeMedianRowReorderedSchedule
+(
+    const WavefrontSchedule& original
+)
+{
+    WavefrontSchedule reordered;
+    reordered.levelStarts = original.levelStarts;
+    reordered.waveCells.reserve(original.waveCells.size());
+    reordered.rowStarts.reserve(original.rowStarts.size());
+    reordered.cols.reserve(original.cols.size());
+    reordered.coeffs.reserve(original.coeffs.size());
+    reordered.diag.reserve(original.diag.size());
+    reordered.rowStarts.push_back(0);
+
+    for (std::size_t level=0; level + 1<original.levelStarts.size(); ++level)
+    {
+        std::vector<std::pair<std::int64_t, label>> keyedRows;
+        for (label row=original.levelStarts[level]; row<original.levelStarts[level + 1]; ++row)
+        {
+            const label begin = original.rowStarts[row];
+            const label end = original.rowStarts[row + 1];
+            std::vector<label> columns
+            (
+                original.cols.begin() + begin, original.cols.begin() + end
+            );
+            std::sort(columns.begin(), columns.end());
+            std::int64_t doubledMedian = 2*std::int64_t(original.waveCells[row]);
+            if (!columns.empty())
+            {
+                const std::size_t middle = columns.size()/2;
+                doubledMedian = columns.size() % 2
+                    ? 2*std::int64_t(columns[middle])
+                    : std::int64_t(columns[middle - 1]) + columns[middle];
+            }
+            keyedRows.emplace_back(doubledMedian, row);
+        }
+        std::stable_sort
+        (
+            keyedRows.begin(), keyedRows.end(),
+            [](const auto& left, const auto& right)
+            {
+                return left.first < right.first;
+            }
+        );
+        for (const auto& [key, row] : keyedRows)
+        {
+            static_cast<void>(key);
+            reordered.waveCells.push_back(original.waveCells[row]);
+            reordered.diag.push_back(original.diag[row]);
+            for (label p=original.rowStarts[row]; p<original.rowStarts[row + 1]; ++p)
+            {
+                reordered.cols.push_back(original.cols[p]);
+                reordered.coeffs.push_back(original.coeffs[p]);
+            }
+            reordered.rowStarts.push_back(reordered.cols.size());
+        }
+    }
+    return reordered;
+}
+
 struct ImplementationTiming
 {
     label samples = 0;
@@ -918,6 +978,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         makeWavefrontSchedule(mesh, matrix, wavefronts);
     const WavefrontSchedule localitySchedule =
         makeLocalityReorderedSchedule(schedule);
+    const WavefrontSchedule medianRowSchedule =
+        makeMedianRowReorderedSchedule(schedule);
     const auto preprocessingEnd = std::chrono::steady_clock::now();
     const scalar preprocessingSeconds =
         std::chrono::duration<scalar>
@@ -974,6 +1036,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     );
     scalarField psiLocality = initialPsi;
     serialGatherSmooth(psiLocality, source, localitySchedule, 1);
+    scalarField psiMedianRow = initialPsi;
+    serialGatherSmooth(psiMedianRow, source, medianRowSchedule, 1);
     const bool avx512Available = avx512GatherAvailable();
     const bool avx2Available = avx2GatherAvailable();
     scalarField psiAvx2 = initialPsi;
@@ -1014,6 +1078,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar degree6InterleavedVsPackedMaxAbs =
         maxAbsDifference(psiSerialGather, psiDegree6Interleaved);
     const scalar localityMaxAbs = maxAbsDifference(psiReference, psiLocality);
+    const scalar medianRowMaxAbs = maxAbsDifference(psiReference, psiMedianRow);
+    const scalar medianRowVsPackedMaxAbs =
+        maxAbsDifference(psiSerialGather, psiMedianRow);
     const scalar prefetchFirstMaxAbs =
         maxAbsDifference(psiReference, psiPrefetchFirst);
     const scalar prefetchTwoMaxAbs =
@@ -1038,6 +1105,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         l2Differences(psiReference, psiDegree6Interleaved);
     const auto [localityL2, localityRelativeL2] =
         l2Differences(psiReference, psiLocality);
+    const auto [medianRowL2, medianRowRelativeL2] =
+        l2Differences(psiReference, psiMedianRow);
     const auto [prefetchFirstL2, prefetchFirstRelativeL2] =
         l2Differences(psiReference, psiPrefetchFirst);
     const auto [prefetchTwoL2, prefetchTwoRelativeL2] =
@@ -1065,6 +1134,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar degree6InterleavedResidual =
         relativeResidual(matrix, psiDegree6Interleaved, source);
     const scalar localityResidual = relativeResidual(matrix, psiLocality, source);
+    const scalar medianRowResidual =
+        relativeResidual(matrix, psiMedianRow, source);
     const scalar prefetchFirstResidual =
         relativeResidual(matrix, psiPrefetchFirst, source);
     const scalar prefetchTwoResidual =
@@ -1089,6 +1160,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::abs(referenceOneSweepResidual - avx512AcrossRowsResidual);
     const scalar localityResidualDifference =
         std::abs(referenceOneSweepResidual - localityResidual);
+    const scalar medianRowResidualDifference =
+        std::abs(referenceOneSweepResidual - medianRowResidual);
     const scalar prefetchFirstResidualDifference =
         std::abs(referenceOneSweepResidual - prefetchFirstResidual);
     const scalar prefetchTwoResidualDifference =
@@ -1116,6 +1189,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nPrefetch (8, first) residual:   " << prefetchFirstResidual
         << "\nPrefetch (8, first 2) residual: " << prefetchTwoResidual
         << "\nLocality-reordered residual:    " << localityResidual
+        << "\nMedian-row reordered residual:  " << medianRowResidual
         << "\nSerial packed AVX2 residual:    " << avx2Residual
         << "\nAVX2 across-rows residual:      " << avx2AcrossRowsResidual
         << "\nSerial packed AVX-512 residual: " << avx512Residual
@@ -1136,6 +1210,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << prefetchTwoResidualDifference
         << "\nLocality-reordered residual difference: "
         << localityResidualDifference
+        << "\nMedian-row residual difference:        "
+        << medianRowResidualDifference
         << "\nAVX-512 residual difference:           "
         << avx512ResidualDifference
         << "\nAVX2 residual difference:              "
@@ -1160,6 +1236,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmax |reference - prefetch first|: " << prefetchFirstMaxAbs
         << "\nmax |reference - prefetch first 2|: " << prefetchTwoMaxAbs
         << "\nmax |reference - locality|:       " << localityMaxAbs
+        << "\nmax |reference - median-row|:     " << medianRowMaxAbs
+        << "\nmax |packed - median-row|:        " << medianRowVsPackedMaxAbs
         << "\nmax |reference - AVX-512|:        " << avx512MaxAbs
         << "\nmax |reference - AVX2|:           " << avx2MaxAbs
         << "\nmax |reference - AVX2 rows|:      " << avx2AcrossRowsMaxAbs
@@ -1180,6 +1258,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << prefetchTwoL2 << " / " << prefetchTwoRelativeL2
         << "\nlocality L2 / relative L2:       "
         << localityL2 << " / " << localityRelativeL2
+        << "\nmedian-row L2 / relative L2:     "
+        << medianRowL2 << " / " << medianRowRelativeL2
         << "\nAVX-512 L2 / relative L2:        "
         << avx512L2 << " / " << avx512RelativeL2
         << "\nAVX2 L2 / relative L2:           "
@@ -1220,6 +1300,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nprefetch first equivalence:      " << status(prefetchFirstMaxAbs)
         << "\nprefetch first 2 equivalence:    " << status(prefetchTwoMaxAbs)
         << "\nlocality-reordered equivalence:  " << status(localityMaxAbs)
+        << "\nmedian-row exact equality:       "
+        << (medianRowMaxAbs == 0 ? "PASS" : "NO")
+        << "\nmedian-row equivalence:          " << status(medianRowMaxAbs)
         << "\nAVX-512 equivalence:             " << status(avx512MaxAbs)
         << "\nAVX2 equivalence:                " << status(avx2MaxAbs)
         << "\nAVX2 across-rows equivalence:    " << status(avx2AcrossRowsMaxAbs)
@@ -1251,6 +1334,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
      || prefetchTwoResidualDifference > equivalenceTolerance
      || localityMaxAbs > equivalenceTolerance
      || localityResidualDifference > equivalenceTolerance
+     || medianRowMaxAbs > equivalenceTolerance
+     || medianRowVsPackedMaxAbs > equivalenceTolerance
+     || medianRowResidualDifference > equivalenceTolerance
      || avx2MaxAbs > equivalenceTolerance
      || avx2ResidualDifference > equivalenceTolerance
      || avx2AcrossRowsMaxAbs > equivalenceTolerance
@@ -1514,6 +1600,20 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                     );
                 }
             }
+        },
+        {
+            "Median-row reordered packed scalar",
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialGatherSmooth
+                    (
+                        timedPsi, source, medianRowSchedule,
+                        productionSweepsPerCall
+                    );
+                }
+            }
         }
     };
     const std::vector<ImplementationTiming> productionTimings =
@@ -1529,6 +1629,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const ImplementationTiming& productionDegree6Timing = productionTimings[3];
     const ImplementationTiming& productionDegree6InterleavedTiming =
         productionTimings[4];
+    const ImplementationTiming& productionMedianRowTiming = productionTimings[5];
 
 
     scalarField psi = initialPsi;
@@ -1830,6 +1931,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar productionDegree6InterleavedSpeedupReference =
         productionReferenceTiming.medianSeconds
        /productionDegree6InterleavedTiming.medianSeconds;
+    const scalar productionMedianRowSpeedupPacked =
+        productionPackedTiming.medianSeconds/productionMedianRowTiming.medianSeconds;
+    const scalar productionMedianRowSpeedupReference =
+        productionReferenceTiming.medianSeconds/productionMedianRowTiming.medianSeconds;
     std::cout << "\nProduction-like scalar ILP benchmark:"
         << "\n  calls/sample: " << productionCallsPerSample
         << "\n  sweeps/call: " << productionSweepsPerCall
@@ -1847,6 +1952,11 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     (
         "3-sweep Packed scalar degree-6 4-way interleaved",
         productionDegree6InterleavedTiming
+    );
+    printTiming
+    (
+        "3-sweep Median-row reordered packed scalar",
+        productionMedianRowTiming
     );
     std::cout << "\nInterleaved rows summary (median):"
         << "\nvariant          median(s)  ns/cell  CV(%)"
@@ -1866,6 +1976,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << productionDegree6InterleavedTiming.medianSeconds
         << "  " << productionDegree6InterleavedTiming.medianNsPerCellSweep
         << "  " << productionDegree6InterleavedTiming.cvPercent
+        << "\nmedian-row       " << productionMedianRowTiming.medianSeconds
+        << "  " << productionMedianRowTiming.medianNsPerCellSweep
+        << "  " << productionMedianRowTiming.cvPercent
         << "\n  generic interleaved speedup vs packed/reference: "
         << productionInterleavedSpeedupPacked << "x / "
         << productionInterleavedSpeedupReference << "x"
@@ -1875,6 +1988,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  degree-6 ILP speedup vs packed/reference: "
         << productionDegree6InterleavedSpeedupPacked << "x / "
         << productionDegree6InterleavedSpeedupReference << "x"
+        << "\n  median-row speedup vs packed/reference: "
+        << productionMedianRowSpeedupPacked << "x / "
+        << productionMedianRowSpeedupReference << "x"
         << "\n  speedup vs packed, reference: "
         << productionPackedTiming.medianSeconds
            /productionReferenceTiming.medianSeconds << "x"
@@ -1884,7 +2000,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  speedup vs packed, degree-6 scalar: "
         << productionDegree6SpeedupPacked << "x"
         << "\n  speedup vs packed, degree-6 4-way: "
-        << productionDegree6InterleavedSpeedupPacked << "x\n";
+        << productionDegree6InterleavedSpeedupPacked << "x"
+        << "\n  speedup vs packed, median-row reordered: "
+        << productionMedianRowSpeedupPacked << "x\n";
 
     std::cout << "\nPrefetch summary (median):"
         << "\nvariant          distance  neighbours  median(s)  ns/cell  "
