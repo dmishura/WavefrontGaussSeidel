@@ -593,6 +593,90 @@ struct PackedIndexStatistics
     std::uint64_t maximumSpan = 0;
 };
 
+struct PsiAccessStatistics
+{
+    std::size_t contributions = 0;
+    std::size_t repeatedContributions = 0;
+    std::size_t runs = 0;
+    std::size_t runsLength1 = 0;
+    std::size_t runsLength2 = 0;
+    std::size_t runsLength3 = 0;
+    std::size_t runsLength4Plus = 0;
+    std::size_t deltas = 0;
+    std::size_t deltaAtMost1 = 0;
+    std::size_t deltaAtMost8 = 0;
+    std::size_t deltaAtMost64 = 0;
+    std::size_t deltaAtMost256 = 0;
+    std::size_t deltaAtMost4096 = 0;
+    scalar meanDelta = 0;
+    scalar medianDelta = 0;
+    std::uint64_t p90Delta = 0;
+    std::uint64_t p95Delta = 0;
+    std::uint64_t maximumDelta = 0;
+};
+
+PsiAccessStatistics psiAccessStatistics(const WavefrontSchedule& schedule)
+{
+    PsiAccessStatistics result;
+    std::vector<std::uint64_t> deltas;
+    deltas.reserve(schedule.cols.size() - schedule.waveCells.size());
+    std::uint64_t totalDelta = 0;
+    const auto recordRun = [&](const std::size_t length)
+    {
+        ++result.runs;
+        if (length == 1) ++result.runsLength1;
+        else if (length == 2) ++result.runsLength2;
+        else if (length == 3) ++result.runsLength3;
+        else ++result.runsLength4Plus;
+    };
+
+    result.contributions = schedule.cols.size();
+    for (std::size_t row=0; row<schedule.waveCells.size(); ++row)
+    {
+        const label begin = schedule.rowStarts[row];
+        const label end = schedule.rowStarts[row + 1];
+        if (begin == end) continue;
+        std::size_t runLength = 1;
+        for (label p=begin + 1; p<end; ++p)
+        {
+            const std::int64_t difference =
+                std::int64_t(schedule.cols[p]) - schedule.cols[p - 1];
+            const std::uint64_t delta = static_cast<std::uint64_t>
+            (
+                difference < 0 ? -difference : difference
+            );
+            deltas.push_back(delta);
+            totalDelta += delta;
+            result.deltaAtMost1 += delta <= 1;
+            result.deltaAtMost8 += delta <= 8;
+            result.deltaAtMost64 += delta <= 64;
+            result.deltaAtMost256 += delta <= 256;
+            result.deltaAtMost4096 += delta <= 4096;
+            if (delta == 0)
+            {
+                ++result.repeatedContributions;
+                ++runLength;
+            }
+            else
+            {
+                recordRun(runLength);
+                runLength = 1;
+            }
+        }
+        recordRun(runLength);
+    }
+    std::sort(deltas.begin(), deltas.end());
+    result.deltas = deltas.size();
+    result.meanDelta = scalar(totalDelta)/deltas.size();
+    result.medianDelta = deltas.size() % 2
+        ? scalar(deltas[deltas.size()/2])
+        : 0.5*scalar(deltas[deltas.size()/2 - 1] + deltas[deltas.size()/2]);
+    result.p90Delta = deltas[static_cast<std::size_t>(0.90*(deltas.size() - 1))];
+    result.p95Delta = deltas[static_cast<std::size_t>(0.95*(deltas.size() - 1))];
+    result.maximumDelta = deltas.back();
+    return result;
+}
+
 PackedIndexStatistics packedIndexStatistics(const WavefrontSchedule& schedule)
 {
     std::vector<std::uint64_t> spans;
@@ -754,6 +838,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         (preprocessingEnd - preprocessingBegin).count();
     const RowLengthStatistics rowLengths = rowLengthStatistics(schedule);
     const PackedIndexStatistics packedIndices = packedIndexStatistics(schedule);
+    const PsiAccessStatistics psiAccesses = psiAccessStatistics(schedule);
     const std::vector<std::size_t> contributionHistogram =
         rowLengthHistogram(schedule);
     const scalarField initialPsi(exact.size(), 0.0);
@@ -1492,6 +1577,39 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << 100*scalar(packedIndices.uint16SpanRows)/rowCount << " % ("
         << packedIndices.uint16SpanRows << "/" << schedule.waveCells.size()
         << ")\n";
+    const scalar deltaCount = psiAccesses.deltas;
+    const std::size_t savedPsiLoads =
+        psiAccesses.contributions - psiAccesses.runs;
+    std::cout << "Packed psi access diagnostics:"
+        << "\n  contributions: " << psiAccesses.contributions
+        << "\n  consecutive repeated cols: " << psiAccesses.repeatedContributions
+        << " (" << 100*scalar(psiAccesses.repeatedContributions)
+           /psiAccesses.contributions << " %)"
+        << "\n  runs total: " << psiAccesses.runs
+        << "\n  runs length 1: " << psiAccesses.runsLength1
+        << "\n  runs length 2: " << psiAccesses.runsLength2
+        << "\n  runs length 3: " << psiAccesses.runsLength3
+        << "\n  runs length 4+: " << psiAccesses.runsLength4Plus
+        << "\n  runs/contributions: " << psiAccesses.runs << "/"
+        << psiAccesses.contributions << " ("
+        << 100*scalar(psiAccesses.runs)/psiAccesses.contributions << " %)"
+        << "\n  theoretical saved psi loads: " << savedPsiLoads
+        << " (" << 100*scalar(savedPsiLoads)/psiAccesses.contributions << " %)"
+        << "\n  adjacent-column delta mean: " << psiAccesses.meanDelta
+        << "\n  adjacent-column delta median: " << psiAccesses.medianDelta
+        << "\n  adjacent-column delta p90: " << psiAccesses.p90Delta
+        << "\n  adjacent-column delta p95: " << psiAccesses.p95Delta
+        << "\n  adjacent-column delta max: " << psiAccesses.maximumDelta
+        << "\n  adjacent-column delta <= 1: "
+        << 100*psiAccesses.deltaAtMost1/deltaCount << " %"
+        << "\n  adjacent-column delta <= 8: "
+        << 100*psiAccesses.deltaAtMost8/deltaCount << " %"
+        << "\n  adjacent-column delta <= 64: "
+        << 100*psiAccesses.deltaAtMost64/deltaCount << " %"
+        << "\n  adjacent-column delta <= 256: "
+        << 100*psiAccesses.deltaAtMost256/deltaCount << " %"
+        << "\n  adjacent-column delta <= 4096: "
+        << 100*psiAccesses.deltaAtMost4096/deltaCount << " %\n";
     const std::size_t shown = std::min<std::size_t>(10, wavefronts.widths.size());
     printLevelWidths("first levels: ", wavefronts.widths, 0, shown);
     printLevelWidths
