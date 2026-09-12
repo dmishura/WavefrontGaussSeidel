@@ -579,6 +579,69 @@ struct RowLengthStatistics
     scalar averageActiveLanes = 0;
 };
 
+struct PackedIndexStatistics
+{
+    std::size_t contributions = 0;
+    std::size_t int16Contributions = 0;
+    std::size_t int16Rows = 0;
+    std::size_t uint16SpanRows = 0;
+    std::uint64_t minimumSpan = 0;
+    scalar meanSpan = 0;
+    scalar medianSpan = 0;
+    std::uint64_t p90Span = 0;
+    std::uint64_t p95Span = 0;
+    std::uint64_t maximumSpan = 0;
+};
+
+PackedIndexStatistics packedIndexStatistics(const WavefrontSchedule& schedule)
+{
+    std::vector<std::uint64_t> spans;
+    spans.reserve(schedule.waveCells.size());
+    std::uint64_t totalSpan = 0;
+    PackedIndexStatistics result;
+    for (std::size_t row=0; row<schedule.waveCells.size(); ++row)
+    {
+        const std::int64_t cell = schedule.waveCells[row];
+        const label begin = schedule.rowStarts[row];
+        const label end = schedule.rowStarts[row + 1];
+        bool rowFitsInt16 = true;
+        std::int64_t minimumColumn = cell;
+        std::int64_t maximumColumn = cell;
+        if (begin < end)
+        {
+            minimumColumn = schedule.cols[begin];
+            maximumColumn = schedule.cols[begin];
+        }
+        for (label p=begin; p<end; ++p)
+        {
+            const std::int64_t column = schedule.cols[p];
+            const std::int64_t offset = column - cell;
+            const bool fitsInt16 = offset >= -32768 && offset <= 32767;
+            result.int16Contributions += fitsInt16;
+            rowFitsInt16 = rowFitsInt16 && fitsInt16;
+            minimumColumn = std::min(minimumColumn, column);
+            maximumColumn = std::max(maximumColumn, column);
+        }
+        result.contributions += static_cast<std::size_t>(end - begin);
+        result.int16Rows += rowFitsInt16;
+        const std::uint64_t span =
+            static_cast<std::uint64_t>(maximumColumn - minimumColumn);
+        result.uint16SpanRows += span <= 65535;
+        totalSpan += span;
+        spans.push_back(span);
+    }
+    std::sort(spans.begin(), spans.end());
+    result.minimumSpan = spans.front();
+    result.meanSpan = scalar(totalSpan)/spans.size();
+    result.medianSpan = spans.size() % 2
+        ? scalar(spans[spans.size()/2])
+        : 0.5*scalar(spans[spans.size()/2 - 1] + spans[spans.size()/2]);
+    result.p90Span = spans[static_cast<std::size_t>(0.90*(spans.size() - 1))];
+    result.p95Span = spans[static_cast<std::size_t>(0.95*(spans.size() - 1))];
+    result.maximumSpan = spans.back();
+    return result;
+}
+
 RowLengthStatistics rowLengthStatistics(const WavefrontSchedule& schedule)
 {
     std::vector<label> lengths(schedule.waveCells.size());
@@ -690,6 +753,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         std::chrono::duration<scalar>
         (preprocessingEnd - preprocessingBegin).count();
     const RowLengthStatistics rowLengths = rowLengthStatistics(schedule);
+    const PackedIndexStatistics packedIndices = packedIndexStatistics(schedule);
     const std::vector<std::size_t> contributionHistogram =
         rowLengthHistogram(schedule);
     const scalarField initialPsi(exact.size(), 0.0);
@@ -1408,6 +1472,26 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
             std::cout << "degree " << degree << ": "
                 << contributionHistogram[degree] << '\n';
     }
+    const scalar rowCount = schedule.waveCells.size();
+    std::cout << "Packed index diagnostics:"
+        << "\n  int16 cell-relative contributions: "
+        << 100*scalar(packedIndices.int16Contributions)
+           /packedIndices.contributions << " % ("
+        << packedIndices.int16Contributions << "/"
+        << packedIndices.contributions << ")"
+        << "\n  rows entirely int16 cell-relative: "
+        << 100*scalar(packedIndices.int16Rows)/rowCount << " % ("
+        << packedIndices.int16Rows << "/" << schedule.waveCells.size() << ")"
+        << "\n  row span min: " << packedIndices.minimumSpan
+        << "\n  row span mean: " << packedIndices.meanSpan
+        << "\n  row span median: " << packedIndices.medianSpan
+        << "\n  row span p90: " << packedIndices.p90Span
+        << "\n  row span p95: " << packedIndices.p95Span
+        << "\n  row span max: " << packedIndices.maximumSpan
+        << "\n  rows with span <= 65535: "
+        << 100*scalar(packedIndices.uint16SpanRows)/rowCount << " % ("
+        << packedIndices.uint16SpanRows << "/" << schedule.waveCells.size()
+        << ")\n";
     const std::size_t shown = std::min<std::size_t>(10, wavefronts.widths.size());
     printLevelWidths("first levels: ", wavefronts.widths, 0, shown);
     printLevelWidths
