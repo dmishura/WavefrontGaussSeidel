@@ -21,6 +21,17 @@ struct WavefrontSchedule
     std::vector<Foam::scalar> diag;
 };
 
+struct HybridWavefrontSchedule
+{
+    const WavefrontSchedule* packed = nullptr;
+    const Foam::scalarField* lowerCoeffs = nullptr;
+    std::vector<Foam::label> incomingStarts;
+    std::vector<Foam::label> incomingFaces;
+    std::vector<Foam::label> outgoingFaceStarts;
+    std::vector<Foam::label> outgoingFaceEnds;
+    Foam::label nInternalFaces = 0;
+};
+
 struct WholeRowInt16Schedule
 {
     std::vector<Foam::label> levelStarts, waveCells, rowStarts;
@@ -51,6 +62,25 @@ void serialGatherSmooth
     const Foam::scalarField& source,
     const WavefrontSchedule& schedule,
     Foam::label nSweeps
+);
+
+void serialHybridSmooth
+(
+    Foam::scalarField& psi,
+    Foam::scalarField& edgeValues,
+    const Foam::scalarField& source,
+    const HybridWavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
+void persistentOpenMpHybridSmooth
+(
+    Foam::scalarField& psi,
+    Foam::scalarField& edgeValues,
+    const Foam::scalarField& source,
+    const HybridWavefrontSchedule& schedule,
+    Foam::label nSweeps,
+    int& detectedThreads
 );
 
 void serialWholeRowInt16Smooth

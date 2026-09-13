@@ -28,15 +28,18 @@ using smootherTest::DeltaEscapeInt16Schedule;
 using smootherTest::PackedUint24Schedule;
 using smootherTest::WholeRowInt16Schedule;
 using smootherTest::WavefrontSchedule;
+using smootherTest::HybridWavefrontSchedule;
 using smootherTest::avx2GatherAvailable;
 using smootherTest::avx512GatherAvailable;
 using smootherTest::perLevelOpenMpSmooth;
 using smootherTest::persistentOpenMpSmooth;
+using smootherTest::persistentOpenMpHybridSmooth;
 using smootherTest::serialGatherAvx512Smooth;
 using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
+using smootherTest::serialHybridSmooth;
 using smootherTest::serialDeltaEscapeInt16Smooth;
 using smootherTest::serialWholeRowInt16Smooth;
 using smootherTest::serialPackedUint24Smooth;
@@ -492,6 +495,54 @@ WavefrontSchedule makeWavefrontSchedule
         throw std::runtime_error("invalid packed wavefront schedule size");
     }
     return schedule;
+}
+
+HybridWavefrontSchedule makeHybridWavefrontSchedule
+(
+    const PolyMeshTopology& mesh,
+    const lduMatrix& matrix,
+    const WavefrontSchedule& packed
+)
+{
+    HybridWavefrontSchedule hybrid;
+    hybrid.packed = &packed;
+    hybrid.nInternalFaces = static_cast<label>(mesh.nInternalFaces());
+    hybrid.lowerCoeffs = &matrix.lower();
+    hybrid.incomingStarts.reserve(mesh.nCells + 1);
+    hybrid.incomingStarts.push_back(0);
+    hybrid.incomingFaces.reserve(mesh.nInternalFaces());
+    hybrid.outgoingFaceStarts.reserve(mesh.nCells + 1);
+    hybrid.outgoingFaceEnds.reserve(mesh.nCells);
+
+    std::vector<label> incomingStarts(mesh.nCells + 1, 0);
+    for (const int neighbour : mesh.neighbour)
+        ++incomingStarts[static_cast<std::size_t>(neighbour) + 1];
+    for (std::size_t cell=0; cell<mesh.nCells; ++cell)
+        incomingStarts[cell + 1] += incomingStarts[cell];
+    std::vector<label> incomingFaces(mesh.nInternalFaces());
+    std::vector<label> cursor = incomingStarts;
+    for (label face=0; face<label(mesh.nInternalFaces()); ++face)
+        incomingFaces[cursor[mesh.neighbour[face]]++] = face;
+
+    const labelField& ownerStarts = matrix.lduAddr().ownerStartAddr();
+    for (label row=0; row<label(packed.waveCells.size()); ++row)
+    {
+        const label cell = packed.waveCells[row];
+        for (label p=incomingStarts[cell]; p<incomingStarts[cell + 1]; ++p)
+            hybrid.incomingFaces.push_back(incomingFaces[p]);
+        hybrid.incomingStarts.push_back(hybrid.incomingFaces.size());
+        hybrid.outgoingFaceStarts.push_back(ownerStarts[cell]);
+        hybrid.outgoingFaceEnds.push_back(ownerStarts[cell + 1]);
+    }
+    if
+    (
+        hybrid.incomingFaces.size() != mesh.nInternalFaces()
+     || hybrid.incomingStarts.size() != mesh.nCells + 1
+     || hybrid.outgoingFaceStarts.size() != mesh.nCells
+     || hybrid.outgoingFaceEnds.size() != mesh.nCells
+    )
+        throw std::runtime_error("invalid hybrid wavefront schedule size");
+    return hybrid;
 }
 
 WholeRowInt16Schedule makeWholeRowInt16Schedule
@@ -1653,6 +1704,151 @@ int runHpcBestSeries(const std::string& meshDirectory)
         << timings[0].medianSeconds/timings[2].medianSeconds << "x"
         << "\nMedian speedup Geometry-8192 vs Packed: "
         << timings[1].medianSeconds/timings[2].medianSeconds << "x\nPASS\n";
+    return 0;
+}
+
+int runHpcHybridSeries(const std::string& meshDirectory)
+{
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    lduMatrix matrix = makeMatrix(mesh);
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(exact.size()); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    const auto setupBegin = std::chrono::steady_clock::now();
+    const WavefrontStatistics baseStatistics = constructWavefronts(mesh);
+    const WavefrontSchedule baseSchedule =
+        makeWavefrontSchedule(mesh, matrix, baseStatistics);
+    const WavefrontStatistics geometryStatistics =
+        constructWidthConstrainedGeometryWavefronts(mesh, 256, 8192);
+    const WavefrontSchedule geometrySchedule =
+        makeWavefrontSchedule(mesh, matrix, geometryStatistics);
+    const HybridWavefrontSchedule hybridBase =
+        makeHybridWavefrontSchedule(mesh, matrix, baseSchedule);
+    const HybridWavefrontSchedule hybridGeometry =
+        makeHybridWavefrontSchedule(mesh, matrix, geometrySchedule);
+    const scalar setupSeconds = std::chrono::duration<scalar>
+    (
+        std::chrono::steady_clock::now() - setupBegin
+    ).count();
+    const int threads = omp_get_max_threads();
+    const scalarField initialPsi(mesh.nCells, 0.0);
+    scalarField baseReference = initialPsi;
+    scalarField geometryReference = initialPsi;
+    serialGatherSmooth(baseReference, source, baseSchedule, 1);
+    serialGatherSmooth(geometryReference, source, geometrySchedule, 1);
+    scalarField edgeValues(mesh.nInternalFaces(), 0.0);
+    scalarField candidateBase = initialPsi;
+    scalarField candidateGeometry = initialPsi;
+    serialHybridSmooth(candidateBase, edgeValues, source, hybridBase, 1);
+    int detectedThreads = 1;
+    if (threads == 1)
+        serialHybridSmooth
+        (
+            candidateGeometry, edgeValues, source, hybridGeometry, 1
+        );
+    else
+        persistentOpenMpHybridSmooth
+        (
+            candidateGeometry, edgeValues, source, hybridGeometry,
+            1, detectedThreads
+        );
+    const scalar baseDifference = maxAbsDifference(baseReference, candidateBase);
+    const scalar geometryDifference =
+        maxAbsDifference(geometryReference, candidateGeometry);
+    if (baseDifference != 0 || geometryDifference != 0)
+        throw std::runtime_error("HPC hybrid exact equivalence failed");
+
+    constexpr label samples = 5;
+    constexpr label sweepsPerSample = 81;
+    constexpr label warmupSweeps = 6;
+    constexpr std::uint32_t seed = 0x5EED1234u;
+    std::vector<RandomizedBenchmarkVariant> variants;
+    if (threads == 1)
+    {
+        variants.push_back({"Packed scalar", [&](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+                serialGatherSmooth(psi, source, baseSchedule, 3);
+        }});
+        variants.push_back({"Hybrid Packed scalar", [&](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+                serialHybridSmooth(psi, edgeValues, source, hybridBase, 3);
+        }});
+        variants.push_back({"Geometry width 8192 scalar", [&](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+                serialGatherSmooth(psi, source, geometrySchedule, 3);
+        }});
+        variants.push_back({"Hybrid Geometry width 8192 scalar", [&](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+                serialHybridSmooth
+                (
+                    psi, edgeValues, source, hybridGeometry, 3
+                );
+        }});
+    }
+    else
+    {
+        variants.push_back({"Geometry width 8192 persistent", [&](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+                persistentOpenMpSmooth
+                (
+                    psi, source, geometrySchedule, 3, detectedThreads
+                );
+        }});
+        variants.push_back({"Hybrid Geometry width 8192 persistent", [&](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+                persistentOpenMpHybridSmooth
+                (
+                    psi, edgeValues, source, hybridGeometry,
+                    3, detectedThreads
+                );
+        }});
+    }
+    const auto timings = timeRandomizedImplementations
+    (
+        initialPsi, mesh.nCells, samples, sweepsPerSample,
+        warmupSweeps, seed, variants
+    );
+    const std::size_t edgeBytes = mesh.nInternalFaces()*sizeof(scalar);
+    std::cout << "MTBHPC hybrid series cells: " << mesh.nCells
+        << "\ninternal faces: " << mesh.nInternalFaces()
+        << "\nschedule setup: " << setupSeconds << " s"
+        << "\nthreads: " << threads
+        << "\ndetected threads: " << detectedThreads
+        << "\nGeometry width 8192 levels: "
+        << geometryStatistics.widths.size()
+        << "\nedgeValue bytes per active smoother: " << edgeBytes
+        << " (" << scalar(edgeBytes)/(1024*1024) << " MiB)"
+        << "\nmax |Packed - Hybrid Packed|: " << baseDifference
+        << "\nmax |Geometry - Hybrid Geometry|: " << geometryDifference
+        << "\ndependency validation: PASS"
+        << "\nexact correctness: PASS"
+        << "\nbenchmark seed: " << seed << '\n';
+    for (std::size_t i=0; i<variants.size(); ++i)
+        printTiming(variants[i].name.c_str(), timings[i]);
+    if (threads == 1)
+    {
+        std::cout << "\nHybrid Packed speedup vs Packed: "
+            << timings[0].medianSeconds/timings[1].medianSeconds << "x"
+            << "\nHybrid Geometry speedup vs Geometry: "
+            << timings[2].medianSeconds/timings[3].medianSeconds << "x\n";
+    }
+    else
+    {
+        std::cout << "\nHybrid Geometry speedup vs Geometry: "
+            << timings[0].medianSeconds/timings[1].medianSeconds << "x\n";
+    }
+    std::cout << "PASS\n";
     return 0;
 }
 
@@ -3160,7 +3356,7 @@ int main(int argc, char** argv)
     const std::string usage =
         "Usage: Test-GaussSeidel <polyMesh-directory> "
         "[--history-sweeps N] [--width-benchmark-only] [--hpc-series] "
-        "[--hpc-prefetch-series] [--hpc-best-series]\n";
+        "[--hpc-prefetch-series] [--hpc-best-series] [--hpc-hybrid-series]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -3178,6 +3374,7 @@ int main(int argc, char** argv)
         bool hpcSeries = false;
         bool hpcPrefetchSeries = false;
         bool hpcBestSeries = false;
+        bool hpcHybridSeries = false;
         for (int argument=2; argument<argc; ++argument)
         {
             const std::string option = argv[argument];
@@ -3201,6 +3398,11 @@ int main(int argc, char** argv)
                 hpcBestSeries = true;
                 continue;
             }
+            if (option == "--hpc-hybrid-series")
+            {
+                hpcHybridSeries = true;
+                continue;
+            }
             if (option != "--history-sweeps" || argument + 1 >= argc)
             {
                 std::cerr << usage;
@@ -3219,6 +3421,7 @@ int main(int argc, char** argv)
             }
         }
         if (hpcPrefetchSeries) return runHpcPrefetchSeries(argv[1]);
+        if (hpcHybridSeries) return runHpcHybridSeries(argv[1]);
         if (hpcBestSeries) return runHpcBestSeries(argv[1]);
         if (hpcSeries) return runHpcSeries(argv[1]);
         return runTest(argv[1], historySweeps, widthBenchmarkOnly);

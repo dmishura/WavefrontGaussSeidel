@@ -43,6 +43,112 @@ void serialGatherSmooth
     }
 }
 
+void serialHybridSmooth
+(
+    Foam::scalarField& psiField,
+    Foam::scalarField& edgeField,
+    const Foam::scalarField& sourceField,
+    const HybridWavefrontSchedule& schedule,
+    const label nSweeps
+)
+{
+    const WavefrontSchedule& packed = *schedule.packed;
+    const label* const levelStarts = packed.levelStarts.data();
+    const label* const waveCells = packed.waveCells.data();
+    const label* const rowStarts = packed.rowStarts.data();
+    const label* const incomingCounts = packed.incomingCounts.data();
+    const label* const incomingStarts = schedule.incomingStarts.data();
+    const label* const incomingFaces = schedule.incomingFaces.data();
+    const label* const cols = packed.cols.data();
+    const scalar* const coeffs = packed.coeffs.data();
+    const scalar* const diag = packed.diag.data();
+    const label* const outgoingFaceStarts = schedule.outgoingFaceStarts.data();
+    const label* const outgoingFaceEnds = schedule.outgoingFaceEnds.data();
+    const scalar* const lower = schedule.lowerCoeffs->data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    scalar* const edgeValues = edgeField.data();
+    const std::size_t nLevels = packed.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                const label incomingEnd = rowStarts[row] + incomingCounts[row];
+                for (label p=incomingStarts[row]; p<incomingStarts[row + 1]; ++p)
+                    psii -= edgeValues[incomingFaces[p]];
+                for (label p=incomingEnd; p<rowStarts[row + 1]; ++p)
+                    psii -= coeffs[p]*psi[cols[p]];
+                const scalar value = psii/diag[row];
+                psi[cell] = value;
+                for (label face=outgoingFaceStarts[row]; face<outgoingFaceEnds[row]; ++face)
+                    edgeValues[face] = lower[face]*value;
+            }
+        }
+    }
+}
+
+void persistentOpenMpHybridSmooth
+(
+    Foam::scalarField& psiField,
+    Foam::scalarField& edgeField,
+    const Foam::scalarField& sourceField,
+    const HybridWavefrontSchedule& schedule,
+    const label nSweeps,
+    int& detectedThreads
+)
+{
+    const WavefrontSchedule& packed = *schedule.packed;
+    const label* const levelStarts = packed.levelStarts.data();
+    const label* const waveCells = packed.waveCells.data();
+    const label* const rowStarts = packed.rowStarts.data();
+    const label* const incomingCounts = packed.incomingCounts.data();
+    const label* const incomingStarts = schedule.incomingStarts.data();
+    const label* const incomingFaces = schedule.incomingFaces.data();
+    const label* const cols = packed.cols.data();
+    const scalar* const coeffs = packed.coeffs.data();
+    const scalar* const diag = packed.diag.data();
+    const label* const outgoingFaceStarts = schedule.outgoingFaceStarts.data();
+    const label* const outgoingFaceEnds = schedule.outgoingFaceEnds.data();
+    const scalar* const lower = schedule.lowerCoeffs->data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    scalar* const edgeValues = edgeField.data();
+    const std::size_t nLevels = packed.levelStarts.size() - 1;
+
+    #pragma omp parallel
+    {
+        #pragma omp single
+        detectedThreads = omp_get_num_threads();
+
+        for (label sweep=0; sweep<nSweeps; ++sweep)
+        {
+            for (std::size_t level=0; level<nLevels; ++level)
+            {
+                #pragma omp for schedule(static)
+                for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+                {
+                    const label cell = waveCells[row];
+                    scalar psii = source[cell];
+                    const label incomingEnd = rowStarts[row] + incomingCounts[row];
+                    for (label p=incomingStarts[row]; p<incomingStarts[row + 1]; ++p)
+                        psii -= edgeValues[incomingFaces[p]];
+                    for (label p=incomingEnd; p<rowStarts[row + 1]; ++p)
+                        psii -= coeffs[p]*psi[cols[p]];
+                    const scalar value = psii/diag[row];
+                    psi[cell] = value;
+                    for (label face=outgoingFaceStarts[row]; face<outgoingFaceEnds[row]; ++face)
+                        edgeValues[face] = lower[face]*value;
+                }
+            }
+        }
+    }
+}
+
 void serialWholeRowInt16Smooth
 (
     Foam::scalarField& psiField,
