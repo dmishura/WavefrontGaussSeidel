@@ -1320,7 +1320,8 @@ int runHpcSeries(const std::string& meshDirectory)
     const WavefrontSchedule baseSchedule =
         makeWavefrontSchedule(mesh, matrix, baseStatistics);
     constexpr label xSlabs = 256;
-    constexpr std::array<label, 3> widths{{256, 512, 1024}};
+    constexpr std::array<label, 7> widths
+    {{256, 512, 1024, 2048, 4096, 8192, 16384}};
     std::array<WavefrontStatistics, widths.size()> statistics;
     std::array<WavefrontSchedule, widths.size()> schedules;
     for (std::size_t i=0; i<widths.size(); ++i)
