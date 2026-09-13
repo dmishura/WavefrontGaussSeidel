@@ -1301,6 +1301,127 @@ void printLevelWidths
 
 }
 
+int runHpcSeries(const std::string& meshDirectory)
+{
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    lduMatrix matrix = makeMatrix(mesh);
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(exact.size()); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    FieldField<Field, scalar> interfaceCoeffs(0);
+    lduInterfaceFieldPtrsList interfaces(0);
+    const auto setupBegin = std::chrono::steady_clock::now();
+    const WavefrontStatistics baseStatistics = constructWavefronts(mesh);
+    const WavefrontSchedule baseSchedule =
+        makeWavefrontSchedule(mesh, matrix, baseStatistics);
+    constexpr label xSlabs = 256;
+    constexpr std::array<label, 3> widths{{256, 512, 1024}};
+    std::array<WavefrontStatistics, widths.size()> statistics;
+    std::array<WavefrontSchedule, widths.size()> schedules;
+    for (std::size_t i=0; i<widths.size(); ++i)
+    {
+        statistics[i] = constructWidthConstrainedGeometryWavefronts
+        (
+            mesh, xSlabs, widths[i]
+        );
+        schedules[i] = makeWavefrontSchedule(mesh, matrix, statistics[i]);
+    }
+    const scalar setupSeconds = std::chrono::duration<scalar>
+    (
+        std::chrono::steady_clock::now() - setupBegin
+    ).count();
+    const scalarField initialPsi(mesh.nCells, 0.0);
+    scalarField reference = initialPsi;
+    GaussSeidelSmoother::smooth
+    (
+        "psi", reference, matrix, source,
+        interfaceCoeffs, interfaces, 0, 1
+    );
+    const int threads = omp_get_max_threads();
+    for (std::size_t i=0; i<widths.size(); ++i)
+    {
+        scalarField candidate = initialPsi;
+        if (threads == 1)
+            serialGatherSmooth(candidate, source, schedules[i], 1);
+        else
+        {
+            int detected = 1;
+            persistentOpenMpSmooth(candidate, source, schedules[i], 1, detected);
+        }
+        if (maxAbsDifference(reference, candidate) != 0)
+            throw std::runtime_error("HPC series exact equivalence failed");
+    }
+    std::cout << "MTBHPC cells: " << mesh.nCells
+        << "\ninternal faces: " << mesh.nInternalFaces()
+        << "\nschedule setup: " << setupSeconds << " s"
+        << "\nthreads: " << threads << '\n';
+    for (std::size_t i=0; i<widths.size(); ++i)
+    {
+        const auto& s = statistics[i];
+        std::cout << "width " << widths[i] << ": levels=" << s.widths.size()
+            << " min=" << s.minimumWidth << " mean=" << s.meanWidth
+            << " median=" << s.medianWidth << " max=" << s.maximumWidth
+            << " dependency=PASS exact=PASS\n";
+    }
+    constexpr label samples = 5;
+    constexpr label sweepsPerSample = 81;
+    constexpr label warmupSweeps = 6;
+    constexpr std::uint32_t seed = 0x5EED1234u;
+    std::vector<RandomizedBenchmarkVariant> variants;
+    variants.push_back({"Reference GS", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            GaussSeidelSmoother::smooth
+            (
+                "psi", psi, matrix, source, interfaceCoeffs, interfaces, 0, 3
+            );
+    }});
+    variants.push_back({"Packed scalar", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            serialGatherSmooth(psi, source, baseSchedule, 3);
+    }});
+    for (std::size_t i=0; i<widths.size(); ++i)
+    {
+        variants.push_back
+        ({
+            "Geometry width " + std::to_string(widths[i])
+              + (threads == 1 ? " scalar" : " persistent"),
+            [&, i](scalarField& psi, const label n)
+            {
+                for (label sweep=0; sweep<n; sweep += 3)
+                {
+                    if (threads == 1)
+                        serialGatherSmooth(psi, source, schedules[i], 3);
+                    else
+                    {
+                        int detected = 1;
+                        persistentOpenMpSmooth
+                        (
+                            psi, source, schedules[i], 3, detected
+                        );
+                    }
+                }
+            }
+        });
+    }
+    const auto timings = timeRandomizedImplementations
+    (
+        initialPsi, mesh.nCells, samples, sweepsPerSample,
+        warmupSweeps, seed, variants
+    );
+    std::cout << "HPC benchmark seed: " << seed << '\n';
+    for (std::size_t i=0; i<variants.size(); ++i)
+        printTiming(variants[i].name.c_str(), timings[i]);
+    std::cout << "PASS\n";
+    return 0;
+}
+
 int runTest
 (
     const std::string& meshDirectory,
@@ -2804,7 +2925,7 @@ int main(int argc, char** argv)
 {
     const std::string usage =
         "Usage: Test-GaussSeidel <polyMesh-directory> "
-        "[--history-sweeps N] [--width-benchmark-only]\n";
+        "[--history-sweeps N] [--width-benchmark-only] [--hpc-series]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -2819,12 +2940,18 @@ int main(int argc, char** argv)
     {
         label historySweeps = 20;
         bool widthBenchmarkOnly = false;
+        bool hpcSeries = false;
         for (int argument=2; argument<argc; ++argument)
         {
             const std::string option = argv[argument];
             if (option == "--width-benchmark-only")
             {
                 widthBenchmarkOnly = true;
+                continue;
+            }
+            if (option == "--hpc-series")
+            {
+                hpcSeries = true;
                 continue;
             }
             if (option != "--history-sweeps" || argument + 1 >= argc)
@@ -2844,6 +2971,7 @@ int main(int argc, char** argv)
                 );
             }
         }
+        if (hpcSeries) return runHpcSeries(argv[1]);
         return runTest(argv[1], historySweeps, widthBenchmarkOnly);
     }
     catch (const std::exception& error)

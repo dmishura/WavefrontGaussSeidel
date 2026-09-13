@@ -171,7 +171,52 @@ std::pair<std::vector<int>, std::vector<int>> readCompactFaces
 {
     GeometryFileHeader file = readGeometryHeader(path);
     if (!file.binary)
-        throw std::runtime_error("ASCII faceCompactList is not supported yet");
+    {
+        std::vector<int> starts;
+        std::vector<int> vertices;
+        starts.reserve(file.count + 1);
+        starts.push_back(0);
+        for (std::size_t face=0; face<file.count; ++face)
+        {
+            skipSpaceAndComments(file.bytes, file.position);
+            const std::size_t countBegin = file.position;
+            while
+            (
+                file.position < file.bytes.size()
+             && std::isdigit(static_cast<unsigned char>(file.bytes[file.position]))
+            ) ++file.position;
+            if (countBegin == file.position)
+                throw std::runtime_error("invalid ASCII face size");
+            const int count = std::stoi
+            (
+                file.text.substr(countBegin, file.position - countBegin)
+            );
+            skipSpaceAndComments(file.bytes, file.position);
+            if (file.position >= file.bytes.size() || file.bytes[file.position++] != '(')
+                throw std::runtime_error("invalid ASCII face opening");
+            for (int point=0; point<count; ++point)
+            {
+                skipSpaceAndComments(file.bytes, file.position);
+                const std::size_t begin = file.position;
+                while
+                (
+                    file.position < file.bytes.size()
+                 && std::isdigit(static_cast<unsigned char>(file.bytes[file.position]))
+                ) ++file.position;
+                if (begin == file.position)
+                    throw std::runtime_error("invalid ASCII face point");
+                vertices.push_back
+                (
+                    std::stoi(file.text.substr(begin, file.position - begin))
+                );
+            }
+            skipSpaceAndComments(file.bytes, file.position);
+            if (file.position >= file.bytes.size() || file.bytes[file.position++] != ')')
+                throw std::runtime_error("invalid ASCII face closing");
+            starts.push_back(vertices.size());
+        }
+        return {std::move(starts), std::move(vertices)};
+    }
     std::vector<int> starts(file.count);
     const std::size_t startsBytes = starts.size()*sizeof(std::int32_t);
     if (startsBytes > file.bytes.size() - file.position)
