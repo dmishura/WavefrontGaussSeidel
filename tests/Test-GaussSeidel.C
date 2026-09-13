@@ -1339,7 +1339,8 @@ int runTest
     const auto geometryScheduleEnd = std::chrono::steady_clock::now();
     const WavefrontSchedule xSortedSchedule =
         makeXSortedWithinLevelsSchedule(schedule, mesh.cellCentreX);
-    constexpr std::array<label, 4> constrainedWidths{{256, 512, 1024, 2048}};
+    constexpr std::array<label, 7> constrainedWidths
+    {{256, 512, 1024, 2048, 4096, 8192, 16384}};
     std::array<WavefrontStatistics, constrainedWidths.size()> constrainedStatistics;
     std::array<WavefrontSchedule, constrainedWidths.size()> constrainedSchedules;
     for (std::size_t i=0; i<constrainedWidths.size(); ++i)
