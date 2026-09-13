@@ -1852,6 +1852,134 @@ int runHpcHybridSeries(const std::string& meshDirectory)
     return 0;
 }
 
+int runHpcGeometryKernelSeries(const std::string& meshDirectory)
+{
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    lduMatrix matrix = makeMatrix(mesh);
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(exact.size()); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    constexpr std::array<label, 3> widths{{2048, 4096, 8192}};
+    std::array<WavefrontStatistics, widths.size()> statistics;
+    std::array<WavefrontSchedule, widths.size()> schedules;
+    const auto setupBegin = std::chrono::steady_clock::now();
+    for (std::size_t i=0; i<widths.size(); ++i)
+    {
+        statistics[i] = constructWidthConstrainedGeometryWavefronts
+        (
+            mesh, 256, widths[i]
+        );
+        schedules[i] = makeWavefrontSchedule(mesh, matrix, statistics[i]);
+    }
+    const scalar setupSeconds = std::chrono::duration<scalar>
+    (
+        std::chrono::steady_clock::now() - setupBegin
+    ).count();
+    if (omp_get_max_threads() != 1)
+        throw std::runtime_error("geometry kernel series requires one thread");
+    if (!avx512GatherAvailable())
+        throw std::runtime_error("AVX-512 kernel is unavailable");
+    const scalarField initialPsi(mesh.nCells, 0.0);
+    for (std::size_t i=0; i<widths.size(); ++i)
+    {
+        scalarField baseline = initialPsi;
+        scalarField interleaved = initialPsi;
+        scalarField avx512 = initialPsi;
+        serialGatherSmooth(baseline, source, schedules[i], 1);
+        serialGatherInterleavedRowsSmooth
+        (
+            interleaved, source, schedules[i], 1
+        );
+        serialGatherAvx512AcrossRowsSmooth
+        (
+            avx512, source, schedules[i], 1
+        );
+        if
+        (
+            maxAbsDifference(baseline, interleaved) != 0
+         || maxAbsDifference(baseline, avx512) != 0
+        )
+            throw std::runtime_error("geometry kernel exact equivalence failed");
+    }
+
+    constexpr label samples = 5;
+    constexpr label sweepsPerSample = 81;
+    constexpr label warmupSweeps = 6;
+    constexpr std::uint32_t seed = 0x5EED1234u;
+    std::vector<RandomizedBenchmarkVariant> variants;
+    for (std::size_t i=0; i<widths.size(); ++i)
+    {
+        variants.push_back
+        ({
+            "Geometry " + std::to_string(widths[i]) + " scalar",
+            [&, i](scalarField& psi, const label n)
+            {
+                for (label sweep=0; sweep<n; sweep += 3)
+                    serialGatherSmooth(psi, source, schedules[i], 3);
+            }
+        });
+        variants.push_back
+        ({
+            "Geometry " + std::to_string(widths[i]) + " generic 4-way",
+            [&, i](scalarField& psi, const label n)
+            {
+                for (label sweep=0; sweep<n; sweep += 3)
+                    serialGatherInterleavedRowsSmooth
+                    (
+                        psi, source, schedules[i], 3
+                    );
+            }
+        });
+        variants.push_back
+        ({
+            "Geometry " + std::to_string(widths[i]) + " AVX-512 rows",
+            [&, i](scalarField& psi, const label n)
+            {
+                for (label sweep=0; sweep<n; sweep += 3)
+                    serialGatherAvx512AcrossRowsSmooth
+                    (
+                        psi, source, schedules[i], 3
+                    );
+            }
+        });
+    }
+    const auto timings = timeRandomizedImplementations
+    (
+        initialPsi, mesh.nCells, samples, sweepsPerSample,
+        warmupSweeps, seed, variants
+    );
+    std::cout << "MTBHPC Geometry kernel series: cells=" << mesh.nCells
+        << " setup=" << setupSeconds << " s threads=1 seed=" << seed
+        << "\nAVX-512 available: YES"
+        << "\ndependency validation: PASS"
+        << "\nexact correctness: PASS\n";
+    for (std::size_t i=0; i<widths.size(); ++i)
+        std::cout << "width " << widths[i]
+            << ": levels=" << statistics[i].widths.size()
+            << " mean=" << statistics[i].meanWidth
+            << " median=" << statistics[i].medianWidth << '\n';
+    for (std::size_t i=0; i<variants.size(); ++i)
+        printTiming(variants[i].name.c_str(), timings[i]);
+    std::cout << "\nGeometry kernel speedups (median):\n";
+    for (std::size_t i=0; i<widths.size(); ++i)
+    {
+        const std::size_t base = 3*i;
+        std::cout << "width " << widths[i]
+            << " 4-way/scalar="
+            << timings[base].medianSeconds/timings[base + 1].medianSeconds
+            << "x AVX512/scalar="
+            << timings[base].medianSeconds/timings[base + 2].medianSeconds
+            << "x\n";
+    }
+    std::cout << "PASS\n";
+    return 0;
+}
+
 int runTest
 (
     const std::string& meshDirectory,
@@ -3356,7 +3484,8 @@ int main(int argc, char** argv)
     const std::string usage =
         "Usage: Test-GaussSeidel <polyMesh-directory> "
         "[--history-sweeps N] [--width-benchmark-only] [--hpc-series] "
-        "[--hpc-prefetch-series] [--hpc-best-series] [--hpc-hybrid-series]\n";
+        "[--hpc-prefetch-series] [--hpc-best-series] [--hpc-hybrid-series] "
+        "[--hpc-geometry-kernels]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -3375,6 +3504,7 @@ int main(int argc, char** argv)
         bool hpcPrefetchSeries = false;
         bool hpcBestSeries = false;
         bool hpcHybridSeries = false;
+        bool hpcGeometryKernels = false;
         for (int argument=2; argument<argc; ++argument)
         {
             const std::string option = argv[argument];
@@ -3403,6 +3533,11 @@ int main(int argc, char** argv)
                 hpcHybridSeries = true;
                 continue;
             }
+            if (option == "--hpc-geometry-kernels")
+            {
+                hpcGeometryKernels = true;
+                continue;
+            }
             if (option != "--history-sweeps" || argument + 1 >= argc)
             {
                 std::cerr << usage;
@@ -3422,6 +3557,7 @@ int main(int argc, char** argv)
         }
         if (hpcPrefetchSeries) return runHpcPrefetchSeries(argv[1]);
         if (hpcHybridSeries) return runHpcHybridSeries(argv[1]);
+        if (hpcGeometryKernels) return runHpcGeometryKernelSeries(argv[1]);
         if (hpcBestSeries) return runHpcBestSeries(argv[1]);
         if (hpcSeries) return runHpcSeries(argv[1]);
         return runTest(argv[1], historySweeps, widthBenchmarkOnly);
