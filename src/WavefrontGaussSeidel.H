@@ -3,6 +3,7 @@
 
 #include "lduMatrix.H"
 
+#include <cstdint>
 #include <vector>
 
 namespace smootherTest
@@ -20,11 +21,59 @@ struct WavefrontSchedule
     std::vector<Foam::scalar> diag;
 };
 
+struct WholeRowInt16Schedule
+{
+    std::vector<Foam::label> levelStarts, waveCells, rowStarts;
+    std::vector<Foam::label> compactStarts, fallbackStarts, fallbackCols;
+    std::vector<std::int16_t> offsets;
+    std::vector<unsigned char> compactRows;
+    std::vector<Foam::scalar> coeffs, diag;
+};
+
+struct DeltaEscapeInt16Schedule
+{
+    std::vector<Foam::label> levelStarts, waveCells, rowStarts;
+    std::vector<Foam::label> firstCols, deltaStarts, escapeStarts, escapeCols;
+    std::vector<std::int16_t> deltas;
+    std::vector<Foam::scalar> coeffs, diag;
+};
+
+struct PackedUint24Schedule
+{
+    std::vector<Foam::label> levelStarts, waveCells, rowStarts;
+    std::vector<std::uint8_t> cols;
+    std::vector<Foam::scalar> coeffs, diag;
+};
+
 void serialGatherSmooth
 (
     Foam::scalarField& psi,
     const Foam::scalarField& source,
     const WavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
+void serialWholeRowInt16Smooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WholeRowInt16Schedule& schedule,
+    Foam::label nSweeps
+);
+
+void serialDeltaEscapeInt16Smooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const DeltaEscapeInt16Schedule& schedule,
+    Foam::label nSweeps
+);
+
+void serialPackedUint24Smooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const PackedUint24Schedule& schedule,
     Foam::label nSweeps
 );
 

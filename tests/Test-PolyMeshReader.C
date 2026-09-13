@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -25,6 +26,21 @@ void testMotorBike(const fs::path& meshDir)
     require(mesh.nPoints == 404931, "unexpected motorBike point count");
     require(mesh.nFaces == 1104083, "unexpected motorBike face count");
     require(mesh.nInternalFaces() == 1053964, "unexpected internal-face count");
+    require(mesh.cellCentreX.size() == mesh.nCells, "cell centres were not read");
+    require
+    (
+        std::all_of
+        (
+            mesh.cellCentreX.begin(), mesh.cellCentreX.end(),
+            [](const double x) { return std::isfinite(x); }
+        ),
+        "cell centre contains a non-finite X coordinate"
+    );
+    const auto centreBounds = std::minmax_element
+    (
+        mesh.cellCentreX.begin(), mesh.cellCentreX.end()
+    );
+    require(*centreBounds.second > *centreBounds.first, "cell centre X range is empty");
     const auto starts = mesh.ownerStartAddressing();
     require(starts.size() == mesh.nCells + 1, "invalid ownerStart size");
     require(starts.front() == 0, "ownerStart must begin at zero");

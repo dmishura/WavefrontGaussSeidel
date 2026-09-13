@@ -14,6 +14,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <omp.h>
 #include <random>
@@ -23,6 +24,9 @@
 using namespace Foam;
 using smootherTest::PolyMeshReader;
 using smootherTest::PolyMeshTopology;
+using smootherTest::DeltaEscapeInt16Schedule;
+using smootherTest::PackedUint24Schedule;
+using smootherTest::WholeRowInt16Schedule;
 using smootherTest::WavefrontSchedule;
 using smootherTest::avx2GatherAvailable;
 using smootherTest::avx512GatherAvailable;
@@ -33,6 +37,9 @@ using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
+using smootherTest::serialDeltaEscapeInt16Smooth;
+using smootherTest::serialWholeRowInt16Smooth;
+using smootherTest::serialPackedUint24Smooth;
 using smootherTest::serialGatherInterleavedRowsSmooth;
 using smootherTest::serialGatherDegree6Smooth;
 using smootherTest::serialGatherDegree6InterleavedRowsSmooth;
@@ -227,6 +234,88 @@ WavefrontStatistics constructWavefronts(const PolyMeshTopology& mesh)
     return result;
 }
 
+WavefrontStatistics constructGeometryOrientedWavefronts
+(
+    const PolyMeshTopology& mesh,
+    const label xSlabs
+)
+{
+    if (mesh.cellCentreX.size() != mesh.nCells)
+        throw std::runtime_error("mesh geometry is unavailable for X-oriented schedule");
+    const auto xBounds = std::minmax_element
+    (
+        mesh.cellCentreX.begin(), mesh.cellCentreX.end()
+    );
+    const double xMinimum = *xBounds.first;
+    const double xRange = std::max(*xBounds.second - xMinimum, 1e-300);
+    const auto slabForCell = [&](const label cell)
+    {
+        const double position = (mesh.cellCentreX[cell] - xMinimum)/xRange;
+        return std::min
+        (
+            xSlabs - 1,
+            static_cast<label>(position*xSlabs)
+        );
+    };
+
+    std::vector<label> predecessorCounts(mesh.nCells, 0);
+    std::vector<std::vector<label>> successors(mesh.nCells);
+    for (std::size_t face=0; face<mesh.nInternalFaces(); ++face)
+    {
+        const label dependency = mesh.owner[face];
+        const label cell = mesh.neighbour[face];
+        ++predecessorCounts[cell];
+        successors[dependency].push_back(cell);
+    }
+    std::vector<std::vector<label>> ready(xSlabs);
+    for (label cell=0; cell<label(mesh.nCells); ++cell)
+        if (predecessorCounts[cell] == 0) ready[slabForCell(cell)].push_back(cell);
+
+    WavefrontStatistics result;
+    result.levels.assign(mesh.nCells, -1);
+    std::size_t assigned = 0;
+    label level = 0;
+    while (assigned < mesh.nCells)
+    {
+        label slab = 0;
+        while (slab<xSlabs && ready[slab].empty()) ++slab;
+        if (slab == xSlabs)
+            throw std::runtime_error("geometry-oriented topological schedule stalled");
+        std::vector<label> current;
+        current.swap(ready[slab]);
+        result.widths.push_back(current.size());
+        assigned += current.size();
+        for (const label cell : current) result.levels[cell] = level;
+        for (const label dependency : current)
+        {
+            for (const label cell : successors[dependency])
+            {
+                if (--predecessorCounts[cell] == 0)
+                    ready[slabForCell(cell)].push_back(cell);
+            }
+        }
+        ++level;
+    }
+    for (std::size_t face=0; face<mesh.nInternalFaces(); ++face)
+    {
+        if (result.levels[mesh.owner[face]] >= result.levels[mesh.neighbour[face]])
+            throw std::runtime_error("geometry-oriented dependency validation failed");
+    }
+    const auto bounds = std::minmax_element(result.widths.begin(), result.widths.end());
+    result.minimumWidth = *bounds.first;
+    result.maximumWidth = *bounds.second;
+    result.meanWidth = scalar(mesh.nCells)/result.widths.size();
+    std::vector<std::size_t> sorted = result.widths;
+    std::sort(sorted.begin(), sorted.end());
+    const std::size_t middle = sorted.size()/2;
+    result.medianWidth = sorted.size() % 2
+        ? scalar(sorted[middle])
+        : 0.5*scalar(sorted[middle - 1] + sorted[middle]);
+    result.p90Width = percentile(sorted, 0.90);
+    result.p95Width = percentile(sorted, 0.95);
+    return result;
+}
+
 WavefrontSchedule makeWavefrontSchedule
 (
     const PolyMeshTopology& mesh,
@@ -311,6 +400,130 @@ WavefrontSchedule makeWavefrontSchedule
         throw std::runtime_error("invalid packed wavefront schedule size");
     }
     return schedule;
+}
+
+WholeRowInt16Schedule makeWholeRowInt16Schedule
+(
+    const WavefrontSchedule& original
+)
+{
+    WholeRowInt16Schedule compact;
+    compact.levelStarts = original.levelStarts;
+    compact.waveCells = original.waveCells;
+    compact.rowStarts = original.rowStarts;
+    compact.coeffs = original.coeffs;
+    compact.diag = original.diag;
+    compact.compactRows.resize(original.waveCells.size(), 0);
+    compact.compactStarts.reserve(original.waveCells.size() + 1);
+    compact.fallbackStarts.reserve(original.waveCells.size() + 1);
+    compact.compactStarts.push_back(0);
+    compact.fallbackStarts.push_back(0);
+
+    for (label row=0; row<label(original.waveCells.size()); ++row)
+    {
+        const label cell = original.waveCells[row];
+        bool fits = true;
+        for (label p=original.rowStarts[row]; p<original.rowStarts[row + 1]; ++p)
+        {
+            const std::int64_t offset =
+                std::int64_t(original.cols[p]) - std::int64_t(cell);
+            fits = fits
+                && offset >= std::numeric_limits<std::int16_t>::min()
+                && offset <= std::numeric_limits<std::int16_t>::max();
+        }
+        compact.compactRows[row] = fits;
+        if (fits)
+        {
+            for (label p=original.rowStarts[row]; p<original.rowStarts[row + 1]; ++p)
+                compact.offsets.push_back(static_cast<std::int16_t>(original.cols[p] - cell));
+        }
+        else
+        {
+            for (label p=original.rowStarts[row]; p<original.rowStarts[row + 1]; ++p)
+                compact.fallbackCols.push_back(original.cols[p]);
+        }
+        compact.compactStarts.push_back(compact.offsets.size());
+        compact.fallbackStarts.push_back(compact.fallbackCols.size());
+    }
+    return compact;
+}
+
+DeltaEscapeInt16Schedule makeDeltaEscapeInt16Schedule
+(
+    const WavefrontSchedule& original
+)
+{
+    DeltaEscapeInt16Schedule compact;
+    compact.levelStarts = original.levelStarts;
+    compact.waveCells = original.waveCells;
+    compact.rowStarts = original.rowStarts;
+    compact.coeffs = original.coeffs;
+    compact.diag = original.diag;
+    compact.firstCols.resize(original.waveCells.size(), 0);
+    compact.deltaStarts.reserve(original.waveCells.size() + 1);
+    compact.escapeStarts.reserve(original.waveCells.size() + 1);
+    compact.deltaStarts.push_back(0);
+    compact.escapeStarts.push_back(0);
+    constexpr std::int64_t escapeValue =
+        std::numeric_limits<std::int16_t>::min();
+
+    for (label row=0; row<label(original.waveCells.size()); ++row)
+    {
+        const label begin = original.rowStarts[row];
+        const label end = original.rowStarts[row + 1];
+        if (begin < end)
+        {
+            label previous = original.cols[begin];
+            compact.firstCols[row] = previous;
+            for (label p=begin + 1; p<end; ++p)
+            {
+                const label col = original.cols[p];
+                const std::int64_t delta =
+                    std::int64_t(col) - std::int64_t(previous);
+                if
+                (
+                    delta > escapeValue
+                 && delta <= std::numeric_limits<std::int16_t>::max()
+                )
+                {
+                    compact.deltas.push_back(static_cast<std::int16_t>(delta));
+                }
+                else
+                {
+                    compact.deltas.push_back(static_cast<std::int16_t>(escapeValue));
+                    compact.escapeCols.push_back(col);
+                }
+                previous = col;
+            }
+        }
+        compact.deltaStarts.push_back(compact.deltas.size());
+        compact.escapeStarts.push_back(compact.escapeCols.size());
+    }
+    return compact;
+}
+
+PackedUint24Schedule makePackedUint24Schedule
+(
+    const WavefrontSchedule& original
+)
+{
+    PackedUint24Schedule compact;
+    compact.levelStarts = original.levelStarts;
+    compact.waveCells = original.waveCells;
+    compact.rowStarts = original.rowStarts;
+    compact.coeffs = original.coeffs;
+    compact.diag = original.diag;
+    compact.cols.reserve(3*original.cols.size());
+    for (const label col : original.cols)
+    {
+        if (col < 0 || std::uint64_t(col) > 0xFFFFFFu)
+            throw std::runtime_error("packed column does not fit uint24");
+        const std::uint32_t value = static_cast<std::uint32_t>(col);
+        compact.cols.push_back(static_cast<std::uint8_t>(value));
+        compact.cols.push_back(static_cast<std::uint8_t>(value >> 8));
+        compact.cols.push_back(static_cast<std::uint8_t>(value >> 16));
+    }
+    return compact;
 }
 
 WavefrontSchedule makeLocalityReorderedSchedule
@@ -976,14 +1189,39 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const WavefrontStatistics wavefronts = constructWavefronts(mesh);
     const WavefrontSchedule schedule =
         makeWavefrontSchedule(mesh, matrix, wavefronts);
+    const auto referenceScheduleEnd = std::chrono::steady_clock::now();
+    constexpr label geometryXSlabs = 256;
+    const WavefrontStatistics geometryWavefronts =
+        constructGeometryOrientedWavefronts(mesh, geometryXSlabs);
+    const WavefrontSchedule geometrySchedule =
+        makeWavefrontSchedule(mesh, matrix, geometryWavefronts);
+    const auto geometryScheduleEnd = std::chrono::steady_clock::now();
     const WavefrontSchedule localitySchedule =
         makeLocalityReorderedSchedule(schedule);
     const WavefrontSchedule medianRowSchedule =
         makeMedianRowReorderedSchedule(schedule);
+    const WholeRowInt16Schedule wholeRowInt16Schedule =
+        makeWholeRowInt16Schedule(schedule);
+    const DeltaEscapeInt16Schedule deltaEscapeInt16Schedule =
+        makeDeltaEscapeInt16Schedule(schedule);
+    const PackedUint24Schedule packedUint24Schedule =
+        makePackedUint24Schedule(schedule);
     const auto preprocessingEnd = std::chrono::steady_clock::now();
     const scalar preprocessingSeconds =
         std::chrono::duration<scalar>
         (preprocessingEnd - preprocessingBegin).count();
+    const scalar referenceScheduleSeconds =
+        std::chrono::duration<scalar>
+        (referenceScheduleEnd - preprocessingBegin).count();
+    const scalar geometryScheduleSeconds =
+        std::chrono::duration<scalar>
+        (geometryScheduleEnd - referenceScheduleEnd).count();
+    std::cout << "Schedule setup timing (outside sweep benchmarks):"
+        << "\n  minimal-level schedule: " << referenceScheduleSeconds << " s"
+        << "\n  geometry-oriented schedule: " << geometryScheduleSeconds << " s"
+        << "\n  geometry/minimal setup ratio: "
+        << geometryScheduleSeconds/referenceScheduleSeconds << "x"
+        << "\n  all experimental schedules: " << preprocessingSeconds << " s\n\n";
     const RowLengthStatistics rowLengths = rowLengthStatistics(schedule);
     const PackedIndexStatistics packedIndices = packedIndexStatistics(schedule);
     const PsiAccessStatistics psiAccesses = psiAccessStatistics(schedule);
@@ -1038,6 +1276,20 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     serialGatherSmooth(psiLocality, source, localitySchedule, 1);
     scalarField psiMedianRow = initialPsi;
     serialGatherSmooth(psiMedianRow, source, medianRowSchedule, 1);
+    scalarField psiWholeRowInt16 = initialPsi;
+    serialWholeRowInt16Smooth
+    (
+        psiWholeRowInt16, source, wholeRowInt16Schedule, 1
+    );
+    scalarField psiDeltaEscapeInt16 = initialPsi;
+    serialDeltaEscapeInt16Smooth
+    (
+        psiDeltaEscapeInt16, source, deltaEscapeInt16Schedule, 1
+    );
+    scalarField psiPackedUint24 = initialPsi;
+    serialPackedUint24Smooth(psiPackedUint24, source, packedUint24Schedule, 1);
+    scalarField psiGeometry = initialPsi;
+    serialGatherSmooth(psiGeometry, source, geometrySchedule, 1);
     const bool avx512Available = avx512GatherAvailable();
     const bool avx2Available = avx2GatherAvailable();
     scalarField psiAvx2 = initialPsi;
@@ -1081,6 +1333,13 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar medianRowMaxAbs = maxAbsDifference(psiReference, psiMedianRow);
     const scalar medianRowVsPackedMaxAbs =
         maxAbsDifference(psiSerialGather, psiMedianRow);
+    const scalar wholeRowInt16MaxAbs =
+        maxAbsDifference(psiReference, psiWholeRowInt16);
+    const scalar deltaEscapeInt16MaxAbs =
+        maxAbsDifference(psiReference, psiDeltaEscapeInt16);
+    const scalar packedUint24MaxAbs =
+        maxAbsDifference(psiReference, psiPackedUint24);
+    const scalar geometryMaxAbs = maxAbsDifference(psiReference, psiGeometry);
     const scalar prefetchFirstMaxAbs =
         maxAbsDifference(psiReference, psiPrefetchFirst);
     const scalar prefetchTwoMaxAbs =
@@ -1136,6 +1395,13 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar localityResidual = relativeResidual(matrix, psiLocality, source);
     const scalar medianRowResidual =
         relativeResidual(matrix, psiMedianRow, source);
+    const scalar wholeRowInt16Residual =
+        relativeResidual(matrix, psiWholeRowInt16, source);
+    const scalar deltaEscapeInt16Residual =
+        relativeResidual(matrix, psiDeltaEscapeInt16, source);
+    const scalar packedUint24Residual =
+        relativeResidual(matrix, psiPackedUint24, source);
+    const scalar geometryResidual = relativeResidual(matrix, psiGeometry, source);
     const scalar prefetchFirstResidual =
         relativeResidual(matrix, psiPrefetchFirst, source);
     const scalar prefetchTwoResidual =
@@ -1190,6 +1456,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nPrefetch (8, first 2) residual: " << prefetchTwoResidual
         << "\nLocality-reordered residual:    " << localityResidual
         << "\nMedian-row reordered residual:  " << medianRowResidual
+        << "\nWhole-row int16 residual:       " << wholeRowInt16Residual
+        << "\nDelta/escape int16 residual:    " << deltaEscapeInt16Residual
+        << "\nAbsolute uint24 residual:       " << packedUint24Residual
+        << "\nGeometry-oriented residual:     " << geometryResidual
         << "\nSerial packed AVX2 residual:    " << avx2Residual
         << "\nAVX2 across-rows residual:      " << avx2AcrossRowsResidual
         << "\nSerial packed AVX-512 residual: " << avx512Residual
@@ -1238,6 +1508,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmax |reference - locality|:       " << localityMaxAbs
         << "\nmax |reference - median-row|:     " << medianRowMaxAbs
         << "\nmax |packed - median-row|:        " << medianRowVsPackedMaxAbs
+        << "\nmax |reference - whole-row int16|: " << wholeRowInt16MaxAbs
+        << "\nmax |reference - delta/escape|:    " << deltaEscapeInt16MaxAbs
+        << "\nmax |reference - absolute uint24|: " << packedUint24MaxAbs
+        << "\nmax |reference - geometry schedule|: " << geometryMaxAbs
         << "\nmax |reference - AVX-512|:        " << avx512MaxAbs
         << "\nmax |reference - AVX2|:           " << avx2MaxAbs
         << "\nmax |reference - AVX2 rows|:      " << avx2AcrossRowsMaxAbs
@@ -1303,6 +1577,14 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmedian-row exact equality:       "
         << (medianRowMaxAbs == 0 ? "PASS" : "NO")
         << "\nmedian-row equivalence:          " << status(medianRowMaxAbs)
+        << "\nwhole-row int16 exact equality:  "
+        << (wholeRowInt16MaxAbs == 0 ? "PASS" : "NO")
+        << "\ndelta/escape exact equality:     "
+        << (deltaEscapeInt16MaxAbs == 0 ? "PASS" : "NO")
+        << "\nabsolute uint24 exact equality:   "
+        << (packedUint24MaxAbs == 0 ? "PASS" : "NO")
+        << "\ngeometry schedule exact equality: "
+        << (geometryMaxAbs == 0 ? "PASS" : "NO")
         << "\nAVX-512 equivalence:             " << status(avx512MaxAbs)
         << "\nAVX2 equivalence:                " << status(avx2MaxAbs)
         << "\nAVX2 across-rows equivalence:    " << status(avx2AcrossRowsMaxAbs)
@@ -1337,6 +1619,14 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
      || medianRowMaxAbs > equivalenceTolerance
      || medianRowVsPackedMaxAbs > equivalenceTolerance
      || medianRowResidualDifference > equivalenceTolerance
+     || wholeRowInt16MaxAbs != 0
+     || deltaEscapeInt16MaxAbs != 0
+     || wholeRowInt16Residual != referenceOneSweepResidual
+     || deltaEscapeInt16Residual != referenceOneSweepResidual
+     || packedUint24MaxAbs != 0
+     || packedUint24Residual != referenceOneSweepResidual
+     || geometryMaxAbs != 0
+     || geometryResidual != referenceOneSweepResidual
      || avx2MaxAbs > equivalenceTolerance
      || avx2ResidualDifference > equivalenceTolerance
      || avx2AcrossRowsMaxAbs > equivalenceTolerance
@@ -1614,6 +1904,62 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                     );
                 }
             }
+        },
+        {
+            "Whole-row int16/fallback",
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialWholeRowInt16Smooth
+                    (
+                        timedPsi, source, wholeRowInt16Schedule,
+                        productionSweepsPerCall
+                    );
+                }
+            }
+        },
+        {
+            "Chained int16 delta/escape",
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialDeltaEscapeInt16Smooth
+                    (
+                        timedPsi, source, deltaEscapeInt16Schedule,
+                        productionSweepsPerCall
+                    );
+                }
+            }
+        },
+        {
+            "Absolute uint24 columns",
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialPackedUint24Smooth
+                    (
+                        timedPsi, source, packedUint24Schedule,
+                        productionSweepsPerCall
+                    );
+                }
+            }
+        },
+        {
+            "Geometry-oriented wavefront",
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialGatherSmooth
+                    (
+                        timedPsi, source, geometrySchedule,
+                        productionSweepsPerCall
+                    );
+                }
+            }
         }
     };
     const std::vector<ImplementationTiming> productionTimings =
@@ -1630,6 +1976,13 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const ImplementationTiming& productionDegree6InterleavedTiming =
         productionTimings[4];
     const ImplementationTiming& productionMedianRowTiming = productionTimings[5];
+    const ImplementationTiming& productionWholeRowInt16Timing =
+        productionTimings[6];
+    const ImplementationTiming& productionDeltaEscapeInt16Timing =
+        productionTimings[7];
+    const ImplementationTiming& productionPackedUint24Timing =
+        productionTimings[8];
+    const ImplementationTiming& productionGeometryTiming = productionTimings[9];
 
 
     scalarField psi = initialPsi;
@@ -1935,6 +2288,44 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         productionPackedTiming.medianSeconds/productionMedianRowTiming.medianSeconds;
     const scalar productionMedianRowSpeedupReference =
         productionReferenceTiming.medianSeconds/productionMedianRowTiming.medianSeconds;
+    const scalar productionWholeRowInt16SpeedupPacked =
+        productionPackedTiming.medianSeconds
+       /productionWholeRowInt16Timing.medianSeconds;
+    const scalar productionDeltaEscapeInt16SpeedupPacked =
+        productionPackedTiming.medianSeconds
+       /productionDeltaEscapeInt16Timing.medianSeconds;
+    const scalar productionPackedUint24SpeedupPacked =
+        productionPackedTiming.medianSeconds
+       /productionPackedUint24Timing.medianSeconds;
+    const scalar productionGeometrySpeedupPacked =
+        productionPackedTiming.medianSeconds/productionGeometryTiming.medianSeconds;
+    const std::size_t compactRowCount = std::count
+    (
+        wholeRowInt16Schedule.compactRows.begin(),
+        wholeRowInt16Schedule.compactRows.end(),
+        static_cast<unsigned char>(1)
+    );
+    std::cout << "\nCompressed addressing setup:"
+        << "\n  whole-row compact rows: " << compactRowCount << " / "
+        << schedule.waveCells.size()
+        << "\n  whole-row compact contributions: "
+        << wholeRowInt16Schedule.offsets.size() << " / " << schedule.cols.size()
+        << "\n  delta entries: " << deltaEscapeInt16Schedule.deltas.size()
+        << "\n  delta escapes: " << deltaEscapeInt16Schedule.escapeCols.size()
+        << "\n  uint24 column bytes: " << packedUint24Schedule.cols.size()
+        << " (baseline label bytes: "
+        << schedule.cols.size()*sizeof(label) << ')'
+        << "\n  preprocessing time (all schedules): "
+        << preprocessingSeconds << " s\n";
+    std::cout << "\nGeometry-oriented wavefront statistics:"
+        << "\n  X slabs: " << geometryXSlabs
+        << "\n  levels: " << geometryWavefronts.widths.size()
+        << "\n  cells: " << geometrySchedule.waveCells.size()
+        << "\n  min width: " << geometryWavefronts.minimumWidth
+        << "\n  mean width: " << geometryWavefronts.meanWidth
+        << "\n  median width: " << geometryWavefronts.medianWidth
+        << "\n  max width: " << geometryWavefronts.maximumWidth
+        << "\n  dependency validation: PASS\n";
     std::cout << "\nProduction-like scalar ILP benchmark:"
         << "\n  calls/sample: " << productionCallsPerSample
         << "\n  sweeps/call: " << productionSweepsPerCall
@@ -1958,6 +2349,10 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         "3-sweep Median-row reordered packed scalar",
         productionMedianRowTiming
     );
+    printTiming("3-sweep Whole-row int16/fallback", productionWholeRowInt16Timing);
+    printTiming("3-sweep Chained int16 delta/escape", productionDeltaEscapeInt16Timing);
+    printTiming("3-sweep Absolute uint24 columns", productionPackedUint24Timing);
+    printTiming("3-sweep Geometry-oriented wavefront", productionGeometryTiming);
     std::cout << "\nInterleaved rows summary (median):"
         << "\nvariant          median(s)  ns/cell  CV(%)"
         << "\nreference        " << productionReferenceTiming.medianSeconds
@@ -1979,6 +2374,18 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmedian-row       " << productionMedianRowTiming.medianSeconds
         << "  " << productionMedianRowTiming.medianNsPerCellSweep
         << "  " << productionMedianRowTiming.cvPercent
+        << "\nwhole-row int16  " << productionWholeRowInt16Timing.medianSeconds
+        << "  " << productionWholeRowInt16Timing.medianNsPerCellSweep
+        << "  " << productionWholeRowInt16Timing.cvPercent
+        << "\ndelta/escape     " << productionDeltaEscapeInt16Timing.medianSeconds
+        << "  " << productionDeltaEscapeInt16Timing.medianNsPerCellSweep
+        << "  " << productionDeltaEscapeInt16Timing.cvPercent
+        << "\nabsolute uint24  " << productionPackedUint24Timing.medianSeconds
+        << "  " << productionPackedUint24Timing.medianNsPerCellSweep
+        << "  " << productionPackedUint24Timing.cvPercent
+        << "\ngeometry X       " << productionGeometryTiming.medianSeconds
+        << "  " << productionGeometryTiming.medianNsPerCellSweep
+        << "  " << productionGeometryTiming.cvPercent
         << "\n  generic interleaved speedup vs packed/reference: "
         << productionInterleavedSpeedupPacked << "x / "
         << productionInterleavedSpeedupReference << "x"
@@ -2002,7 +2409,15 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  speedup vs packed, degree-6 4-way: "
         << productionDegree6InterleavedSpeedupPacked << "x"
         << "\n  speedup vs packed, median-row reordered: "
-        << productionMedianRowSpeedupPacked << "x\n";
+        << productionMedianRowSpeedupPacked << "x"
+        << "\n  speedup vs packed, whole-row int16: "
+        << productionWholeRowInt16SpeedupPacked << "x"
+        << "\n  speedup vs packed, chained delta/escape: "
+        << productionDeltaEscapeInt16SpeedupPacked << "x"
+        << "\n  speedup vs packed, absolute uint24: "
+        << productionPackedUint24SpeedupPacked << "x"
+        << "\n  speedup vs packed, geometry X: "
+        << productionGeometrySpeedupPacked << "x\n";
 
     std::cout << "\nPrefetch summary (median):"
         << "\nvariant          distance  neighbours  median(s)  ns/cell  "

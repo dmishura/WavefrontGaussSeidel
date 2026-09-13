@@ -1,5 +1,6 @@
 #include "WavefrontGaussSeidel.H"
 
+#include <limits>
 #include <omp.h>
 
 namespace smootherTest
@@ -36,6 +37,150 @@ void serialGatherSmooth
                 scalar psii = source[cell];
                 for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
                     psii -= coeffs[p]*psi[cols[p]];
+                psi[cell] = psii/diag[row];
+            }
+        }
+    }
+}
+
+void serialWholeRowInt16Smooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const WholeRowInt16Schedule& schedule,
+    const label nSweeps
+)
+{
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const compactStarts = schedule.compactStarts.data();
+    const label* const fallbackStarts = schedule.fallbackStarts.data();
+    const label* const fallbackCols = schedule.fallbackCols.data();
+    const std::int16_t* const offsets = schedule.offsets.data();
+    const unsigned char* const compactRows = schedule.compactRows.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                const label coefficientBegin = rowStarts[row];
+                if (compactRows[row])
+                {
+                    const label begin = compactStarts[row];
+                    const label end = compactStarts[row + 1];
+                    for (label q=begin; q<end; ++q)
+                        psii -= coeffs[coefficientBegin + q - begin]*psi[cell + offsets[q]];
+                }
+                else
+                {
+                    const label begin = fallbackStarts[row];
+                    const label end = fallbackStarts[row + 1];
+                    for (label q=begin; q<end; ++q)
+                        psii -= coeffs[coefficientBegin + q - begin]*psi[fallbackCols[q]];
+                }
+                psi[cell] = psii/diag[row];
+            }
+        }
+    }
+}
+
+void serialDeltaEscapeInt16Smooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const DeltaEscapeInt16Schedule& schedule,
+    const label nSweeps
+)
+{
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const firstCols = schedule.firstCols.data();
+    const label* const deltaStarts = schedule.deltaStarts.data();
+    const label* const escapeStarts = schedule.escapeStarts.data();
+    const label* const escapeCols = schedule.escapeCols.data();
+    const std::int16_t* const deltas = schedule.deltas.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::int16_t escape = std::numeric_limits<std::int16_t>::min();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                const label begin = rowStarts[row];
+                const label end = rowStarts[row + 1];
+                if (begin < end)
+                {
+                    label col = firstCols[row];
+                    psii -= coeffs[begin]*psi[col];
+                    label deltaIndex = deltaStarts[row];
+                    label escapeIndex = escapeStarts[row];
+                    for (label p=begin + 1; p<end; ++p)
+                    {
+                        const std::int16_t delta = deltas[deltaIndex++];
+                        col = delta == escape ? escapeCols[escapeIndex++] : col + delta;
+                        psii -= coeffs[p]*psi[col];
+                    }
+                }
+                psi[cell] = psii/diag[row];
+            }
+        }
+    }
+}
+
+void serialPackedUint24Smooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const PackedUint24Schedule& schedule,
+    const label nSweeps
+)
+{
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const std::uint8_t* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                {
+                    const std::size_t byte = 3*std::size_t(p);
+                    const std::uint32_t col =
+                        std::uint32_t(cols[byte])
+                      | (std::uint32_t(cols[byte + 1]) << 8)
+                      | (std::uint32_t(cols[byte + 2]) << 16);
+                    psii -= coeffs[p]*psi[col];
+                }
                 psi[cell] = psii/diag[row];
             }
         }

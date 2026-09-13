@@ -15,6 +15,7 @@ struct PolyMeshTopology
     std::size_t nFaces = 0;
     std::vector<int> owner;
     std::vector<int> neighbour;
+    std::vector<double> cellCentreX;
 
     std::size_t nInternalFaces() const noexcept { return neighbour.size(); }
 
