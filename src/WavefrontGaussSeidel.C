@@ -243,6 +243,50 @@ void serialGatherPrefetchSmooth
     }
 }
 
+void serialGatherFirstPsiPrefetchSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const WavefrontSchedule& schedule,
+    const label nSweeps,
+    const label rowDistance
+)
+{
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const label nRows = static_cast<label>(schedule.waveCells.size());
+    const label prefetchEnd = std::max<label>(0, nRows - rowDistance);
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (label row=0; row<prefetchEnd; ++row)
+        {
+            const label futureRow = row + rowDistance;
+            const label futureBegin = rowStarts[futureRow];
+            if (futureBegin < rowStarts[futureRow + 1])
+                __builtin_prefetch(psi + cols[futureBegin], 0, 1);
+            const label cell = waveCells[row];
+            scalar psii = source[cell];
+            for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                psii -= coeffs[p]*psi[cols[p]];
+            psi[cell] = psii/diag[row];
+        }
+        for (label row=prefetchEnd; row<nRows; ++row)
+        {
+            const label cell = waveCells[row];
+            scalar psii = source[cell];
+            for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                psii -= coeffs[p]*psi[cols[p]];
+            psi[cell] = psii/diag[row];
+        }
+    }
+}
+
 void serialGatherInterleavedRowsSmooth
 (
     Foam::scalarField& psiField,

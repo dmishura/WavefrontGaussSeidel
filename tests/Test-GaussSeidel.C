@@ -44,6 +44,7 @@ using smootherTest::serialGatherInterleavedRowsSmooth;
 using smootherTest::serialGatherDegree6Smooth;
 using smootherTest::serialGatherDegree6InterleavedRowsSmooth;
 using smootherTest::serialGatherPrefetchSmooth;
+using smootherTest::serialGatherFirstPsiPrefetchSmooth;
 using smootherTest::serialReorderedPsiSmooth;
 
 namespace
@@ -1299,6 +1300,131 @@ void printLevelWidths
     std::cout << '\n';
 }
 
+}
+
+int runHpcPrefetchSeries(const std::string& meshDirectory)
+{
+    const int threads = omp_get_max_threads();
+    if (threads != 1)
+        throw std::runtime_error
+        (
+            "MTBHPC prefetch series requires OMP_NUM_THREADS=1"
+        );
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    lduMatrix matrix = makeMatrix(mesh);
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(exact.size()); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    const auto setupBegin = std::chrono::steady_clock::now();
+    const WavefrontStatistics baseStatistics = constructWavefronts(mesh);
+    const WavefrontSchedule packed =
+        makeWavefrontSchedule(mesh, matrix, baseStatistics);
+    const WavefrontStatistics geometryStatistics =
+        constructWidthConstrainedGeometryWavefronts(mesh, 256, 8192);
+    const WavefrontSchedule geometry =
+        makeWavefrontSchedule(mesh, matrix, geometryStatistics);
+    const scalar setupSeconds = std::chrono::duration<scalar>
+    (
+        std::chrono::steady_clock::now() - setupBegin
+    ).count();
+    const scalarField initialPsi(mesh.nCells, 0.0);
+    scalarField packedReference = initialPsi;
+    scalarField geometryReference = initialPsi;
+    serialGatherSmooth(packedReference, source, packed, 1);
+    serialGatherSmooth(geometryReference, source, geometry, 1);
+    constexpr std::array<label, 4> distances{{4, 8, 16, 32}};
+    for (const label distance : distances)
+    {
+        scalarField candidate = initialPsi;
+        serialGatherFirstPsiPrefetchSmooth
+        (
+            candidate, source, packed, 1, distance
+        );
+        if (maxAbsDifference(packedReference, candidate) != 0)
+            throw std::runtime_error("packed HPC prefetch equivalence failed");
+        candidate = initialPsi;
+        serialGatherFirstPsiPrefetchSmooth
+        (
+            candidate, source, geometry, 1, distance
+        );
+        if (maxAbsDifference(geometryReference, candidate) != 0)
+            throw std::runtime_error("geometry HPC prefetch equivalence failed");
+    }
+    constexpr label samples = 5;
+    constexpr label sweepsPerSample = 81;
+    constexpr label warmupSweeps = 6;
+    constexpr std::uint32_t seed = 0x5EED1234u;
+    std::vector<RandomizedBenchmarkVariant> variants;
+    const auto addBaseline = [&](const std::string& name, const WavefrontSchedule& s)
+    {
+        const WavefrontSchedule* const selected = &s;
+        variants.push_back({name, [&, selected](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+                serialGatherSmooth(psi, source, *selected, 3);
+        }});
+    };
+    const auto addPrefetch = [&]
+    (
+        const std::string& prefix,
+        const WavefrontSchedule& s,
+        const label distance
+    )
+    {
+        const WavefrontSchedule* const selected = &s;
+        variants.push_back
+        ({
+            prefix + " prefetch D=" + std::to_string(distance),
+            [&, selected, distance](scalarField& psi, const label n)
+            {
+                for (label sweep=0; sweep<n; sweep += 3)
+                    serialGatherFirstPsiPrefetchSmooth
+                    (
+                        psi, source, *selected, 3, distance
+                    );
+            }
+        });
+    };
+    addBaseline("Packed scalar", packed);
+    for (const label distance : distances) addPrefetch("Packed", packed, distance);
+    addBaseline("Geometry width 8192 scalar", geometry);
+    for (const label distance : distances)
+        addPrefetch("Geometry width 8192", geometry, distance);
+    const auto timings = timeRandomizedImplementations
+    (
+        initialPsi, mesh.nCells, samples, sweepsPerSample,
+        warmupSweeps, seed, variants
+    );
+    std::cout << "MTBHPC prefetch series: cells=" << mesh.nCells
+        << " setup=" << setupSeconds << " s threads=" << threads
+        << " seed=" << seed
+        << "\nGeometry width 8192 levels=" << geometryStatistics.widths.size()
+        << " dependency=PASS exact=PASS\n";
+    for (std::size_t i=0; i<variants.size(); ++i)
+        printTiming(variants[i].name.c_str(), timings[i]);
+    std::cout << "\nPrefetch summary (median):\n"
+        << "variant  D  seconds/sweep  CV(%)  baseline/prefetch\n";
+    for (std::size_t i=0; i<5; ++i)
+    {
+        const scalar relative = timings[0].medianSeconds/timings[i].medianSeconds;
+        std::cout << "packed  " << (i == 0 ? 0 : distances[i - 1])
+            << "  " << timings[i].medianSeconds
+            << "  " << timings[i].cvPercent << "  " << relative << '\n';
+    }
+    for (std::size_t i=5; i<10; ++i)
+    {
+        const scalar relative = timings[5].medianSeconds/timings[i].medianSeconds;
+        std::cout << "geometry8192  " << (i == 5 ? 0 : distances[i - 6])
+            << "  " << timings[i].medianSeconds
+            << "  " << timings[i].cvPercent << "  " << relative << '\n';
+    }
+    std::cout << "PASS\n";
+    return 0;
 }
 
 int runHpcSeries(const std::string& meshDirectory)
@@ -2926,7 +3052,8 @@ int main(int argc, char** argv)
 {
     const std::string usage =
         "Usage: Test-GaussSeidel <polyMesh-directory> "
-        "[--history-sweeps N] [--width-benchmark-only] [--hpc-series]\n";
+        "[--history-sweeps N] [--width-benchmark-only] [--hpc-series] "
+        "[--hpc-prefetch-series]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -2942,6 +3069,7 @@ int main(int argc, char** argv)
         label historySweeps = 20;
         bool widthBenchmarkOnly = false;
         bool hpcSeries = false;
+        bool hpcPrefetchSeries = false;
         for (int argument=2; argument<argc; ++argument)
         {
             const std::string option = argv[argument];
@@ -2953,6 +3081,11 @@ int main(int argc, char** argv)
             if (option == "--hpc-series")
             {
                 hpcSeries = true;
+                continue;
+            }
+            if (option == "--hpc-prefetch-series")
+            {
+                hpcPrefetchSeries = true;
                 continue;
             }
             if (option != "--history-sweeps" || argument + 1 >= argc)
@@ -2972,6 +3105,7 @@ int main(int argc, char** argv)
                 );
             }
         }
+        if (hpcPrefetchSeries) return runHpcPrefetchSeries(argv[1]);
         if (hpcSeries) return runHpcSeries(argv[1]);
         return runTest(argv[1], historySweeps, widthBenchmarkOnly);
     }
