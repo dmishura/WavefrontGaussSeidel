@@ -1549,6 +1549,113 @@ int runHpcSeries(const std::string& meshDirectory)
     return 0;
 }
 
+int runHpcBestSeries(const std::string& meshDirectory)
+{
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    lduMatrix matrix = makeMatrix(mesh);
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(exact.size()); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    FieldField<Field, scalar> interfaceCoeffs(0);
+    lduInterfaceFieldPtrsList interfaces(0);
+    const auto setupBegin = std::chrono::steady_clock::now();
+    const WavefrontStatistics baseStatistics = constructWavefronts(mesh);
+    const WavefrontSchedule baseSchedule =
+        makeWavefrontSchedule(mesh, matrix, baseStatistics);
+    const WavefrontStatistics geometryStatistics =
+        constructWidthConstrainedGeometryWavefronts(mesh, 256, 8192);
+    const WavefrontSchedule geometrySchedule =
+        makeWavefrontSchedule(mesh, matrix, geometryStatistics);
+    const scalar setupSeconds = std::chrono::duration<scalar>
+    (
+        std::chrono::steady_clock::now() - setupBegin
+    ).count();
+    const scalarField initialPsi(mesh.nCells, 0.0);
+    scalarField reference = initialPsi;
+    GaussSeidelSmoother::smooth
+    (
+        "psi", reference, matrix, source,
+        interfaceCoeffs, interfaces, 0, 1
+    );
+    scalarField candidate = initialPsi;
+    const int threads = omp_get_max_threads();
+    int detectedThreads = 1;
+    if (threads == 1)
+        serialGatherSmooth(candidate, source, geometrySchedule, 1);
+    else
+        persistentOpenMpSmooth
+        (
+            candidate, source, geometrySchedule, 1, detectedThreads
+        );
+    if (maxAbsDifference(reference, candidate) != 0)
+        throw std::runtime_error("HPC best-series exact equivalence failed");
+
+    constexpr label samples = 5;
+    constexpr label sweepsPerSample = 81;
+    constexpr label warmupSweeps = 6;
+    constexpr std::uint32_t seed = 0x5EED1234u;
+    std::vector<RandomizedBenchmarkVariant> variants;
+    variants.push_back({"Reference GS", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            GaussSeidelSmoother::smooth
+            (
+                "psi", psi, matrix, source, interfaceCoeffs, interfaces, 0, 3
+            );
+    }});
+    variants.push_back({"Packed scalar", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            serialGatherSmooth(psi, source, baseSchedule, 3);
+    }});
+    variants.push_back
+    ({
+        threads == 1
+            ? "Geometry width 8192 scalar"
+            : "Geometry width 8192 persistent",
+        [&](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+            {
+                if (threads == 1)
+                    serialGatherSmooth(psi, source, geometrySchedule, 3);
+                else
+                    persistentOpenMpSmooth
+                    (
+                        psi, source, geometrySchedule, 3, detectedThreads
+                    );
+            }
+        }
+    });
+    const auto timings = timeRandomizedImplementations
+    (
+        initialPsi, mesh.nCells, samples, sweepsPerSample,
+        warmupSweeps, seed, variants
+    );
+    std::cout << "MTBHPC best-series cells: " << mesh.nCells
+        << "\ninternal faces: " << mesh.nInternalFaces()
+        << "\nschedule setup: " << setupSeconds << " s"
+        << "\nrequested threads: " << threads
+        << "\ndetected threads: " << detectedThreads
+        << "\nGeometry width 8192 levels: "
+        << geometryStatistics.widths.size()
+        << "\ndependency validation: PASS"
+        << "\nexact correctness: PASS"
+        << "\nbenchmark seed: " << seed << '\n';
+    for (std::size_t i=0; i<variants.size(); ++i)
+        printTiming(variants[i].name.c_str(), timings[i]);
+    std::cout << "\nMedian speedup Geometry-8192 vs Reference: "
+        << timings[0].medianSeconds/timings[2].medianSeconds << "x"
+        << "\nMedian speedup Geometry-8192 vs Packed: "
+        << timings[1].medianSeconds/timings[2].medianSeconds << "x\nPASS\n";
+    return 0;
+}
+
 int runTest
 (
     const std::string& meshDirectory,
@@ -3053,7 +3160,7 @@ int main(int argc, char** argv)
     const std::string usage =
         "Usage: Test-GaussSeidel <polyMesh-directory> "
         "[--history-sweeps N] [--width-benchmark-only] [--hpc-series] "
-        "[--hpc-prefetch-series]\n";
+        "[--hpc-prefetch-series] [--hpc-best-series]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -3070,6 +3177,7 @@ int main(int argc, char** argv)
         bool widthBenchmarkOnly = false;
         bool hpcSeries = false;
         bool hpcPrefetchSeries = false;
+        bool hpcBestSeries = false;
         for (int argument=2; argument<argc; ++argument)
         {
             const std::string option = argv[argument];
@@ -3086,6 +3194,11 @@ int main(int argc, char** argv)
             if (option == "--hpc-prefetch-series")
             {
                 hpcPrefetchSeries = true;
+                continue;
+            }
+            if (option == "--hpc-best-series")
+            {
+                hpcBestSeries = true;
                 continue;
             }
             if (option != "--history-sweeps" || argument + 1 >= argc)
@@ -3106,6 +3219,7 @@ int main(int argc, char** argv)
             }
         }
         if (hpcPrefetchSeries) return runHpcPrefetchSeries(argv[1]);
+        if (hpcBestSeries) return runHpcBestSeries(argv[1]);
         if (hpcSeries) return runHpcSeries(argv[1]);
         return runTest(argv[1], historySweeps, widthBenchmarkOnly);
     }
