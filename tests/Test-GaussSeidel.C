@@ -526,6 +526,51 @@ PackedUint24Schedule makePackedUint24Schedule
     return compact;
 }
 
+WavefrontSchedule makeXSortedWithinLevelsSchedule
+(
+    const WavefrontSchedule& original,
+    const std::vector<double>& cellCentreX
+)
+{
+    WavefrontSchedule reordered;
+    reordered.levelStarts = original.levelStarts;
+    reordered.waveCells.reserve(original.waveCells.size());
+    reordered.rowStarts.reserve(original.rowStarts.size());
+    reordered.cols.reserve(original.cols.size());
+    reordered.coeffs.reserve(original.coeffs.size());
+    reordered.diag.reserve(original.diag.size());
+    reordered.rowStarts.push_back(0);
+    for (std::size_t level=0; level + 1<original.levelStarts.size(); ++level)
+    {
+        std::vector<label> rows;
+        for (label row=original.levelStarts[level]; row<original.levelStarts[level + 1]; ++row)
+            rows.push_back(row);
+        std::stable_sort
+        (
+            rows.begin(), rows.end(), [&](const label left, const label right)
+            {
+                const label leftCell = original.waveCells[left];
+                const label rightCell = original.waveCells[right];
+                return cellCentreX[leftCell] == cellCentreX[rightCell]
+                    ? leftCell < rightCell
+                    : cellCentreX[leftCell] < cellCentreX[rightCell];
+            }
+        );
+        for (const label row : rows)
+        {
+            reordered.waveCells.push_back(original.waveCells[row]);
+            reordered.diag.push_back(original.diag[row]);
+            for (label p=original.rowStarts[row]; p<original.rowStarts[row + 1]; ++p)
+            {
+                reordered.cols.push_back(original.cols[p]);
+                reordered.coeffs.push_back(original.coeffs[p]);
+            }
+            reordered.rowStarts.push_back(reordered.cols.size());
+        }
+    }
+    return reordered;
+}
+
 WavefrontSchedule makeLocalityReorderedSchedule
 (
     const WavefrontSchedule& original
@@ -1196,6 +1241,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const WavefrontSchedule geometrySchedule =
         makeWavefrontSchedule(mesh, matrix, geometryWavefronts);
     const auto geometryScheduleEnd = std::chrono::steady_clock::now();
+    const WavefrontSchedule xSortedSchedule =
+        makeXSortedWithinLevelsSchedule(schedule, mesh.cellCentreX);
     const WavefrontSchedule localitySchedule =
         makeLocalityReorderedSchedule(schedule);
     const WavefrontSchedule medianRowSchedule =
@@ -1290,6 +1337,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     serialPackedUint24Smooth(psiPackedUint24, source, packedUint24Schedule, 1);
     scalarField psiGeometry = initialPsi;
     serialGatherSmooth(psiGeometry, source, geometrySchedule, 1);
+    scalarField psiXSorted = initialPsi;
+    serialGatherSmooth(psiXSorted, source, xSortedSchedule, 1);
     const bool avx512Available = avx512GatherAvailable();
     const bool avx2Available = avx2GatherAvailable();
     scalarField psiAvx2 = initialPsi;
@@ -1340,6 +1389,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar packedUint24MaxAbs =
         maxAbsDifference(psiReference, psiPackedUint24);
     const scalar geometryMaxAbs = maxAbsDifference(psiReference, psiGeometry);
+    const scalar xSortedMaxAbs = maxAbsDifference(psiReference, psiXSorted);
     const scalar prefetchFirstMaxAbs =
         maxAbsDifference(psiReference, psiPrefetchFirst);
     const scalar prefetchTwoMaxAbs =
@@ -1402,6 +1452,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const scalar packedUint24Residual =
         relativeResidual(matrix, psiPackedUint24, source);
     const scalar geometryResidual = relativeResidual(matrix, psiGeometry, source);
+    const scalar xSortedResidual = relativeResidual(matrix, psiXSorted, source);
     const scalar prefetchFirstResidual =
         relativeResidual(matrix, psiPrefetchFirst, source);
     const scalar prefetchTwoResidual =
@@ -1460,6 +1511,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nDelta/escape int16 residual:    " << deltaEscapeInt16Residual
         << "\nAbsolute uint24 residual:       " << packedUint24Residual
         << "\nGeometry-oriented residual:     " << geometryResidual
+        << "\nX-sorted 49-level residual:     " << xSortedResidual
         << "\nSerial packed AVX2 residual:    " << avx2Residual
         << "\nAVX2 across-rows residual:      " << avx2AcrossRowsResidual
         << "\nSerial packed AVX-512 residual: " << avx512Residual
@@ -1512,6 +1564,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\nmax |reference - delta/escape|:    " << deltaEscapeInt16MaxAbs
         << "\nmax |reference - absolute uint24|: " << packedUint24MaxAbs
         << "\nmax |reference - geometry schedule|: " << geometryMaxAbs
+        << "\nmax |reference - X-sorted levels|: " << xSortedMaxAbs
         << "\nmax |reference - AVX-512|:        " << avx512MaxAbs
         << "\nmax |reference - AVX2|:           " << avx2MaxAbs
         << "\nmax |reference - AVX2 rows|:      " << avx2AcrossRowsMaxAbs
@@ -1585,6 +1638,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << (packedUint24MaxAbs == 0 ? "PASS" : "NO")
         << "\ngeometry schedule exact equality: "
         << (geometryMaxAbs == 0 ? "PASS" : "NO")
+        << "\nX-sorted levels exact equality:   "
+        << (xSortedMaxAbs == 0 ? "PASS" : "NO")
         << "\nAVX-512 equivalence:             " << status(avx512MaxAbs)
         << "\nAVX2 equivalence:                " << status(avx2MaxAbs)
         << "\nAVX2 across-rows equivalence:    " << status(avx2AcrossRowsMaxAbs)
@@ -1627,6 +1682,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
      || packedUint24Residual != referenceOneSweepResidual
      || geometryMaxAbs != 0
      || geometryResidual != referenceOneSweepResidual
+     || xSortedMaxAbs != 0
+     || xSortedResidual != referenceOneSweepResidual
      || avx2MaxAbs > equivalenceTolerance
      || avx2ResidualDifference > equivalenceTolerance
      || avx2AcrossRowsMaxAbs > equivalenceTolerance
@@ -1960,6 +2017,20 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
                     );
                 }
             }
+        },
+        {
+            "X-sorted within original levels",
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    serialGatherSmooth
+                    (
+                        timedPsi, source, xSortedSchedule,
+                        productionSweepsPerCall
+                    );
+                }
+            }
         }
     };
     const std::vector<ImplementationTiming> productionTimings =
@@ -1983,6 +2054,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const ImplementationTiming& productionPackedUint24Timing =
         productionTimings[8];
     const ImplementationTiming& productionGeometryTiming = productionTimings[9];
+    const ImplementationTiming& productionXSortedTiming = productionTimings[10];
 
 
     scalarField psi = initialPsi;
@@ -2299,6 +2371,8 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
        /productionPackedUint24Timing.medianSeconds;
     const scalar productionGeometrySpeedupPacked =
         productionPackedTiming.medianSeconds/productionGeometryTiming.medianSeconds;
+    const scalar productionXSortedSpeedupPacked =
+        productionPackedTiming.medianSeconds/productionXSortedTiming.medianSeconds;
     const std::size_t compactRowCount = std::count
     (
         wholeRowInt16Schedule.compactRows.begin(),
@@ -2353,6 +2427,7 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     printTiming("3-sweep Chained int16 delta/escape", productionDeltaEscapeInt16Timing);
     printTiming("3-sweep Absolute uint24 columns", productionPackedUint24Timing);
     printTiming("3-sweep Geometry-oriented wavefront", productionGeometryTiming);
+    printTiming("3-sweep X-sorted within original levels", productionXSortedTiming);
     std::cout << "\nInterleaved rows summary (median):"
         << "\nvariant          median(s)  ns/cell  CV(%)"
         << "\nreference        " << productionReferenceTiming.medianSeconds
@@ -2386,6 +2461,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\ngeometry X       " << productionGeometryTiming.medianSeconds
         << "  " << productionGeometryTiming.medianNsPerCellSweep
         << "  " << productionGeometryTiming.cvPercent
+        << "\nX-sort 49 levels " << productionXSortedTiming.medianSeconds
+        << "  " << productionXSortedTiming.medianNsPerCellSweep
+        << "  " << productionXSortedTiming.cvPercent
         << "\n  generic interleaved speedup vs packed/reference: "
         << productionInterleavedSpeedupPacked << "x / "
         << productionInterleavedSpeedupReference << "x"
@@ -2417,7 +2495,9 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         << "\n  speedup vs packed, absolute uint24: "
         << productionPackedUint24SpeedupPacked << "x"
         << "\n  speedup vs packed, geometry X: "
-        << productionGeometrySpeedupPacked << "x\n";
+        << productionGeometrySpeedupPacked << "x"
+        << "\n  speedup vs packed, X-sort within 49 levels: "
+        << productionXSortedSpeedupPacked << "x\n";
 
     std::cout << "\nPrefetch summary (median):"
         << "\nvariant          distance  neighbours  median(s)  ns/cell  "
