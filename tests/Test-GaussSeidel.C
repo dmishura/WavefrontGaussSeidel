@@ -316,6 +316,97 @@ WavefrontStatistics constructGeometryOrientedWavefronts
     return result;
 }
 
+WavefrontStatistics constructWidthConstrainedGeometryWavefronts
+(
+    const PolyMeshTopology& mesh,
+    const label xSlabs,
+    const label targetWidth
+)
+{
+    if (mesh.cellCentreX.size() != mesh.nCells || targetWidth < 1)
+        throw std::runtime_error("invalid width-constrained geometry input");
+    const auto xBounds = std::minmax_element
+    (
+        mesh.cellCentreX.begin(), mesh.cellCentreX.end()
+    );
+    const double xMinimum = *xBounds.first;
+    const double xRange = std::max(*xBounds.second - xMinimum, 1e-300);
+    const auto slabForCell = [&](const label cell)
+    {
+        return std::min
+        (
+            xSlabs - 1,
+            static_cast<label>
+            (
+                (mesh.cellCentreX[cell] - xMinimum)/xRange*xSlabs
+            )
+        );
+    };
+    std::vector<label> predecessorCounts(mesh.nCells, 0);
+    std::vector<std::vector<label>> successors(mesh.nCells);
+    for (std::size_t face=0; face<mesh.nInternalFaces(); ++face)
+    {
+        ++predecessorCounts[mesh.neighbour[face]];
+        successors[mesh.owner[face]].push_back(mesh.neighbour[face]);
+    }
+    std::vector<std::vector<label>> ready(xSlabs);
+    std::vector<std::size_t> readyCursor(xSlabs, 0);
+    for (label cell=0; cell<label(mesh.nCells); ++cell)
+        if (predecessorCounts[cell] == 0) ready[slabForCell(cell)].push_back(cell);
+
+    WavefrontStatistics result;
+    result.levels.assign(mesh.nCells, -1);
+    std::size_t assigned = 0;
+    label level = 0;
+    while (assigned < mesh.nCells)
+    {
+        std::vector<label> current;
+        current.reserve(targetWidth);
+        for (label slab=0; slab<xSlabs && label(current.size())<targetWidth; ++slab)
+        {
+            const label take = std::min
+            (
+                targetWidth - label(current.size()),
+                label(ready[slab].size() - readyCursor[slab])
+            );
+            current.insert
+            (
+                current.end(), ready[slab].begin() + readyCursor[slab],
+                ready[slab].begin() + readyCursor[slab] + take
+            );
+            readyCursor[slab] += take;
+        }
+        if (current.empty())
+            throw std::runtime_error("width-constrained geometry schedule stalled");
+        result.widths.push_back(current.size());
+        assigned += current.size();
+        for (const label cell : current) result.levels[cell] = level;
+        for (const label dependency : current)
+        {
+            for (const label cell : successors[dependency])
+                if (--predecessorCounts[cell] == 0)
+                    ready[slabForCell(cell)].push_back(cell);
+        }
+        ++level;
+    }
+    for (std::size_t face=0; face<mesh.nInternalFaces(); ++face)
+        if (result.levels[mesh.owner[face]] >= result.levels[mesh.neighbour[face]])
+            throw std::runtime_error("width-constrained dependency validation failed");
+    const auto bounds = std::minmax_element(result.widths.begin(), result.widths.end());
+    result.minimumWidth = *bounds.first;
+    result.maximumWidth = *bounds.second;
+    result.meanWidth = scalar(mesh.nCells)/result.widths.size();
+    std::vector<std::size_t> sorted = result.widths;
+    std::sort(sorted.begin(), sorted.end());
+    const std::size_t middle = sorted.size()/2;
+    result.medianWidth = sorted.size() % 2
+        ? scalar(sorted[middle])
+        : 0.5*scalar(sorted[middle - 1] + sorted[middle]);
+    result.p90Width = percentile(sorted, 0.90);
+    result.p95Width = percentile(sorted, 0.95);
+    return result;
+}
+
 WavefrontSchedule makeWavefrontSchedule
 (
     const PolyMeshTopology& mesh,
@@ -778,7 +869,7 @@ ImplementationTiming timeSweepImplementation
 
 struct RandomizedBenchmarkVariant
 {
-    const char* name;
+    std::string name;
     std::function<void(scalarField&, label)> executeSweeps;
 };
 
@@ -1210,7 +1301,12 @@ void printLevelWidths
 
 }
 
-int runTest(const std::string& meshDirectory, const label historySweeps)
+int runTest
+(
+    const std::string& meshDirectory,
+    const label historySweeps,
+    const bool widthBenchmarkOnly
+)
 {
     const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
     lduMatrix matrix = makeMatrix(mesh);
@@ -1243,6 +1339,20 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     const auto geometryScheduleEnd = std::chrono::steady_clock::now();
     const WavefrontSchedule xSortedSchedule =
         makeXSortedWithinLevelsSchedule(schedule, mesh.cellCentreX);
+    constexpr std::array<label, 5> constrainedWidths{{16, 32, 64, 128, 256}};
+    std::array<WavefrontStatistics, constrainedWidths.size()> constrainedStatistics;
+    std::array<WavefrontSchedule, constrainedWidths.size()> constrainedSchedules;
+    for (std::size_t i=0; i<constrainedWidths.size(); ++i)
+    {
+        constrainedStatistics[i] = constructWidthConstrainedGeometryWavefronts
+        (
+            mesh, geometryXSlabs, constrainedWidths[i]
+        );
+        constrainedSchedules[i] = makeWavefrontSchedule
+        (
+            mesh, matrix, constrainedStatistics[i]
+        );
+    }
     const WavefrontSchedule localitySchedule =
         makeLocalityReorderedSchedule(schedule);
     const WavefrontSchedule medianRowSchedule =
@@ -1339,6 +1449,12 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     serialGatherSmooth(psiGeometry, source, geometrySchedule, 1);
     scalarField psiXSorted = initialPsi;
     serialGatherSmooth(psiXSorted, source, xSortedSchedule, 1);
+    std::array<scalarField, constrainedWidths.size()> psiConstrained;
+    for (std::size_t i=0; i<constrainedWidths.size(); ++i)
+    {
+        psiConstrained[i] = initialPsi;
+        serialGatherSmooth(psiConstrained[i], source, constrainedSchedules[i], 1);
+    }
     const bool avx512Available = avx512GatherAvailable();
     const bool avx2Available = avx2GatherAvailable();
     scalarField psiAvx2 = initialPsi;
@@ -1390,6 +1506,16 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
         maxAbsDifference(psiReference, psiPackedUint24);
     const scalar geometryMaxAbs = maxAbsDifference(psiReference, psiGeometry);
     const scalar xSortedMaxAbs = maxAbsDifference(psiReference, psiXSorted);
+    std::array<scalar, constrainedWidths.size()> constrainedMaxAbs{};
+    std::array<scalar, constrainedWidths.size()> constrainedResidual{};
+    for (std::size_t i=0; i<constrainedWidths.size(); ++i)
+    {
+        constrainedMaxAbs[i] = maxAbsDifference(psiReference, psiConstrained[i]);
+        constrainedResidual[i] = relativeResidual
+        (
+            matrix, psiConstrained[i], source
+        );
+    }
     const scalar prefetchFirstMaxAbs =
         maxAbsDifference(psiReference, psiPrefetchFirst);
     const scalar prefetchTwoMaxAbs =
@@ -1697,6 +1823,122 @@ int runTest(const std::string& meshDirectory, const label historySweeps)
     )
     {
         throw std::runtime_error("one-sweep wavefront equivalence check failed");
+    }
+    for (std::size_t i=0; i<constrainedWidths.size(); ++i)
+    {
+        std::cout << "Width-constrained " << constrainedWidths[i]
+            << " residual / max difference / exact: "
+            << constrainedResidual[i] << " / " << constrainedMaxAbs[i]
+            << " / " << (constrainedMaxAbs[i] == 0 ? "PASS" : "FAIL") << '\n';
+        if
+        (
+            constrainedMaxAbs[i] != 0
+         || constrainedResidual[i] != referenceOneSweepResidual
+        ) throw std::runtime_error("width-constrained exact equivalence failed");
+    }
+
+    if (widthBenchmarkOnly)
+    {
+        constexpr label calls = 100;
+        constexpr label sweepsPerCall = 3;
+        constexpr label sweepsPerSample = calls*sweepsPerCall;
+        constexpr label samples = 7;
+        constexpr label warmupSweeps = 12;
+        constexpr std::uint32_t seed = 0x5EED1234u;
+        const int threads = omp_get_max_threads();
+        std::cout << "\nWidth-constrained Geometry-X statistics:\n";
+        for (std::size_t i=0; i<constrainedWidths.size(); ++i)
+        {
+            const WavefrontStatistics& s = constrainedStatistics[i];
+            std::cout << "target " << constrainedWidths[i]
+                << ": levels=" << s.widths.size()
+                << " min=" << s.minimumWidth
+                << " mean=" << s.meanWidth
+                << " median=" << s.medianWidth
+                << " max=" << s.maximumWidth
+                << " dependency=PASS\n";
+        }
+        std::vector<RandomizedBenchmarkVariant> variants;
+        variants.push_back
+        ({
+            "Packed baseline",
+            [&](scalarField& psi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += sweepsPerCall)
+                    serialGatherSmooth(psi, source, schedule, sweepsPerCall);
+            }
+        });
+        variants.push_back
+        ({
+            "Unconstrained Geometry-X scalar",
+            [&](scalarField& psi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += sweepsPerCall)
+                    serialGatherSmooth(psi, source, geometrySchedule, sweepsPerCall);
+            }
+        });
+        for (std::size_t i=0; i<constrainedWidths.size(); ++i)
+        {
+            variants.push_back
+            ({
+                "Width " + std::to_string(constrainedWidths[i]) + " scalar",
+                [&, i](scalarField& psi, const label nSweeps)
+                {
+                    for (label sweep=0; sweep<nSweeps; sweep += sweepsPerCall)
+                        serialGatherSmooth
+                        (
+                            psi, source, constrainedSchedules[i], sweepsPerCall
+                        );
+                }
+            });
+        }
+        if (threads > 1)
+        {
+            variants.push_back
+            ({
+                "Unconstrained Geometry-X persistent",
+                [&](scalarField& psi, const label nSweeps)
+                {
+                    int detected = 1;
+                    for (label sweep=0; sweep<nSweeps; sweep += sweepsPerCall)
+                        persistentOpenMpSmooth
+                        (
+                            psi, source, geometrySchedule, sweepsPerCall,
+                            detected
+                        );
+                }
+            });
+            for (std::size_t i=0; i<constrainedWidths.size(); ++i)
+            {
+                variants.push_back
+                ({
+                    "Width " + std::to_string(constrainedWidths[i]) + " persistent",
+                    [&, i](scalarField& psi, const label nSweeps)
+                    {
+                        int detected = 1;
+                        for (label sweep=0; sweep<nSweeps; sweep += sweepsPerCall)
+                            persistentOpenMpSmooth
+                            (
+                                psi, source, constrainedSchedules[i],
+                                sweepsPerCall, detected
+                            );
+                    }
+                });
+            }
+        }
+        const std::vector<ImplementationTiming> timings =
+            timeRandomizedImplementations
+            (
+                initialPsi, mesh.nCells, samples, sweepsPerSample,
+                warmupSweeps, seed, variants
+            );
+        std::cout << "\nWidth benchmark: threads=" << threads
+            << " seed=" << seed << " calls/sample=" << calls
+            << " sweeps/call=" << sweepsPerCall << '\n';
+        for (std::size_t i=0; i<variants.size(); ++i)
+            printTiming(variants[i].name.c_str(), timings[i]);
+        std::cout << "PASS\n";
+        return 0;
     }
 
     constexpr label reorderedValidationSweeps = 20;
@@ -2561,13 +2803,13 @@ int main(int argc, char** argv)
 {
     const std::string usage =
         "Usage: Test-GaussSeidel <polyMesh-directory> "
-        "[--history-sweeps N]\n";
+        "[--history-sweeps N] [--width-benchmark-only]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
         return 0;
     }
-    if (argc != 2 && argc != 4)
+    if (argc < 2 || argc > 5)
     {
         std::cerr << usage;
         return 2;
@@ -2575,16 +2817,24 @@ int main(int argc, char** argv)
     try
     {
         label historySweeps = 20;
-        if (argc == 4)
+        bool widthBenchmarkOnly = false;
+        for (int argument=2; argument<argc; ++argument)
         {
-            if (std::string(argv[2]) != "--history-sweeps")
+            const std::string option = argv[argument];
+            if (option == "--width-benchmark-only")
+            {
+                widthBenchmarkOnly = true;
+                continue;
+            }
+            if (option != "--history-sweeps" || argument + 1 >= argc)
             {
                 std::cerr << usage;
                 return 2;
             }
+            ++argument;
             std::size_t parsedCharacters = 0;
-            historySweeps = std::stoi(argv[3], &parsedCharacters);
-            if (parsedCharacters != std::string(argv[3]).size()
+            historySweeps = std::stoi(argv[argument], &parsedCharacters);
+            if (parsedCharacters != std::string(argv[argument]).size()
                 || historySweeps < 1 || historySweeps > 10000)
             {
                 throw std::runtime_error
@@ -2593,7 +2843,7 @@ int main(int argc, char** argv)
                 );
             }
         }
-        return runTest(argv[1], historySweeps);
+        return runTest(argv[1], historySweeps, widthBenchmarkOnly);
     }
     catch (const std::exception& error)
     {
