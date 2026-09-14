@@ -52,7 +52,6 @@ void serialRowDegreeSmooth
 )
 {
     const WavefrontSchedule& packed = *schedule.packed;
-    const label* const levelStarts = packed.levelStarts.data();
     const label* const waveCells = packed.waveCells.data();
     const std::uint8_t* const degrees = schedule.degrees.data();
     const label* const cols = packed.cols.data();
@@ -60,23 +59,20 @@ void serialRowDegreeSmooth
     const scalar* const diag = packed.diag.data();
     const scalar* const source = sourceField.data();
     scalar* const psi = psiField.data();
-    const std::size_t nLevels = packed.levelStarts.size() - 1;
+    const label nRows = static_cast<label>(packed.waveCells.size());
 
     for (label sweep=0; sweep<nSweeps; ++sweep)
     {
         label p = 0;
-        for (std::size_t level=0; level<nLevels; ++level)
+        for (label row=0; row<nRows; ++row)
         {
-            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
-            {
-                const label cell = waveCells[row];
-                scalar psii = source[cell];
-                const std::uint8_t degree = degrees[row];
-                const label end = p + degree;
-                for (; p<end; ++p)
-                    psii -= coeffs[p]*psi[cols[p]];
-                psi[cell] = psii/diag[row];
-            }
+            const label cell = waveCells[row];
+            scalar psii = source[cell];
+            const std::uint8_t degree = degrees[row];
+            const label end = p + degree;
+            for (; p<end; ++p)
+                psii -= coeffs[p]*psi[cols[p]];
+            psi[cell] = psii/diag[row];
         }
     }
 }
