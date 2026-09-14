@@ -43,6 +43,47 @@ void serialGatherSmooth
     }
 }
 
+void serialRowBaseDegreeSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const RowBaseDegreeSchedule& schedule,
+    const label nSweeps
+)
+{
+    const WavefrontSchedule& packed = *schedule.packed;
+    const label* const levelStarts = packed.levelStarts.data();
+    const label* const waveCells = packed.waveCells.data();
+    const label* const bases = schedule.bases.data();
+    const std::uint8_t* const degrees = schedule.degrees.data();
+    const label* const cols = packed.cols.data();
+    const scalar* const coeffs = packed.coeffs.data();
+    const scalar* const diag = packed.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = packed.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                const label base = bases[row];
+                const std::uint8_t degree = degrees[row];
+                for (std::uint8_t face=0; face<degree; ++face)
+                {
+                    const label p = base + face;
+                    psii -= coeffs[p]*psi[cols[p]];
+                }
+                psi[cell] = psii/diag[row];
+            }
+        }
+    }
+}
+
 void serialHybridSmooth
 (
     Foam::scalarField& psiField,
