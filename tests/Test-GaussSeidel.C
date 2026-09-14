@@ -33,11 +33,13 @@ using smootherTest::WholeRowInt16Schedule;
 using smootherTest::WavefrontSchedule;
 using smootherTest::HybridWavefrontSchedule;
 using smootherTest::RowDegreeSchedule;
+using smootherTest::BlockedRowDegreeSchedule;
 using smootherTest::avx2GatherAvailable;
 using smootherTest::avx512GatherAvailable;
 using smootherTest::perLevelOpenMpSmooth;
 using smootherTest::persistentOpenMpSmooth;
 using smootherTest::persistentOpenMpHybridSmooth;
+using smootherTest::persistentOpenMpBlockedRowDegreeSmooth;
 using smootherTest::serialGatherAvx512Smooth;
 using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2AcrossRowsSmooth;
@@ -574,6 +576,62 @@ RowDegreeSchedule makeRowDegreeSchedule
     if (contributionCount != packed.cols.size())
         throw std::runtime_error("row degrees do not cover packed contributions");
     return compact;
+}
+
+BlockedRowDegreeSchedule makeBlockedRowDegreeSchedule
+(
+    const WavefrontSchedule& packed,
+    const label blockSize
+)
+{
+    if (blockSize < 1)
+        throw std::runtime_error("blocked row-degree block size must be positive");
+    BlockedRowDegreeSchedule blocked;
+    blocked.packed = &packed;
+    blocked.degrees.reserve(packed.waveCells.size());
+    std::size_t contributionCount = 0;
+    for (label row=0; row<label(packed.waveCells.size()); ++row)
+    {
+        const label degree = packed.rowStarts[row + 1] - packed.rowStarts[row];
+        if
+        (
+            degree < 0
+         || degree > label(std::numeric_limits<std::uint8_t>::max())
+        )
+            throw std::runtime_error("blocked row degree does not fit uint8_t");
+        blocked.degrees.push_back(static_cast<std::uint8_t>(degree));
+        contributionCount += degree;
+    }
+    blocked.levelBlockStarts.reserve(packed.levelStarts.size());
+    blocked.levelBlockStarts.push_back(0);
+    for (std::size_t level=0; level + 1<packed.levelStarts.size(); ++level)
+    {
+        const label levelEnd = packed.levelStarts[level + 1];
+        for (label row=packed.levelStarts[level]; row<levelEnd; row += blockSize)
+        {
+            blocked.blockRowStarts.push_back(row);
+            blocked.blockRowEnds.push_back(std::min(row + blockSize, levelEnd));
+            blocked.blockPStarts.push_back(packed.rowStarts[row]);
+        }
+        blocked.levelBlockStarts.push_back(blocked.blockRowStarts.size());
+    }
+    if
+    (
+        contributionCount != packed.cols.size()
+     || blocked.blockRowStarts.size() != blocked.blockRowEnds.size()
+     || blocked.blockRowStarts.size() != blocked.blockPStarts.size()
+     || blocked.levelBlockStarts.size() != packed.levelStarts.size()
+    )
+        throw std::runtime_error("invalid blocked row-degree schedule");
+    for (std::size_t block=0; block<blocked.blockRowStarts.size(); ++block)
+    {
+        label p = blocked.blockPStarts[block];
+        for (label row=blocked.blockRowStarts[block]; row<blocked.blockRowEnds[block]; ++row)
+            p += blocked.degrees[row];
+        if (p != packed.rowStarts[blocked.blockRowEnds[block]])
+            throw std::runtime_error("blocked row-degree checkpoint mismatch");
+    }
+    return blocked;
 }
 
 WholeRowInt16Schedule makeWholeRowInt16Schedule
@@ -2180,6 +2238,105 @@ int runHpcRowDegreeSeries(const std::string& meshDirectory)
     return 0;
 }
 
+int runHpcBlockedRowDegreeSeries(const std::string& meshDirectory)
+{
+    const int threads = omp_get_max_threads();
+    if (threads < 2)
+        throw std::runtime_error("blocked row-degree series requires at least two threads");
+    constexpr label blockSize = 64;
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    lduMatrix matrix = makeMatrix(mesh);
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(exact.size()); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    const auto setupBegin = std::chrono::steady_clock::now();
+    const WavefrontStatistics statistics =
+        constructWidthConstrainedGeometryWavefronts(mesh, 256, 2048);
+    const WavefrontSchedule schedule =
+        makeWavefrontSchedule(mesh, matrix, statistics);
+    const BlockedRowDegreeSchedule blocked =
+        makeBlockedRowDegreeSchedule(schedule, blockSize);
+    const scalar setupSeconds = std::chrono::duration<scalar>
+    (
+        std::chrono::steady_clock::now() - setupBegin
+    ).count();
+    const scalarField initialPsi(mesh.nCells, 0.0);
+    scalarField baseline = initialPsi;
+    scalarField candidate = initialPsi;
+    int detectedBaseline = 1;
+    int detectedBlocked = 1;
+    persistentOpenMpSmooth
+    (
+        baseline, source, schedule, 1, detectedBaseline
+    );
+    persistentOpenMpBlockedRowDegreeSmooth
+    (
+        candidate, source, blocked, 1, detectedBlocked
+    );
+    const scalar difference = maxAbsDifference(baseline, candidate);
+    if (difference != 0)
+        throw std::runtime_error("blocked row-degree exact equivalence failed");
+
+    constexpr label samples = 5;
+    constexpr label sweepsPerSample = 81;
+    constexpr label warmupSweeps = 6;
+    constexpr std::uint32_t seed = 0x5EED1234u;
+    std::vector<RandomizedBenchmarkVariant> variants;
+    variants.push_back({"Geometry 2048 persistent", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            persistentOpenMpSmooth
+            (
+                psi, source, schedule, 3, detectedBaseline
+            );
+    }});
+    variants.push_back({"Geometry 2048 blocked row-degree", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            persistentOpenMpBlockedRowDegreeSmooth
+            (
+                psi, source, blocked, 3, detectedBlocked
+            );
+    }});
+    const auto timings = timeRandomizedImplementations
+    (
+        initialPsi, mesh.nCells, samples, sweepsPerSample,
+        warmupSweeps, seed, variants
+    );
+    const std::size_t beforeBytes = schedule.rowStarts.size()*sizeof(label);
+    const std::size_t afterBytes = blocked.degrees.size()*sizeof(std::uint8_t)
+        + blocked.levelBlockStarts.size()*sizeof(label)
+        + blocked.blockRowStarts.size()*sizeof(label)
+        + blocked.blockRowEnds.size()*sizeof(label)
+        + blocked.blockPStarts.size()*sizeof(label);
+    std::cout << "MTBHPC blocked row-degree series: cells=" << mesh.nCells
+        << " setup=" << setupSeconds << " s threads=" << threads
+        << " seed=" << seed
+        << "\nGeometry width 2048 levels=" << statistics.widths.size()
+        << "\nblock size: " << blockSize
+        << "\nblocks: " << blocked.blockRowStarts.size()
+        << "\ncell-face mapping before: " << beforeBytes << " bytes ("
+        << scalar(beforeBytes)/(1024*1024) << " MiB)"
+        << "\nblocked mapping after: " << afterBytes << " bytes ("
+        << scalar(afterBytes)/(1024*1024) << " MiB)"
+        << "\nmapping size ratio: " << scalar(afterBytes)/beforeBytes << "x"
+        << "\ndetected baseline threads: " << detectedBaseline
+        << "\ndetected blocked threads: " << detectedBlocked
+        << "\nmax difference: " << difference
+        << "\ndependency validation: PASS"
+        << "\nexact correctness: PASS\n";
+    for (std::size_t i=0; i<variants.size(); ++i)
+        printTiming(variants[i].name.c_str(), timings[i]);
+    std::cout << "\nBlocked row-degree speedup vs baseline: "
+        << timings[0].medianSeconds/timings[1].medianSeconds << "x\nPASS\n";
+    return 0;
+}
+
 int runTest
 (
     const std::string& meshDirectory,
@@ -3686,7 +3843,7 @@ int main(int argc, char** argv)
         "[--history-sweeps N] [--width-benchmark-only] [--hpc-series] "
         "[--hpc-prefetch-series] [--hpc-best-series] [--hpc-hybrid-series] "
         "[--hpc-geometry-kernels] [--hpc-row-degree] "
-        "[--profile-variant NAME]\n";
+        "[--hpc-blocked-row-degree] [--profile-variant NAME]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -3707,6 +3864,7 @@ int main(int argc, char** argv)
         bool hpcHybridSeries = false;
         bool hpcGeometryKernels = false;
         bool hpcRowDegree = false;
+        bool hpcBlockedRowDegree = false;
         std::string profileVariant;
         for (int argument=2; argument<argc; ++argument)
         {
@@ -3746,6 +3904,11 @@ int main(int argc, char** argv)
                 hpcRowDegree = true;
                 continue;
             }
+            if (option == "--hpc-blocked-row-degree")
+            {
+                hpcBlockedRowDegree = true;
+                continue;
+            }
             if (option == "--profile-variant" && argument + 1 < argc)
             {
                 profileVariant = argv[++argument];
@@ -3772,6 +3935,8 @@ int main(int argc, char** argv)
         if (hpcHybridSeries) return runHpcHybridSeries(argv[1]);
         if (hpcGeometryKernels) return runHpcGeometryKernelSeries(argv[1]);
         if (hpcRowDegree) return runHpcRowDegreeSeries(argv[1]);
+        if (hpcBlockedRowDegree)
+            return runHpcBlockedRowDegreeSeries(argv[1]);
         if (!profileVariant.empty())
             return runVtuneProfile(argv[1], profileVariant);
         if (hpcBestSeries) return runHpcBestSeries(argv[1]);

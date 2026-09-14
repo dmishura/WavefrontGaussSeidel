@@ -38,6 +38,16 @@ struct RowDegreeSchedule
     std::vector<std::uint8_t> degrees;
 };
 
+struct BlockedRowDegreeSchedule
+{
+    const WavefrontSchedule* packed = nullptr;
+    std::vector<std::uint8_t> degrees;
+    std::vector<Foam::label> levelBlockStarts;
+    std::vector<Foam::label> blockRowStarts;
+    std::vector<Foam::label> blockRowEnds;
+    std::vector<Foam::label> blockPStarts;
+};
+
 struct WholeRowInt16Schedule
 {
     std::vector<Foam::label> levelStarts, waveCells, rowStarts;
@@ -76,6 +86,15 @@ void serialRowDegreeSmooth
     const Foam::scalarField& source,
     const RowDegreeSchedule& schedule,
     Foam::label nSweeps
+);
+
+void persistentOpenMpBlockedRowDegreeSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const BlockedRowDegreeSchedule& schedule,
+    Foam::label nSweeps,
+    int& detectedThreads
 );
 
 void serialHybridSmooth

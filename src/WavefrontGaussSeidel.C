@@ -77,6 +77,57 @@ void serialRowDegreeSmooth
     }
 }
 
+void persistentOpenMpBlockedRowDegreeSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const BlockedRowDegreeSchedule& schedule,
+    const label nSweeps,
+    int& detectedThreads
+)
+{
+    const WavefrontSchedule& packed = *schedule.packed;
+    const label* const waveCells = packed.waveCells.data();
+    const std::uint8_t* const degrees = schedule.degrees.data();
+    const label* const levelBlockStarts = schedule.levelBlockStarts.data();
+    const label* const blockRowStarts = schedule.blockRowStarts.data();
+    const label* const blockRowEnds = schedule.blockRowEnds.data();
+    const label* const blockPStarts = schedule.blockPStarts.data();
+    const label* const cols = packed.cols.data();
+    const scalar* const coeffs = packed.coeffs.data();
+    const scalar* const diag = packed.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = packed.levelStarts.size() - 1;
+
+    #pragma omp parallel
+    {
+        #pragma omp single
+        detectedThreads = omp_get_num_threads();
+
+        for (label sweep=0; sweep<nSweeps; ++sweep)
+        {
+            for (std::size_t level=0; level<nLevels; ++level)
+            {
+                #pragma omp for schedule(static)
+                for (label block=levelBlockStarts[level]; block<levelBlockStarts[level + 1]; ++block)
+                {
+                    label p = blockPStarts[block];
+                    for (label row=blockRowStarts[block]; row<blockRowEnds[block]; ++row)
+                    {
+                        const label cell = waveCells[row];
+                        scalar psii = source[cell];
+                        const label end = p + degrees[row];
+                        for (; p<end; ++p)
+                            psii -= coeffs[p]*psi[cols[p]];
+                        psi[cell] = psii/diag[row];
+                    }
+                }
+            }
+        }
+    }
+}
+
 void serialHybridSmooth
 (
     Foam::scalarField& psiField,
