@@ -20,6 +20,9 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
+#ifdef HAVE_ITTNOTIFY
+#include <ittnotify.h>
+#endif
 
 using namespace Foam;
 using smootherTest::PolyMeshReader;
@@ -1980,6 +1983,99 @@ int runHpcGeometryKernelSeries(const std::string& meshDirectory)
     return 0;
 }
 
+int runVtuneProfile
+(
+    const std::string& meshDirectory,
+    const std::string& variant
+)
+{
+    if (omp_get_max_threads() != 1)
+        throw std::runtime_error("VTune profiling requires OMP_NUM_THREADS=1");
+#ifndef HAVE_ITTNOTIFY
+    throw std::runtime_error("this build has no VTune ITT support");
+#else
+    __itt_pause();
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    lduMatrix matrix = makeMatrix(mesh);
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(exact.size()); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    FieldField<Field, scalar> interfaceCoeffs(0);
+    lduInterfaceFieldPtrsList interfaces(0);
+    constexpr label warmupSweeps = 3;
+    constexpr label profileSweeps = 20;
+    scalarField psi(mesh.nCells, 0.0);
+    scalarField reference(mesh.nCells, 0.0);
+    GaussSeidelSmoother::smooth
+    (
+        "psi", reference, matrix, source,
+        interfaceCoeffs, interfaces, 0, 1
+    );
+    WavefrontStatistics statistics;
+    WavefrontSchedule schedule;
+    if (variant == "packed")
+    {
+        statistics = constructWavefronts(mesh);
+        schedule = makeWavefrontSchedule(mesh, matrix, statistics);
+    }
+    else if (variant == "geometry2048")
+    {
+        statistics = constructWidthConstrainedGeometryWavefronts
+        (
+            mesh, 256, 2048
+        );
+        schedule = makeWavefrontSchedule(mesh, matrix, statistics);
+    }
+    else if (variant != "reference")
+    {
+        throw std::runtime_error
+        (
+            "profile variant must be reference, packed, or geometry2048"
+        );
+    }
+    if (variant != "reference")
+    {
+        scalarField candidate(mesh.nCells, 0.0);
+        serialGatherSmooth(candidate, source, schedule, 1);
+        if (maxAbsDifference(reference, candidate) != 0)
+            throw std::runtime_error("VTune profile correctness failed");
+    }
+    const auto execute = [&](const label sweeps)
+    {
+        if (variant == "reference")
+            GaussSeidelSmoother::smooth
+            (
+                "psi", psi, matrix, source,
+                interfaceCoeffs, interfaces, 0, sweeps
+            );
+        else
+            serialGatherSmooth(psi, source, schedule, sweeps);
+    };
+    execute(warmupSweeps);
+    const auto begin = std::chrono::steady_clock::now();
+    __itt_resume();
+    execute(profileSweeps);
+    __itt_pause();
+    const scalar elapsed = std::chrono::duration<scalar>
+    (
+        std::chrono::steady_clock::now() - begin
+    ).count();
+    std::cout << "VTune profile variant: " << variant
+        << "\ncells: " << mesh.nCells
+        << "\nwarm-up sweeps: " << warmupSweeps
+        << "\nprofile sweeps: " << profileSweeps
+        << "\nprofiled wall time: " << elapsed << " s"
+        << "\naverage sweep time: " << elapsed/profileSweeps << " s"
+        << "\ncorrectness: PASS\n";
+    return 0;
+#endif
+}
+
 int runTest
 (
     const std::string& meshDirectory,
@@ -3485,7 +3581,7 @@ int main(int argc, char** argv)
         "Usage: Test-GaussSeidel <polyMesh-directory> "
         "[--history-sweeps N] [--width-benchmark-only] [--hpc-series] "
         "[--hpc-prefetch-series] [--hpc-best-series] [--hpc-hybrid-series] "
-        "[--hpc-geometry-kernels]\n";
+        "[--hpc-geometry-kernels] [--profile-variant NAME]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -3505,6 +3601,7 @@ int main(int argc, char** argv)
         bool hpcBestSeries = false;
         bool hpcHybridSeries = false;
         bool hpcGeometryKernels = false;
+        std::string profileVariant;
         for (int argument=2; argument<argc; ++argument)
         {
             const std::string option = argv[argument];
@@ -3538,6 +3635,11 @@ int main(int argc, char** argv)
                 hpcGeometryKernels = true;
                 continue;
             }
+            if (option == "--profile-variant" && argument + 1 < argc)
+            {
+                profileVariant = argv[++argument];
+                continue;
+            }
             if (option != "--history-sweeps" || argument + 1 >= argc)
             {
                 std::cerr << usage;
@@ -3558,6 +3660,8 @@ int main(int argc, char** argv)
         if (hpcPrefetchSeries) return runHpcPrefetchSeries(argv[1]);
         if (hpcHybridSeries) return runHpcHybridSeries(argv[1]);
         if (hpcGeometryKernels) return runHpcGeometryKernelSeries(argv[1]);
+        if (!profileVariant.empty())
+            return runVtuneProfile(argv[1], profileVariant);
         if (hpcBestSeries) return runHpcBestSeries(argv[1]);
         if (hpcSeries) return runHpcSeries(argv[1]);
         return runTest(argv[1], historySweeps, widthBenchmarkOnly);

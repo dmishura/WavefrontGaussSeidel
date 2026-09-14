@@ -1,6 +1,11 @@
 CXX ?= c++
 CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -fopenmp -Icompat -Isrc
+VTUNE_ROOT ?= /opt/intel/oneapi/vtune/latest
+ifneq ($(wildcard $(VTUNE_ROOT)/include/ittnotify.h),)
+CXXFLAGS += -DHAVE_ITTNOTIFY -I$(VTUNE_ROOT)/include
+LDLIBS += -L$(VTUNE_ROOT)/lib64 -littnotify -ldl
+endif
 HISTORY_SWEEPS ?= 20
 AVX512_FLAGS ?= -mavx512f -mavx512vl
 AVX2_FLAGS ?= -mavx2
@@ -36,10 +41,10 @@ test-smoother run: $(SMOOTHER_TARGET) $(MESH_STAMP)
 	./$(SMOOTHER_TARGET) $(MESH_DIR) --history-sweeps $(HISTORY_SWEEPS)
 
 $(SMOOTHER_TARGET): $(SMOOTHER_OBJECTS)
-	$(CXX) $(CXXFLAGS) $^ -o $@
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 $(READER_TARGET): $(READER_OBJECTS)
-	$(CXX) $(CXXFLAGS) $^ -o $@
+	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
 
 $(MESH_STAMP): $(MESH_ARCHIVE)
 	mkdir -p build/mesh-data
