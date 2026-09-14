@@ -32,7 +32,7 @@ using smootherTest::PackedUint24Schedule;
 using smootherTest::WholeRowInt16Schedule;
 using smootherTest::WavefrontSchedule;
 using smootherTest::HybridWavefrontSchedule;
-using smootherTest::RowBaseDegreeSchedule;
+using smootherTest::RowDegreeSchedule;
 using smootherTest::avx2GatherAvailable;
 using smootherTest::avx512GatherAvailable;
 using smootherTest::perLevelOpenMpSmooth;
@@ -44,7 +44,7 @@ using smootherTest::serialGatherAvx2AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
 using smootherTest::serialHybridSmooth;
-using smootherTest::serialRowBaseDegreeSmooth;
+using smootherTest::serialRowDegreeSmooth;
 using smootherTest::serialDeltaEscapeInt16Smooth;
 using smootherTest::serialWholeRowInt16Smooth;
 using smootherTest::serialPackedUint24Smooth;
@@ -550,15 +550,15 @@ HybridWavefrontSchedule makeHybridWavefrontSchedule
     return hybrid;
 }
 
-RowBaseDegreeSchedule makeRowBaseDegreeSchedule
+RowDegreeSchedule makeRowDegreeSchedule
 (
     const WavefrontSchedule& packed
 )
 {
-    RowBaseDegreeSchedule compact;
+    RowDegreeSchedule compact;
     compact.packed = &packed;
-    compact.bases.reserve(packed.waveCells.size());
     compact.degrees.reserve(packed.waveCells.size());
+    std::size_t contributionCount = 0;
     for (label row=0; row<label(packed.waveCells.size()); ++row)
     {
         const label degree = packed.rowStarts[row + 1] - packed.rowStarts[row];
@@ -568,9 +568,11 @@ RowBaseDegreeSchedule makeRowBaseDegreeSchedule
          || degree > label(std::numeric_limits<std::uint8_t>::max())
         )
             throw std::runtime_error("packed row degree does not fit uint8_t");
-        compact.bases.push_back(packed.rowStarts[row]);
         compact.degrees.push_back(static_cast<std::uint8_t>(degree));
+        contributionCount += degree;
     }
+    if (contributionCount != packed.cols.size())
+        throw std::runtime_error("row degrees do not cover packed contributions");
     return compact;
 }
 
@@ -2102,10 +2104,10 @@ int runVtuneProfile
 #endif
 }
 
-int runHpcRowBaseDegreeSeries(const std::string& meshDirectory)
+int runHpcRowDegreeSeries(const std::string& meshDirectory)
 {
     if (omp_get_max_threads() != 1)
-        throw std::runtime_error("row-base-degree series requires one thread");
+        throw std::runtime_error("row-degree series requires one thread");
     const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
     lduMatrix matrix = makeMatrix(mesh);
     scalarField exact(mesh.nCells);
@@ -2121,7 +2123,7 @@ int runHpcRowBaseDegreeSeries(const std::string& meshDirectory)
         constructWidthConstrainedGeometryWavefronts(mesh, 256, 2048);
     const WavefrontSchedule schedule =
         makeWavefrontSchedule(mesh, matrix, statistics);
-    const RowBaseDegreeSchedule compact = makeRowBaseDegreeSchedule(schedule);
+    const RowDegreeSchedule compact = makeRowDegreeSchedule(schedule);
     const scalar setupSeconds = std::chrono::duration<scalar>
     (
         std::chrono::steady_clock::now() - setupBegin
@@ -2130,10 +2132,10 @@ int runHpcRowBaseDegreeSeries(const std::string& meshDirectory)
     scalarField baseline = initialPsi;
     scalarField candidate = initialPsi;
     serialGatherSmooth(baseline, source, schedule, 1);
-    serialRowBaseDegreeSmooth(candidate, source, compact, 1);
+    serialRowDegreeSmooth(candidate, source, compact, 1);
     const scalar difference = maxAbsDifference(baseline, candidate);
     if (difference != 0)
-        throw std::runtime_error("row-base-degree exact equivalence failed");
+        throw std::runtime_error("row-degree exact equivalence failed");
 
     constexpr label samples = 5;
     constexpr label sweepsPerSample = 81;
@@ -2145,10 +2147,10 @@ int runHpcRowBaseDegreeSeries(const std::string& meshDirectory)
         for (label sweep=0; sweep<n; sweep += 3)
             serialGatherSmooth(psi, source, schedule, 3);
     }});
-    variants.push_back({"Geometry 2048 row-base-degree", [&](scalarField& psi, const label n)
+    variants.push_back({"Geometry 2048 row-degree", [&](scalarField& psi, const label n)
     {
         for (label sweep=0; sweep<n; sweep += 3)
-            serialRowBaseDegreeSmooth(psi, source, compact, 3);
+            serialRowDegreeSmooth(psi, source, compact, 3);
     }});
     const auto timings = timeRandomizedImplementations
     (
@@ -2156,9 +2158,9 @@ int runHpcRowBaseDegreeSeries(const std::string& meshDirectory)
         warmupSweeps, seed, variants
     );
     const std::size_t beforeBytes = schedule.rowStarts.size()*sizeof(label);
-    const std::size_t afterBytes = compact.bases.size()*sizeof(label)
-        + compact.degrees.size()*sizeof(std::uint8_t);
-    std::cout << "MTBHPC row-base-degree series: cells=" << mesh.nCells
+    const std::size_t afterBytes =
+        compact.degrees.size()*sizeof(std::uint8_t);
+    std::cout << "MTBHPC row-degree series: cells=" << mesh.nCells
         << " setup=" << setupSeconds << " s threads=1 seed=" << seed
         << "\nGeometry width 2048 levels=" << statistics.widths.size()
         << "\ncell-face mapping before: " << beforeBytes << " bytes ("
@@ -2173,7 +2175,7 @@ int runHpcRowBaseDegreeSeries(const std::string& meshDirectory)
         << "\nexact correctness: PASS\n";
     for (std::size_t i=0; i<variants.size(); ++i)
         printTiming(variants[i].name.c_str(), timings[i]);
-    std::cout << "\nRow-base-degree speedup vs baseline: "
+    std::cout << "\nRow-degree speedup vs baseline: "
         << timings[0].medianSeconds/timings[1].medianSeconds << "x\nPASS\n";
     return 0;
 }
@@ -3683,7 +3685,7 @@ int main(int argc, char** argv)
         "Usage: Test-GaussSeidel <polyMesh-directory> "
         "[--history-sweeps N] [--width-benchmark-only] [--hpc-series] "
         "[--hpc-prefetch-series] [--hpc-best-series] [--hpc-hybrid-series] "
-        "[--hpc-geometry-kernels] [--hpc-row-base-degree] "
+        "[--hpc-geometry-kernels] [--hpc-row-degree] "
         "[--profile-variant NAME]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
@@ -3704,7 +3706,7 @@ int main(int argc, char** argv)
         bool hpcBestSeries = false;
         bool hpcHybridSeries = false;
         bool hpcGeometryKernels = false;
-        bool hpcRowBaseDegree = false;
+        bool hpcRowDegree = false;
         std::string profileVariant;
         for (int argument=2; argument<argc; ++argument)
         {
@@ -3739,9 +3741,9 @@ int main(int argc, char** argv)
                 hpcGeometryKernels = true;
                 continue;
             }
-            if (option == "--hpc-row-base-degree")
+            if (option == "--hpc-row-degree")
             {
-                hpcRowBaseDegree = true;
+                hpcRowDegree = true;
                 continue;
             }
             if (option == "--profile-variant" && argument + 1 < argc)
@@ -3769,7 +3771,7 @@ int main(int argc, char** argv)
         if (hpcPrefetchSeries) return runHpcPrefetchSeries(argv[1]);
         if (hpcHybridSeries) return runHpcHybridSeries(argv[1]);
         if (hpcGeometryKernels) return runHpcGeometryKernelSeries(argv[1]);
-        if (hpcRowBaseDegree) return runHpcRowBaseDegreeSeries(argv[1]);
+        if (hpcRowDegree) return runHpcRowDegreeSeries(argv[1]);
         if (!profileVariant.empty())
             return runVtuneProfile(argv[1], profileVariant);
         if (hpcBestSeries) return runHpcBestSeries(argv[1]);

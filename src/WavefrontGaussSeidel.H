@@ -32,10 +32,9 @@ struct HybridWavefrontSchedule
     Foam::label nInternalFaces = 0;
 };
 
-struct RowBaseDegreeSchedule
+struct RowDegreeSchedule
 {
     const WavefrontSchedule* packed = nullptr;
-    std::vector<Foam::label> bases;
     std::vector<std::uint8_t> degrees;
 };
 
@@ -71,11 +70,11 @@ void serialGatherSmooth
     Foam::label nSweeps
 );
 
-void serialRowBaseDegreeSmooth
+void serialRowDegreeSmooth
 (
     Foam::scalarField& psi,
     const Foam::scalarField& source,
-    const RowBaseDegreeSchedule& schedule,
+    const RowDegreeSchedule& schedule,
     Foam::label nSweeps
 );
 
