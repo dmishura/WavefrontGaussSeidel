@@ -18,6 +18,7 @@
 #include <numeric>
 #include <omp.h>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <vector>
 #ifdef HAVE_ITTNOTIFY
@@ -36,6 +37,7 @@ using smootherTest::RowDegreeSchedule;
 using smootherTest::BlockedRowDegreeSchedule;
 using smootherTest::avx2GatherAvailable;
 using smootherTest::avx512GatherAvailable;
+using smootherTest::avx512FAvailable;
 using smootherTest::perLevelOpenMpSmooth;
 using smootherTest::persistentOpenMpSmooth;
 using smootherTest::persistentOpenMpHybridSmooth;
@@ -47,6 +49,8 @@ using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
 using smootherTest::serialHybridSmooth;
 using smootherTest::serialRowDegreeSmooth;
+using smootherTest::serialRowDegreeUnrolled8Smooth;
+using smootherTest::serialRowDegreeAvx512DivideSmooth;
 using smootherTest::serialDeltaEscapeInt16Smooth;
 using smootherTest::serialWholeRowInt16Smooth;
 using smootherTest::serialPackedUint24Smooth;
@@ -412,6 +416,72 @@ WavefrontStatistics constructWidthConstrainedGeometryWavefronts
     const std::size_t middle = sorted.size()/2;
     result.medianWidth = sorted.size() % 2
         ? scalar(sorted[middle])
+        : 0.5*scalar(sorted[middle - 1] + sorted[middle]);
+    result.p90Width = percentile(sorted, 0.90);
+    result.p95Width = percentile(sorted, 0.95);
+    return result;
+}
+
+WavefrontStatistics constructIndexWavefronts
+(
+    const PolyMeshTopology& mesh,
+    const lduMatrix& matrix,
+    const label targetWidth,
+    const bool window
+)
+{
+    if (targetWidth < 1) throw std::runtime_error("invalid index target width");
+    const auto& starts = matrix.lduAddr().ownerStartAddr();
+    const auto& neighbours = matrix.lduAddr().upperAddr();
+    std::vector<label> predecessors(mesh.nCells, 0);
+    for (const label cell : neighbours) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<label(mesh.nCells); ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+    WavefrontStatistics result;
+    result.levels.assign(mesh.nCells, -1);
+    label cursor = 0;
+    std::size_t assigned = 0;
+    std::vector<label> current;
+    current.reserve(targetWidth);
+    while (!ready.empty())
+    {
+        current.clear();
+        // Snapshot membership: unlock successors only after selecting a level.
+        auto it = window ? ready.lower_bound(cursor) : ready.begin();
+        while (!ready.empty() && current.size() < std::size_t(targetWidth))
+        {
+            if (it == ready.end()) it = ready.begin();
+            current.push_back(*it);
+            it = ready.erase(it);
+        }
+        cursor = current.back() + 1;
+        const label level = static_cast<label>(result.widths.size());
+        result.widths.push_back(current.size());
+        assigned += current.size();
+        for (const label cell : current)
+        {
+            if (result.levels[cell] != -1 || predecessors[cell] != 0)
+                throw std::runtime_error("invalid index ready set");
+            result.levels[cell] = level;
+        }
+        for (const label cell : current)
+            for (label face=starts[cell]; face<starts[cell + 1]; ++face)
+                if (--predecessors[neighbours[face]] == 0)
+                    ready.insert(neighbours[face]);
+    }
+    if (assigned != mesh.nCells)
+        throw std::runtime_error("index scheduler did not cover all cells");
+    for (std::size_t face=0; face<mesh.nInternalFaces(); ++face)
+        if (result.levels[mesh.owner[face]] >= result.levels[mesh.neighbour[face]])
+            throw std::runtime_error("index dependency validation failed");
+    std::vector<std::size_t> sorted = result.widths;
+    std::sort(sorted.begin(), sorted.end());
+    result.minimumWidth = sorted.front();
+    result.maximumWidth = sorted.back();
+    result.meanWidth = scalar(mesh.nCells)/sorted.size();
+    const auto middle = sorted.size()/2;
+    result.medianWidth = sorted.size()%2 ? scalar(sorted[middle])
         : 0.5*scalar(sorted[middle - 1] + sorted[middle]);
     result.p90Width = percentile(sorted, 0.90);
     result.p95Width = percentile(sorted, 0.95);
@@ -2162,6 +2232,144 @@ int runVtuneProfile
 #endif
 }
 
+int runHpcIndexSeries(const std::string& meshDirectory, const bool smallWidths)
+{
+    const int threads = omp_get_max_threads();
+    constexpr label blockSize = 64;
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    lduMatrix matrix = makeMatrix(mesh);
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(exact.size()); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    FieldField<Field, scalar> interfaceCoeffs(0);
+    lduInterfaceFieldPtrsList interfaces(0);
+    const std::array<label, 3> widths = smallWidths
+        ? std::array<label, 3>{{512, 1024, 2048}}
+        : std::array<label, 3>{{1024, 2048, 8192}};
+    const std::size_t scheduleCount = smallWidths ? 4 : 7;
+    // Allocate all elements before compact schedules retain pointers to packed.
+    std::vector<WavefrontStatistics> statistics(scheduleCount);
+    std::vector<WavefrontSchedule> packed(scheduleCount);
+    std::vector<RowDegreeSchedule> compact(scheduleCount);
+    std::vector<BlockedRowDegreeSchedule> blocked(scheduleCount);
+    std::vector<int> detectedThreads(scheduleCount, 1);
+    std::vector<std::string> names(scheduleCount);
+    names[0] = "Geometry-X row-degree 2048";
+    statistics[0] = constructWidthConstrainedGeometryWavefronts(mesh, 256, 2048);
+    for (std::size_t i=1; i<packed.size(); ++i)
+    {
+        const bool window = i > widths.size();
+        const label width = widths[(i - 1)%widths.size()];
+        names[i] = std::string(window ? "Index-window Kahn " : "Index-Kahn ")
+            + std::to_string(width);
+        statistics[i] = constructIndexWavefronts(mesh, matrix, width, window);
+    }
+    const scalarField initialPsi(mesh.nCells, 0.0);
+    scalarField reference = initialPsi;
+    GaussSeidelSmoother::smooth
+    (
+        "psi", reference, matrix, source, interfaceCoeffs, interfaces, 0, 1
+    );
+    std::cout << "Index schedule series: cells=" << mesh.nCells
+        << " requested threads=" << threads
+        << "; Reference GS always serial; parallel block size=" << blockSize
+        << "; within-level cell-ID deltas exclude level boundaries\n";
+    for (std::size_t i=0; i<packed.size(); ++i)
+    {
+        packed[i] = makeWavefrontSchedule(mesh, matrix, statistics[i]);
+        scalarField candidate = initialPsi;
+        if (threads == 1)
+        {
+            compact[i] = makeRowDegreeSchedule(packed[i]);
+            serialRowDegreeSmooth(candidate, source, compact[i], 1);
+        }
+        else
+        {
+            blocked[i] = makeBlockedRowDegreeSchedule(packed[i], blockSize);
+            persistentOpenMpBlockedRowDegreeSmooth
+            (
+                candidate, source, blocked[i], 1, detectedThreads[i]
+            );
+            if (detectedThreads[i] != threads)
+                throw std::runtime_error("unexpected OpenMP team size");
+        }
+        const scalar difference = maxAbsDifference(reference, candidate);
+        if (difference != 0)
+            throw std::runtime_error(names[i] + " exact equivalence failed");
+        std::vector<std::size_t> deltas;
+        deltas.reserve(mesh.nCells);
+        for (std::size_t level=0; level<statistics[i].widths.size(); ++level)
+            for (label row=packed[i].levelStarts[level] + 1; row<packed[i].levelStarts[level + 1]; ++row)
+                deltas.push_back(std::size_t(std::abs
+                (
+                    std::int64_t(packed[i].waveCells[row])
+                    - packed[i].waveCells[row - 1]
+                )));
+        std::sort(deltas.begin(), deltas.end());
+        const auto middle = deltas.size()/2;
+        const scalar median = deltas.empty() ? 0
+            : deltas.size()%2 ? scalar(deltas[middle])
+            : 0.5*scalar(deltas[middle - 1] + deltas[middle]);
+        std::cout << names[i]
+            << ": levels=" << statistics[i].widths.size()
+            << " meanWidth=" << statistics[i].meanWidth
+            << " medianWidth=" << statistics[i].medianWidth
+            << " deltaMedian=" << median
+            << " deltaP90=" << (deltas.empty() ? 0 : percentile(deltas, 0.90))
+            << " deltaP95=" << (deltas.empty() ? 0 : percentile(deltas, 0.95))
+            << " maxDifference=" << difference
+            << " detectedThreads=" << detectedThreads[i]
+            << " blocks=" << blocked[i].blockRowStarts.size()
+            << " exact=PASS dependency=PASS\n" << std::flush;
+    }
+    constexpr label samples = 5, sweepsPerSample = 81, warmupSweeps = 6;
+    constexpr std::uint32_t seed = 0x5EED1234u;
+    std::vector<RandomizedBenchmarkVariant> variants;
+    variants.push_back({"Reference GS", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            GaussSeidelSmoother::smooth
+            (
+                "psi", psi, matrix, source, interfaceCoeffs, interfaces, 0, 3
+            );
+    }});
+    for (std::size_t i=0; i<packed.size(); ++i)
+        variants.push_back({names[i], [&, i](scalarField& psi, const label n)
+        {
+            for (label sweep=0; sweep<n; sweep += 3)
+            {
+                if (threads == 1)
+                    serialRowDegreeSmooth(psi, source, compact[i], 3);
+                else
+                    persistentOpenMpBlockedRowDegreeSmooth
+                    (
+                        psi, source, blocked[i], 3, detectedThreads[i]
+                    );
+            }
+        }});
+    std::cout << "seed=" << seed << " samples=5 sweeps/sample=81 sweeps/call=3\n"
+        << std::flush;
+    const auto timings = timeRandomizedImplementations
+    (
+        initialPsi, mesh.nCells, samples, sweepsPerSample,
+        warmupSweeps, seed, variants
+    );
+    for (std::size_t i=0; i<variants.size(); ++i)
+    {
+        printTiming(variants[i].name.c_str(), timings[i]);
+        std::cout << "speedupRef=" << timings[0].medianSeconds/timings[i].medianSeconds
+            << " speedupGeometry=" << timings[1].medianSeconds/timings[i].medianSeconds
+            << '\n';
+    }
+    std::cout << "PASS\n";
+    return 0;
+}
+
 int runHpcRowDegreeSeries(const std::string& meshDirectory)
 {
     if (omp_get_max_threads() != 1)
@@ -2189,11 +2397,31 @@ int runHpcRowDegreeSeries(const std::string& meshDirectory)
     const scalarField initialPsi(mesh.nCells, 0.0);
     scalarField baseline = initialPsi;
     scalarField candidate = initialPsi;
+    scalarField unrolledCandidate = initialPsi;
+    scalarField avx512Candidate = initialPsi;
     serialGatherSmooth(baseline, source, schedule, 1);
     serialRowDegreeSmooth(candidate, source, compact, 1);
+    serialRowDegreeUnrolled8Smooth
+    (
+        unrolledCandidate, source, compact, 1
+    );
+    serialRowDegreeAvx512DivideSmooth
+    (
+        avx512Candidate, source, compact, 1
+    );
     const scalar difference = maxAbsDifference(baseline, candidate);
+    const scalar unrolledDifference =
+        maxAbsDifference(baseline, unrolledCandidate);
+    const scalar avx512Difference =
+        maxAbsDifference(baseline, avx512Candidate);
     if (difference != 0)
         throw std::runtime_error("row-degree exact equivalence failed");
+    constexpr scalar unrolledTolerance = 1e-12;
+    if (unrolledDifference > unrolledTolerance)
+        throw std::runtime_error("row-degree unrolled-8 tolerance failed");
+    constexpr scalar avx512Tolerance = 1e-12;
+    if (avx512Difference > avx512Tolerance)
+        throw std::runtime_error("row-degree AVX-512 divide tolerance failed");
 
     constexpr label samples = 5;
     constexpr label sweepsPerSample = 81;
@@ -2209,6 +2437,16 @@ int runHpcRowDegreeSeries(const std::string& meshDirectory)
     {
         for (label sweep=0; sweep<n; sweep += 3)
             serialRowDegreeSmooth(psi, source, compact, 3);
+    }});
+    variants.push_back({"Geometry 2048 row-degree scalar unrolled-8", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            serialRowDegreeUnrolled8Smooth(psi, source, compact, 3);
+    }});
+    variants.push_back({"Geometry 2048 row-degree AVX-512 divide", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            serialRowDegreeAvx512DivideSmooth(psi, source, compact, 3);
     }});
     const auto timings = timeRandomizedImplementations
     (
@@ -2229,12 +2467,25 @@ int runHpcRowDegreeSeries(const std::string& meshDirectory)
         << "\nmax row degree: "
         << unsigned(*std::max_element(compact.degrees.begin(), compact.degrees.end()))
         << "\nmax difference: " << difference
+        << "\nscalar unrolled-8 max difference: " << unrolledDifference
+        << "\nscalar unrolled-8 exact equality: "
+        << (unrolledDifference == 0 ? "PASS" : "NO")
+        << "\nscalar unrolled-8 tolerance (1e-12): PASS"
+        << "\nAVX-512F divide available: " << avx512FAvailable()
+        << "\nAVX-512 divide max difference: " << avx512Difference
+        << "\nAVX-512 divide exact equality: "
+        << (avx512Difference == 0 ? "PASS" : "NO")
+        << "\nAVX-512 divide tolerance (1e-12): PASS"
         << "\ndependency validation: PASS"
-        << "\nexact correctness: PASS\n";
+        << "\nscalar exact correctness: PASS\n";
     for (std::size_t i=0; i<variants.size(); ++i)
         printTiming(variants[i].name.c_str(), timings[i]);
     std::cout << "\nRow-degree speedup vs baseline: "
-        << timings[0].medianSeconds/timings[1].medianSeconds << "x\nPASS\n";
+        << timings[0].medianSeconds/timings[1].medianSeconds
+        << "x\nScalar unrolled-8 speedup vs row-degree scalar: "
+        << timings[1].medianSeconds/timings[2].medianSeconds
+        << "x\nAVX-512 divide speedup vs row-degree scalar: "
+        << timings[1].medianSeconds/timings[3].medianSeconds << "x\nPASS\n";
     return 0;
 }
 
@@ -2243,7 +2494,7 @@ int runHpcBlockedRowDegreeSeries(const std::string& meshDirectory)
     const int threads = omp_get_max_threads();
     if (threads < 2)
         throw std::runtime_error("blocked row-degree series requires at least two threads");
-    constexpr label blockSize = 64;
+    constexpr std::array<label, 4> blockSizes{{32, 64, 128, 256}};
     const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
     lduMatrix matrix = makeMatrix(mesh);
     scalarField exact(mesh.nCells);
@@ -2259,28 +2510,33 @@ int runHpcBlockedRowDegreeSeries(const std::string& meshDirectory)
         constructWidthConstrainedGeometryWavefronts(mesh, 256, 2048);
     const WavefrontSchedule schedule =
         makeWavefrontSchedule(mesh, matrix, statistics);
-    const BlockedRowDegreeSchedule blocked =
-        makeBlockedRowDegreeSchedule(schedule, blockSize);
+    std::array<BlockedRowDegreeSchedule, blockSizes.size()> blocked;
+    for (std::size_t i=0; i<blockSizes.size(); ++i)
+        blocked[i] = makeBlockedRowDegreeSchedule(schedule, blockSizes[i]);
     const scalar setupSeconds = std::chrono::duration<scalar>
     (
         std::chrono::steady_clock::now() - setupBegin
     ).count();
     const scalarField initialPsi(mesh.nCells, 0.0);
     scalarField baseline = initialPsi;
-    scalarField candidate = initialPsi;
     int detectedBaseline = 1;
-    int detectedBlocked = 1;
+    std::array<int, blockSizes.size()> detectedBlocked{{1, 1, 1, 1}};
     persistentOpenMpSmooth
     (
         baseline, source, schedule, 1, detectedBaseline
     );
-    persistentOpenMpBlockedRowDegreeSmooth
-    (
-        candidate, source, blocked, 1, detectedBlocked
-    );
-    const scalar difference = maxAbsDifference(baseline, candidate);
-    if (difference != 0)
-        throw std::runtime_error("blocked row-degree exact equivalence failed");
+    std::array<scalar, blockSizes.size()> differences;
+    for (std::size_t i=0; i<blockSizes.size(); ++i)
+    {
+        scalarField candidate = initialPsi;
+        persistentOpenMpBlockedRowDegreeSmooth
+        (
+            candidate, source, blocked[i], 1, detectedBlocked[i]
+        );
+        differences[i] = maxAbsDifference(baseline, candidate);
+        if (differences[i] != 0)
+            throw std::runtime_error("blocked row-degree exact equivalence failed");
+    }
 
     constexpr label samples = 5;
     constexpr label sweepsPerSample = 81;
@@ -2295,45 +2551,72 @@ int runHpcBlockedRowDegreeSeries(const std::string& meshDirectory)
                 psi, source, schedule, 3, detectedBaseline
             );
     }});
-    variants.push_back({"Geometry 2048 blocked row-degree", [&](scalarField& psi, const label n)
+    for (std::size_t i=0; i<blockSizes.size(); ++i)
     {
-        for (label sweep=0; sweep<n; sweep += 3)
-            persistentOpenMpBlockedRowDegreeSmooth
-            (
-                psi, source, blocked, 3, detectedBlocked
-            );
-    }});
+        variants.push_back
+        ({
+            "Geometry 2048 blocked row-degree " + std::to_string(blockSizes[i]),
+            [&, i](scalarField& psi, const label n)
+            {
+                for (label sweep=0; sweep<n; sweep += 3)
+                    persistentOpenMpBlockedRowDegreeSmooth
+                    (
+                        psi, source, blocked[i], 3, detectedBlocked[i]
+                    );
+            }
+        });
+    }
     const auto timings = timeRandomizedImplementations
     (
         initialPsi, mesh.nCells, samples, sweepsPerSample,
         warmupSweeps, seed, variants
     );
     const std::size_t beforeBytes = schedule.rowStarts.size()*sizeof(label);
-    const std::size_t afterBytes = blocked.degrees.size()*sizeof(std::uint8_t)
-        + blocked.levelBlockStarts.size()*sizeof(label)
-        + blocked.blockRowStarts.size()*sizeof(label)
-        + blocked.blockRowEnds.size()*sizeof(label)
-        + blocked.blockPStarts.size()*sizeof(label);
     std::cout << "MTBHPC blocked row-degree series: cells=" << mesh.nCells
         << " setup=" << setupSeconds << " s threads=" << threads
         << " seed=" << seed
         << "\nGeometry width 2048 levels=" << statistics.widths.size()
-        << "\nblock size: " << blockSize
-        << "\nblocks: " << blocked.blockRowStarts.size()
         << "\ncell-face mapping before: " << beforeBytes << " bytes ("
         << scalar(beforeBytes)/(1024*1024) << " MiB)"
-        << "\nblocked mapping after: " << afterBytes << " bytes ("
-        << scalar(afterBytes)/(1024*1024) << " MiB)"
-        << "\nmapping size ratio: " << scalar(afterBytes)/beforeBytes << "x"
         << "\ndetected baseline threads: " << detectedBaseline
-        << "\ndetected blocked threads: " << detectedBlocked
-        << "\nmax difference: " << difference
         << "\ndependency validation: PASS"
-        << "\nexact correctness: PASS\n";
+        << "\nexact correctness: PASS\n\n"
+        << "Blocked mapping metadata:\n"
+        << "block-size  blocks       bytes        MiB          ratio-vs-rowStarts"
+        << "  max-difference  threads\n";
+    for (std::size_t i=0; i<blockSizes.size(); ++i)
+    {
+        const std::size_t afterBytes =
+            blocked[i].degrees.size()*sizeof(std::uint8_t)
+          + blocked[i].levelBlockStarts.size()*sizeof(label)
+          + blocked[i].blockRowStarts.size()*sizeof(label)
+          + blocked[i].blockRowEnds.size()*sizeof(label)
+          + blocked[i].blockPStarts.size()*sizeof(label);
+        std::cout << std::setw(10) << blockSizes[i]
+            << std::setw(13) << blocked[i].blockRowStarts.size()
+            << std::setw(13) << afterBytes
+            << std::setw(13) << scalar(afterBytes)/(1024*1024)
+            << std::setw(20) << scalar(afterBytes)/beforeBytes
+            << std::setw(16) << differences[i]
+            << std::setw(9) << detectedBlocked[i] << '\n';
+    }
     for (std::size_t i=0; i<variants.size(); ++i)
         printTiming(variants[i].name.c_str(), timings[i]);
-    std::cout << "\nBlocked row-degree speedup vs baseline: "
-        << timings[0].medianSeconds/timings[1].medianSeconds << "x\nPASS\n";
+    const scalar block64Median = timings[2].medianSeconds;
+    std::cout << "\nBlocked row-degree comparison:\n"
+        << "block-size  median-ms/sweep  CV-percent  ns/cell/sweep"
+        << "  speedup-vs-baseline  speedup-vs-64\n";
+    for (std::size_t i=0; i<blockSizes.size(); ++i)
+    {
+        const ImplementationTiming& timing = timings[i + 1];
+        std::cout << std::setw(10) << blockSizes[i]
+            << std::setw(18) << timing.medianSeconds*1e3
+            << std::setw(12) << timing.cvPercent
+            << std::setw(16) << timing.medianNsPerCellSweep
+            << std::setw(21) << timings[0].medianSeconds/timing.medianSeconds
+            << std::setw(15) << block64Median/timing.medianSeconds << '\n';
+    }
+    std::cout << "PASS\n";
     return 0;
 }
 
@@ -3843,7 +4126,8 @@ int main(int argc, char** argv)
         "[--history-sweeps N] [--width-benchmark-only] [--hpc-series] "
         "[--hpc-prefetch-series] [--hpc-best-series] [--hpc-hybrid-series] "
         "[--hpc-geometry-kernels] [--hpc-row-degree] "
-        "[--hpc-blocked-row-degree] [--profile-variant NAME]\n";
+        "[--hpc-blocked-row-degree] [--hpc-index-series] "
+        "[--hpc-index-small-series] [--profile-variant NAME]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -3864,6 +4148,8 @@ int main(int argc, char** argv)
         bool hpcHybridSeries = false;
         bool hpcGeometryKernels = false;
         bool hpcRowDegree = false;
+        bool hpcIndexSeries = false;
+        bool hpcIndexSmallSeries = false;
         bool hpcBlockedRowDegree = false;
         std::string profileVariant;
         for (int argument=2; argument<argc; ++argument)
@@ -3904,6 +4190,16 @@ int main(int argc, char** argv)
                 hpcRowDegree = true;
                 continue;
             }
+            if (option == "--hpc-index-series")
+            {
+                hpcIndexSeries = true;
+                continue;
+            }
+            if (option == "--hpc-index-small-series")
+            {
+                hpcIndexSmallSeries = true;
+                continue;
+            }
             if (option == "--hpc-blocked-row-degree")
             {
                 hpcBlockedRowDegree = true;
@@ -3934,6 +4230,8 @@ int main(int argc, char** argv)
         if (hpcPrefetchSeries) return runHpcPrefetchSeries(argv[1]);
         if (hpcHybridSeries) return runHpcHybridSeries(argv[1]);
         if (hpcGeometryKernels) return runHpcGeometryKernelSeries(argv[1]);
+        if (hpcIndexSmallSeries) return runHpcIndexSeries(argv[1], true);
+        if (hpcIndexSeries) return runHpcIndexSeries(argv[1], false);
         if (hpcRowDegree) return runHpcRowDegreeSeries(argv[1]);
         if (hpcBlockedRowDegree)
             return runHpcBlockedRowDegreeSeries(argv[1]);

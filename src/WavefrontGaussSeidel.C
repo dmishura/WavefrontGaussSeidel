@@ -77,6 +77,97 @@ void serialRowDegreeSmooth
     }
 }
 
+void serialRowDegreeUnrolled8Smooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const RowDegreeSchedule& schedule,
+    const label nSweeps
+)
+{
+    const WavefrontSchedule& packed = *schedule.packed;
+    const label* const levelStarts = packed.levelStarts.data();
+    const label* const waveCells = packed.waveCells.data();
+    const std::uint8_t* const degrees = schedule.degrees.data();
+    const label* const cols = packed.cols.data();
+    const scalar* const coeffs = packed.coeffs.data();
+    const scalar* const diag = packed.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = packed.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        label p = 0;
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            label row = levelStarts[level];
+            const label levelEnd = levelStarts[level + 1];
+            for (; row + 8<=levelEnd; row += 8)
+            {
+                const label p0 = p;
+                const label p1 = p0 + degrees[row];
+                const label p2 = p1 + degrees[row + 1];
+                const label p3 = p2 + degrees[row + 2];
+                const label p4 = p3 + degrees[row + 3];
+                const label p5 = p4 + degrees[row + 4];
+                const label p6 = p5 + degrees[row + 5];
+                const label p7 = p6 + degrees[row + 6];
+                const label p8 = p7 + degrees[row + 7];
+                const label cell0 = waveCells[row];
+                const label cell1 = waveCells[row + 1];
+                const label cell2 = waveCells[row + 2];
+                const label cell3 = waveCells[row + 3];
+                const label cell4 = waveCells[row + 4];
+                const label cell5 = waveCells[row + 5];
+                const label cell6 = waveCells[row + 6];
+                const label cell7 = waveCells[row + 7];
+                scalar s0 = source[cell0];
+                scalar s1 = source[cell1];
+                scalar s2 = source[cell2];
+                scalar s3 = source[cell3];
+                scalar s4 = source[cell4];
+                scalar s5 = source[cell5];
+                scalar s6 = source[cell6];
+                scalar s7 = source[cell7];
+                for (label q=p0; q<p1; ++q) s0 -= coeffs[q]*psi[cols[q]];
+                for (label q=p1; q<p2; ++q) s1 -= coeffs[q]*psi[cols[q]];
+                for (label q=p2; q<p3; ++q) s2 -= coeffs[q]*psi[cols[q]];
+                for (label q=p3; q<p4; ++q) s3 -= coeffs[q]*psi[cols[q]];
+                for (label q=p4; q<p5; ++q) s4 -= coeffs[q]*psi[cols[q]];
+                for (label q=p5; q<p6; ++q) s5 -= coeffs[q]*psi[cols[q]];
+                for (label q=p6; q<p7; ++q) s6 -= coeffs[q]*psi[cols[q]];
+                for (label q=p7; q<p8; ++q) s7 -= coeffs[q]*psi[cols[q]];
+                p = p8;
+                s0 /= diag[row];
+                s1 /= diag[row + 1];
+                s2 /= diag[row + 2];
+                s3 /= diag[row + 3];
+                s4 /= diag[row + 4];
+                s5 /= diag[row + 5];
+                s6 /= diag[row + 6];
+                s7 /= diag[row + 7];
+                psi[cell0] = s0;
+                psi[cell1] = s1;
+                psi[cell2] = s2;
+                psi[cell3] = s3;
+                psi[cell4] = s4;
+                psi[cell5] = s5;
+                psi[cell6] = s6;
+                psi[cell7] = s7;
+            }
+            for (; row<levelEnd; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                const label end = p + degrees[row];
+                for (; p<end; ++p) psii -= coeffs[p]*psi[cols[p]];
+                psi[cell] = psii/diag[row];
+            }
+        }
+    }
+}
+
 void persistentOpenMpBlockedRowDegreeSmooth
 (
     Foam::scalarField& psiField,

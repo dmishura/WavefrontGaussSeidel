@@ -88,6 +88,22 @@ void serialRowDegreeSmooth
     Foam::label nSweeps
 );
 
+void serialRowDegreeUnrolled8Smooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const RowDegreeSchedule& schedule,
+    Foam::label nSweeps
+);
+
+void serialRowDegreeAvx512DivideSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const RowDegreeSchedule& schedule,
+    Foam::label nSweeps
+);
+
 void persistentOpenMpBlockedRowDegreeSmooth
 (
     Foam::scalarField& psi,
@@ -193,6 +209,8 @@ void serialReorderedPsiSmooth
 );
 
 bool avx512GatherAvailable();
+
+bool avx512FAvailable();
 
 bool avx2GatherAvailable();
 
