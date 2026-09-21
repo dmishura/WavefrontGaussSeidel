@@ -48,6 +48,22 @@ struct BlockedRowDegreeSchedule
     std::vector<Foam::label> blockPStarts;
 };
 
+// Topology-only packed rows. Coefficients and diagonal remain in the live
+// lduMatrix, so this representation needs no per-matrix coefficient copy.
+struct DirectCoefficientSchedule
+{
+    std::vector<Foam::label> levelStarts;
+    std::vector<Foam::label> waveCells;
+    std::vector<Foam::label> cols;
+    std::vector<Foam::label> faceIds;
+    std::vector<std::uint8_t> degrees;
+    std::vector<std::uint8_t> incomingDegrees;
+    std::vector<Foam::label> levelBlockStarts;
+    std::vector<Foam::label> blockRowStarts;
+    std::vector<Foam::label> blockRowEnds;
+    std::vector<Foam::label> blockPStarts;
+};
+
 struct WholeRowInt16Schedule
 {
     std::vector<Foam::label> levelStarts, waveCells, rowStarts;
@@ -86,6 +102,25 @@ void serialRowDegreeSmooth
     const Foam::scalarField& source,
     const RowDegreeSchedule& schedule,
     Foam::label nSweeps
+);
+
+void serialDirectCoefficientSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const Foam::lduMatrix& matrix,
+    const DirectCoefficientSchedule& schedule,
+    Foam::label nSweeps
+);
+
+void persistentOpenMpDirectCoefficientSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const Foam::lduMatrix& matrix,
+    const DirectCoefficientSchedule& schedule,
+    Foam::label nSweeps,
+    int& detectedThreads
 );
 
 void serialRowDegreeUnrolled8Smooth

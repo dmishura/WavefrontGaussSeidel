@@ -77,6 +77,98 @@ void serialRowDegreeSmooth
     }
 }
 
+void serialDirectCoefficientSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const Foam::lduMatrix& matrix,
+    const DirectCoefficientSchedule& schedule,
+    const label nSweeps
+)
+{
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const cols = schedule.cols.data();
+    const label* const faceIds = schedule.faceIds.data();
+    const std::uint8_t* const degrees = schedule.degrees.data();
+    const std::uint8_t* const incomingDegrees = schedule.incomingDegrees.data();
+    const scalar* const lower = matrix.lower().data();
+    const scalar* const upper = matrix.upper().data();
+    const scalar* const diag = matrix.diag().data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const label nRows = static_cast<label>(schedule.waveCells.size());
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        label p = 0;
+        for (label row=0; row<nRows; ++row)
+        {
+            const label cell = waveCells[row];
+            scalar psii = source[cell];
+            const label split = p + incomingDegrees[row];
+            const label end = p + degrees[row];
+            for (; p<split; ++p) psii -= lower[faceIds[p]]*psi[cols[p]];
+            for (; p<end; ++p) psii -= upper[faceIds[p]]*psi[cols[p]];
+            psi[cell] = psii/diag[cell];
+        }
+    }
+}
+
+void persistentOpenMpDirectCoefficientSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const Foam::lduMatrix& matrix,
+    const DirectCoefficientSchedule& schedule,
+    const label nSweeps,
+    int& detectedThreads
+)
+{
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const cols = schedule.cols.data();
+    const label* const faceIds = schedule.faceIds.data();
+    const std::uint8_t* const degrees = schedule.degrees.data();
+    const std::uint8_t* const incomingDegrees = schedule.incomingDegrees.data();
+    const label* const levelBlockStarts = schedule.levelBlockStarts.data();
+    const label* const blockRowStarts = schedule.blockRowStarts.data();
+    const label* const blockRowEnds = schedule.blockRowEnds.data();
+    const label* const blockPStarts = schedule.blockPStarts.data();
+    const scalar* const lower = matrix.lower().data();
+    const scalar* const upper = matrix.upper().data();
+    const scalar* const diag = matrix.diag().data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
+
+    #pragma omp parallel
+    {
+        #pragma omp single
+        detectedThreads = omp_get_num_threads();
+
+        for (label sweep=0; sweep<nSweeps; ++sweep)
+        {
+            for (std::size_t level=0; level<nLevels; ++level)
+            {
+                #pragma omp for schedule(static)
+                for (label block=levelBlockStarts[level]; block<levelBlockStarts[level + 1]; ++block)
+                {
+                    label p = blockPStarts[block];
+                    for (label row=blockRowStarts[block]; row<blockRowEnds[block]; ++row)
+                    {
+                        const label cell = waveCells[row];
+                        scalar psii = source[cell];
+                        const label split = p + incomingDegrees[row];
+                        const label end = p + degrees[row];
+                        for (; p<split; ++p) psii -= lower[faceIds[p]]*psi[cols[p]];
+                        for (; p<end; ++p) psii -= upper[faceIds[p]]*psi[cols[p]];
+                        psi[cell] = psii/diag[cell];
+                    }
+                }
+            }
+        }
+    }
+}
+
 void serialRowDegreeUnrolled8Smooth
 (
     Foam::scalarField& psiField,

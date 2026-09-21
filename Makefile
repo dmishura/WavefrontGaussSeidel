@@ -12,6 +12,7 @@ AVX2_FLAGS ?= -mavx2
 
 OPENFOAM_DIR ?= ../OpenFOAM-14
 GS_DIR := $(OPENFOAM_DIR)/src/OpenFOAM/matrices/lduMatrix/smoothers/GaussSeidel
+SYM_GS_DIR := $(OPENFOAM_DIR)/src/OpenFOAM/matrices/lduMatrix/smoothers/symGaussSeidel
 
 MESH_ARCHIVE := meshes/MTB_example_polyMesh.tgz
 MESH_DIR := build/mesh-data/MTB_example_polyMesh
@@ -21,6 +22,7 @@ SMOOTHER_TARGET := build/Test-GaussSeidel
 READER_TARGET := build/Test-PolyMeshReader
 COMMON_OBJECTS := build/src/PolyMeshReader.o
 SMOOTHER_OBJECTS := build/src/GaussSeidelSmoother.o \
+    build/src/symGaussSeidelSmoother.o \
     build/src/WavefrontGaussSeidel.o \
     build/src/WavefrontGaussSeidelAVX2.o \
     build/src/WavefrontGaussSeidelAVX512.o \
@@ -68,6 +70,8 @@ build/src/WavefrontGaussSeidelAVX2.o: src/WavefrontGaussSeidelAVX2.C
 sync:
 	cp $(GS_DIR)/GaussSeidelSmoother.C src/GaussSeidelSmoother.C
 	cp $(GS_DIR)/GaussSeidelSmoother.H src/GaussSeidelSmoother.H
+	cp $(SYM_GS_DIR)/symGaussSeidelSmoother.C src/symGaussSeidelSmoother.C
+	cp $(SYM_GS_DIR)/symGaussSeidelSmoother.H src/symGaussSeidelSmoother.H
 
 clean:
 	rm -rf build

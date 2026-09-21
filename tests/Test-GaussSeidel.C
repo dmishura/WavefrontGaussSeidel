@@ -5,6 +5,7 @@
 #include "GaussSeidelSmoother.H"
 #include "PolyMeshReader.H"
 #include "WavefrontGaussSeidel.H"
+#include "symGaussSeidelSmoother.H"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +36,7 @@ using smootherTest::WavefrontSchedule;
 using smootherTest::HybridWavefrontSchedule;
 using smootherTest::RowDegreeSchedule;
 using smootherTest::BlockedRowDegreeSchedule;
+using smootherTest::DirectCoefficientSchedule;
 using smootherTest::avx2GatherAvailable;
 using smootherTest::avx512GatherAvailable;
 using smootherTest::avx512FAvailable;
@@ -42,6 +44,7 @@ using smootherTest::perLevelOpenMpSmooth;
 using smootherTest::persistentOpenMpSmooth;
 using smootherTest::persistentOpenMpHybridSmooth;
 using smootherTest::persistentOpenMpBlockedRowDegreeSmooth;
+using smootherTest::persistentOpenMpDirectCoefficientSmooth;
 using smootherTest::serialGatherAvx512Smooth;
 using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2AcrossRowsSmooth;
@@ -49,6 +52,7 @@ using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
 using smootherTest::serialHybridSmooth;
 using smootherTest::serialRowDegreeSmooth;
+using smootherTest::serialDirectCoefficientSmooth;
 using smootherTest::serialRowDegreeUnrolled8Smooth;
 using smootherTest::serialRowDegreeAvx512DivideSmooth;
 using smootherTest::serialDeltaEscapeInt16Smooth;
@@ -571,6 +575,95 @@ WavefrontSchedule makeWavefrontSchedule
     {
         throw std::runtime_error("invalid packed wavefront schedule size");
     }
+    return schedule;
+}
+
+DirectCoefficientSchedule makeDirectCoefficientSchedule
+(
+    const PolyMeshTopology& mesh,
+    const lduMatrix& matrix,
+    const WavefrontStatistics& statistics,
+    const label blockSize
+)
+{
+    if (blockSize < 1) throw std::runtime_error("invalid direct coefficient block size");
+    DirectCoefficientSchedule schedule;
+    schedule.levelStarts.resize(statistics.widths.size() + 1, 0);
+    for (std::size_t level=0; level<statistics.widths.size(); ++level)
+        schedule.levelStarts[level + 1] =
+            schedule.levelStarts[level] + statistics.widths[level];
+    schedule.waveCells.resize(mesh.nCells);
+    std::vector<label> levelCursor = schedule.levelStarts;
+    for (label cell=0; cell<label(mesh.nCells); ++cell)
+        schedule.waveCells[levelCursor[statistics.levels[cell]]++] = cell;
+
+    // Build only topology. Face insertion order matches the original
+    // lower-side update order; no matrix coefficient is copied here.
+    std::vector<label> incomingStarts(mesh.nCells + 1, 0);
+    for (const label neighbour : mesh.neighbour)
+        ++incomingStarts[static_cast<std::size_t>(neighbour) + 1];
+    for (std::size_t cell=0; cell<mesh.nCells; ++cell)
+        incomingStarts[cell + 1] += incomingStarts[cell];
+    std::vector<label> incomingFaces(mesh.nInternalFaces());
+    std::vector<label> cursor = incomingStarts;
+    for (label face=0; face<label(mesh.nInternalFaces()); ++face)
+        incomingFaces[cursor[mesh.neighbour[face]]++] = face;
+
+    const labelField& ownerStarts = matrix.lduAddr().ownerStartAddr();
+    const labelField& neighbours = matrix.lduAddr().upperAddr();
+    schedule.cols.reserve(2*mesh.nInternalFaces());
+    schedule.faceIds.reserve(2*mesh.nInternalFaces());
+    schedule.degrees.reserve(mesh.nCells);
+    schedule.incomingDegrees.reserve(mesh.nCells);
+    std::vector<label> rowPStarts;
+    rowPStarts.reserve(mesh.nCells + 1);
+    for (const label cell : schedule.waveCells)
+    {
+        const label pStart = static_cast<label>(schedule.cols.size());
+        rowPStarts.push_back(pStart);
+        const label incoming = incomingStarts[cell + 1] - incomingStarts[cell];
+        for (label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
+        {
+            const label face = incomingFaces[in];
+            schedule.cols.push_back(mesh.owner[face]);
+            schedule.faceIds.push_back(face);
+        }
+        for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+        {
+            schedule.cols.push_back(neighbours[face]);
+            schedule.faceIds.push_back(face);
+        }
+        const label degree = static_cast<label>(schedule.cols.size()) - pStart;
+        if (degree > std::numeric_limits<std::uint8_t>::max())
+            throw std::runtime_error("direct coefficient row degree exceeds uint8_t");
+        schedule.degrees.push_back(static_cast<std::uint8_t>(degree));
+        schedule.incomingDegrees.push_back(static_cast<std::uint8_t>(incoming));
+    }
+    rowPStarts.push_back(static_cast<label>(schedule.cols.size()));
+
+    schedule.levelBlockStarts.reserve(schedule.levelStarts.size());
+    schedule.levelBlockStarts.push_back(0);
+    for (std::size_t level=0; level<statistics.widths.size(); ++level)
+    {
+        const label levelEnd = schedule.levelStarts[level + 1];
+        for (label row=schedule.levelStarts[level]; row<levelEnd; row += blockSize)
+        {
+            schedule.blockRowStarts.push_back(row);
+            schedule.blockRowEnds.push_back(std::min(row + blockSize, levelEnd));
+            schedule.blockPStarts.push_back(rowPStarts[row]);
+        }
+        schedule.levelBlockStarts.push_back(schedule.blockRowStarts.size());
+    }
+    if
+    (
+        schedule.waveCells.size() != mesh.nCells
+     || schedule.cols.size() != 2*mesh.nInternalFaces()
+     || schedule.faceIds.size() != schedule.cols.size()
+     || schedule.degrees.size() != mesh.nCells
+     || schedule.incomingDegrees.size() != mesh.nCells
+     || schedule.levelBlockStarts.size() != schedule.levelStarts.size()
+    )
+        throw std::runtime_error("invalid direct coefficient schedule size");
     return schedule;
 }
 
@@ -1150,10 +1243,101 @@ void printTiming(const char* variant, const ImplementationTiming& timing)
 
 scalar maxAbsDifference(const scalarField& a, const scalarField& b)
 {
+    if (a.size() != b.size())
+        throw std::runtime_error("field comparison size mismatch");
     scalar result = 0;
     for (label i=0; i<label(a.size()); ++i)
+    {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i]))
+            throw std::runtime_error
+            (
+                "field comparison contains a non-finite value at cell "
+              + std::to_string(i)
+            );
         result = std::max(result, std::abs(a[i] - b[i]));
+    }
     return result;
+}
+
+void validateAsymmetricIndexCase(const int threads)
+{
+    PolyMeshTopology mesh;
+    mesh.nCells = 6;
+    mesh.owner = {0, 0, 0, 1, 1, 2, 2, 3};
+    mesh.neighbour = {2, 3, 5, 3, 4, 4, 5, 5};
+    mesh.nFaces = mesh.owner.size();
+    mesh.validate();
+
+    const std::vector<int> starts = mesh.ownerStartAddressing();
+    scalarField upper(mesh.nInternalFaces());
+    scalarField lower(mesh.nInternalFaces());
+    for (label face=0; face<label(mesh.nInternalFaces()); ++face)
+    {
+        upper[face] = -0.2 - 0.03*face;
+        lower[face] = -0.4 - 0.07*face;
+    }
+    const lduMatrix matrix
+    (
+        lduAddressing
+        (
+            labelField(mesh.neighbour.begin(), mesh.neighbour.end()),
+            labelField(starts.begin(), starts.end())
+        ),
+        scalarField{8.0, 8.5, 9.0, 9.5, 10.0, 10.5},
+        std::move(upper), std::move(lower)
+    );
+    const scalarField source{1.1, -0.7, 2.3, -1.5, 0.9, 1.7};
+    const scalarField initial{0.4, -0.2, 0.8, 0.1, -0.6, 0.3};
+    scalarField reference = initial;
+    FieldField<Field, scalar> interfaceCoeffs(0);
+    lduInterfaceFieldPtrsList interfaces(0);
+    GaussSeidelSmoother::smooth
+    (
+        "psi", reference, matrix, source,
+        interfaceCoeffs, interfaces, 0, 3
+    );
+    const WavefrontStatistics statistics =
+        constructIndexWavefronts(mesh, matrix, 2, false);
+    const WavefrontSchedule packed =
+        makeWavefrontSchedule(mesh, matrix, statistics);
+    scalarField candidate = initial;
+    if (threads == 1)
+    {
+        const RowDegreeSchedule compact = makeRowDegreeSchedule(packed);
+        serialRowDegreeSmooth(candidate, source, compact, 3);
+    }
+    else
+    {
+        const BlockedRowDegreeSchedule blocked =
+            makeBlockedRowDegreeSchedule(packed, 2);
+        int detected = 1;
+        persistentOpenMpBlockedRowDegreeSmooth
+        (
+            candidate, source, blocked, 3, detected
+        );
+        if (detected != threads)
+            throw std::runtime_error("asymmetric test OpenMP team size mismatch");
+    }
+    if (maxAbsDifference(reference, candidate) != 0)
+        throw std::runtime_error("asymmetric index case differs from Reference GS");
+
+    const DirectCoefficientSchedule direct =
+        makeDirectCoefficientSchedule(mesh, matrix, statistics, 2);
+    candidate = initial;
+    if (threads == 1)
+        serialDirectCoefficientSmooth(candidate, source, matrix, direct, 3);
+    else
+    {
+        int detected = 1;
+        persistentOpenMpDirectCoefficientSmooth
+        (
+            candidate, source, matrix, direct, 3, detected
+        );
+        if (detected != threads)
+            throw std::runtime_error("direct asymmetric OpenMP team size mismatch");
+    }
+    if (maxAbsDifference(reference, candidate) != 0)
+        throw std::runtime_error("direct asymmetric case differs from Reference GS");
 }
 
 std::pair<scalar, scalar> l2Differences
@@ -2232,10 +2416,17 @@ int runVtuneProfile
 #endif
 }
 
-int runHpcIndexSeries(const std::string& meshDirectory, const bool smallWidths)
+int runHpcIndexSeries
+(
+    const std::string& meshDirectory,
+    const bool smallWidths,
+    const bool validationOnly
+)
 {
     const int threads = omp_get_max_threads();
     constexpr label blockSize = 64;
+    validateAsymmetricIndexCase(threads);
+    std::cout << "Asymmetric upper/lower correctness: PASS\n";
     const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
     lduMatrix matrix = makeMatrix(mesh);
     scalarField exact(mesh.nCells);
@@ -2275,6 +2466,28 @@ int runHpcIndexSeries(const std::string& meshDirectory, const bool smallWidths)
     (
         "psi", reference, matrix, source, interfaceCoeffs, interfaces, 0, 1
     );
+    scalarField nonzeroInitial(mesh.nCells);
+    for (label cell=0; cell<label(mesh.nCells); ++cell)
+        nonzeroInitial[cell] =
+            scalar((17*std::int64_t(cell))%101 - 50)/37.0;
+    scalarField nonzeroReferenceOne = nonzeroInitial;
+    scalarField nonzeroReferenceThree = nonzeroInitial;
+    scalarField nonzeroReferenceSix = nonzeroInitial;
+    GaussSeidelSmoother::smooth
+    (
+        "psi", nonzeroReferenceOne, matrix, source,
+        interfaceCoeffs, interfaces, 0, 1
+    );
+    GaussSeidelSmoother::smooth
+    (
+        "psi", nonzeroReferenceThree, matrix, source,
+        interfaceCoeffs, interfaces, 0, 3
+    );
+    GaussSeidelSmoother::smooth
+    (
+        "psi", nonzeroReferenceSix, matrix, source,
+        interfaceCoeffs, interfaces, 0, 6
+    );
     std::cout << "Index schedule series: cells=" << mesh.nCells
         << " requested threads=" << threads
         << "; Reference GS always serial; parallel block size=" << blockSize
@@ -2282,24 +2495,47 @@ int runHpcIndexSeries(const std::string& meshDirectory, const bool smallWidths)
     for (std::size_t i=0; i<packed.size(); ++i)
     {
         packed[i] = makeWavefrontSchedule(mesh, matrix, statistics[i]);
-        scalarField candidate = initialPsi;
         if (threads == 1)
-        {
             compact[i] = makeRowDegreeSchedule(packed[i]);
-            serialRowDegreeSmooth(candidate, source, compact[i], 1);
-        }
         else
-        {
             blocked[i] = makeBlockedRowDegreeSchedule(packed[i], blockSize);
-            persistentOpenMpBlockedRowDegreeSmooth
-            (
-                candidate, source, blocked[i], 1, detectedThreads[i]
-            );
-            if (detectedThreads[i] != threads)
-                throw std::runtime_error("unexpected OpenMP team size");
-        }
-        const scalar difference = maxAbsDifference(reference, candidate);
-        if (difference != 0)
+        const auto smoothCandidate = [&](scalarField& field, const label sweeps)
+        {
+            if (threads == 1)
+                serialRowDegreeSmooth(field, source, compact[i], sweeps);
+            else
+            {
+                persistentOpenMpBlockedRowDegreeSmooth
+                (
+                    field, source, blocked[i], sweeps, detectedThreads[i]
+                );
+                if (detectedThreads[i] != threads)
+                    throw std::runtime_error("unexpected OpenMP team size");
+            }
+        };
+        scalarField candidate = initialPsi;
+        smoothCandidate(candidate, 1);
+        const scalar zeroOneDifference = maxAbsDifference(reference, candidate);
+        candidate = nonzeroInitial;
+        smoothCandidate(candidate, 1);
+        const scalar nonzeroOneDifference =
+            maxAbsDifference(nonzeroReferenceOne, candidate);
+        candidate = nonzeroInitial;
+        smoothCandidate(candidate, 3);
+        const scalar nonzeroThreeDifference =
+            maxAbsDifference(nonzeroReferenceThree, candidate);
+        candidate = nonzeroInitial;
+        smoothCandidate(candidate, 3);
+        smoothCandidate(candidate, 3);
+        const scalar nonzeroTwoCallsDifference =
+            maxAbsDifference(nonzeroReferenceSix, candidate);
+        if
+        (
+            zeroOneDifference != 0
+         || nonzeroOneDifference != 0
+         || nonzeroThreeDifference != 0
+         || nonzeroTwoCallsDifference != 0
+        )
             throw std::runtime_error(names[i] + " exact equivalence failed");
         std::vector<std::size_t> deltas;
         deltas.reserve(mesh.nCells);
@@ -2322,10 +2558,18 @@ int runHpcIndexSeries(const std::string& meshDirectory, const bool smallWidths)
             << " deltaMedian=" << median
             << " deltaP90=" << (deltas.empty() ? 0 : percentile(deltas, 0.90))
             << " deltaP95=" << (deltas.empty() ? 0 : percentile(deltas, 0.95))
-            << " maxDifference=" << difference
+            << " maxDifferenceZero1=" << zeroOneDifference
+            << " maxDifferenceNonzero1=" << nonzeroOneDifference
+            << " maxDifferenceNonzero3=" << nonzeroThreeDifference
+            << " maxDifferenceNonzero2x3=" << nonzeroTwoCallsDifference
             << " detectedThreads=" << detectedThreads[i]
             << " blocks=" << blocked[i].blockRowStarts.size()
             << " exact=PASS dependency=PASS\n" << std::flush;
+    }
+    if (validationOnly)
+    {
+        std::cout << "Index schedule correctness: PASS\n";
+        return 0;
     }
     constexpr label samples = 5, sweepsPerSample = 81, warmupSweeps = 6;
     constexpr std::uint32_t seed = 0x5EED1234u;
@@ -2365,6 +2609,158 @@ int runHpcIndexSeries(const std::string& meshDirectory, const bool smallWidths)
         std::cout << "speedupRef=" << timings[0].medianSeconds/timings[i].medianSeconds
             << " speedupGeometry=" << timings[1].medianSeconds/timings[i].medianSeconds
             << '\n';
+    }
+    std::cout << "PASS\n";
+    return 0;
+}
+
+int runHpcDirectCoefficientSeries(const std::string& meshDirectory)
+{
+    const int threads = omp_get_max_threads();
+    if (threads != 1 && threads != 2 && threads != 4)
+        throw std::runtime_error("direct coefficient series requires 1, 2 or 4 threads");
+    validateAsymmetricIndexCase(threads);
+    const PolyMeshTopology mesh = PolyMeshReader::read(meshDirectory);
+    const lduMatrix matrix = makeMatrix(mesh);
+    const label targetWidth = threads == 1 ? 1024 : 2048;
+    constexpr label blockSize = 64;
+    const WavefrontStatistics statistics =
+        constructIndexWavefronts(mesh, matrix, targetWidth, false);
+    const WavefrontSchedule packed =
+        makeWavefrontSchedule(mesh, matrix, statistics);
+    const DirectCoefficientSchedule direct =
+        makeDirectCoefficientSchedule(mesh, matrix, statistics, blockSize);
+    if (packed.waveCells != direct.waveCells || packed.cols != direct.cols)
+        throw std::runtime_error("direct topology differs from packed topology");
+    for (label row=0, p=0; row<label(direct.waveCells.size()); ++row)
+    {
+        const label cell = direct.waveCells[row];
+        if (packed.diag[row] != matrix.diag()[cell])
+            throw std::runtime_error("direct diagonal mapping mismatch");
+        const label split = p + direct.incomingDegrees[row];
+        const label end = p + direct.degrees[row];
+        for (; p<split; ++p)
+            if (packed.coeffs[p] != matrix.lower()[direct.faceIds[p]])
+                throw std::runtime_error("direct lower coefficient mapping mismatch");
+        for (; p<end; ++p)
+            if (packed.coeffs[p] != matrix.upper()[direct.faceIds[p]])
+                throw std::runtime_error("direct upper coefficient mapping mismatch");
+    }
+    const RowDegreeSchedule compact = makeRowDegreeSchedule(packed);
+    const BlockedRowDegreeSchedule blocked =
+        makeBlockedRowDegreeSchedule(packed, blockSize);
+
+    scalarField exact(mesh.nCells);
+    for (label cell=0; cell<label(mesh.nCells); ++cell)
+    {
+        const scalar position = scalar(cell)/scalar(exact.size() - 1);
+        exact[cell] = 1.0 + 0.25*std::sin(2.0*M_PI*position)
+            + 0.1*std::cos(10.0*M_PI*position);
+    }
+    const scalarField source = multiply(matrix, exact);
+    const scalarField initialPsi(mesh.nCells, 0.0);
+    scalarField nonzeroInitial(mesh.nCells);
+    for (label cell=0; cell<label(mesh.nCells); ++cell)
+        nonzeroInitial[cell] =
+            scalar((17*std::int64_t(cell))%101 - 50)/37.0;
+    FieldField<Field, scalar> interfaceCoeffs(0);
+    lduInterfaceFieldPtrsList interfaces(0);
+    int packedThreads = 1, directThreads = 1;
+    const auto runPacked = [&](scalarField& psi, const label nSweeps)
+    {
+        if (threads == 1)
+            serialRowDegreeSmooth(psi, source, compact, nSweeps);
+        else
+            persistentOpenMpBlockedRowDegreeSmooth
+            (
+                psi, source, blocked, nSweeps, packedThreads
+            );
+    };
+    const auto runDirect = [&](scalarField& psi, const label nSweeps)
+    {
+        if (threads == 1)
+            serialDirectCoefficientSmooth(psi, source, matrix, direct, nSweeps);
+        else
+            persistentOpenMpDirectCoefficientSmooth
+            (
+                psi, source, matrix, direct, nSweeps, directThreads
+            );
+    };
+    scalar maximumDifference = 0;
+    scalar maximumResidualDifference = 0;
+    const std::array<const scalarField*, 2> initialStates
+    {{&initialPsi, &nonzeroInitial}};
+    for (const scalarField* initial : initialStates)
+    {
+        for (const label nSweeps : {1, 3, 6})
+        {
+            scalarField reference = *initial;
+            scalarField packedPsi = *initial;
+            scalarField directPsi = *initial;
+            GaussSeidelSmoother::smooth
+            (
+                "psi", reference, matrix, source,
+                interfaceCoeffs, interfaces, 0, nSweeps
+            );
+            runPacked(packedPsi, nSweeps);
+            runDirect(directPsi, nSweeps);
+            const scalar difference = maxAbsDifference(reference, directPsi);
+            maximumDifference = std::max(maximumDifference, difference);
+            maximumResidualDifference = std::max
+            (
+                maximumResidualDifference,
+                std::abs(relativeResidual(matrix, reference, source)
+                    - relativeResidual(matrix, directPsi, source))
+            );
+            if (difference != 0 || maxAbsDifference(reference, packedPsi) != 0)
+                throw std::runtime_error("direct coefficient exact correctness failed");
+        }
+    }
+    if (packedThreads != threads || directThreads != threads)
+        throw std::runtime_error("unexpected OpenMP team size");
+    std::cout << "Direct coefficient Index-Kahn: cells=" << mesh.nCells
+        << " faces=" << mesh.nInternalFaces()
+        << " threads=" << threads << " width=" << targetWidth
+        << " levels=" << statistics.widths.size()
+        << " blocks=" << direct.blockRowStarts.size()
+        << " maxDifference=" << maximumDifference
+        << " residualDifference=" << maximumResidualDifference
+        << " dependency=PASS exact=PASS\n" << std::flush;
+
+    constexpr label samples = 5, sweepsPerSample = 81, warmupSweeps = 6;
+    constexpr std::uint32_t seed = 0x5EED1234u;
+    std::vector<RandomizedBenchmarkVariant> variants;
+    variants.push_back({"Reference GS", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3)
+            GaussSeidelSmoother::smooth
+            (
+                "psi", psi, matrix, source, interfaceCoeffs, interfaces, 0, 3
+            );
+    }});
+    variants.push_back({"Packed row-degree", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3) runPacked(psi, 3);
+    }});
+    variants.push_back({"Direct coefficients", [&](scalarField& psi, const label n)
+    {
+        for (label sweep=0; sweep<n; sweep += 3) runDirect(psi, 3);
+    }});
+    std::cout << "seed=" << seed << " samples=" << samples
+        << " sweeps/sample=" << sweepsPerSample
+        << " sweeps/call=3; preprocessing excluded\n" << std::flush;
+    const auto timings = timeRandomizedImplementations
+    (
+        initialPsi, mesh.nCells, samples, sweepsPerSample,
+        warmupSweeps, seed, variants
+    );
+    for (std::size_t i=0; i<variants.size(); ++i)
+    {
+        printTiming(variants[i].name.c_str(), timings[i]);
+        std::cout << "speedupRef="
+            << timings[0].medianSeconds/timings[i].medianSeconds
+            << " speedupPacked="
+            << timings[1].medianSeconds/timings[i].medianSeconds << '\n';
     }
     std::cout << "PASS\n";
     return 0;
@@ -2725,6 +3121,12 @@ int runTest
         "psi", psiReference, matrix, source,
         interfaceCoeffs, interfaces, 0, 1
     );
+    scalarField psiSymmetricReference = initialPsi;
+    symGaussSeidelSmoother::smooth
+    (
+        "psi", psiSymmetricReference, matrix, source,
+        interfaceCoeffs, interfaces, 0, 1
+    );
     scalarField psiSerialGather = initialPsi;
     serialGatherSmooth(psiSerialGather, source, schedule, 1);
     scalarField psiInterleavedRows = initialPsi;
@@ -2881,6 +3283,10 @@ int runTest
 
     const scalar referenceOneSweepResidual =
         relativeResidual(matrix, psiReference, source);
+    const scalar referenceInitialResidual =
+        relativeResidual(matrix, initialPsi, source);
+    const scalar symmetricOneSweepResidual =
+        relativeResidual(matrix, psiSymmetricReference, source);
     const scalar serialGatherResidual =
         relativeResidual(matrix, psiSerialGather, source);
     const scalar interleavedRowsResidual =
@@ -2945,6 +3351,7 @@ int runTest
         << "\ninternal faces: " << mesh.nInternalFaces()
         << "\n\nOne-sweep correctness:"
         << "\nReference GS residual:          " << referenceOneSweepResidual
+        << "\nReference symmetric GS residual:" << symmetricOneSweepResidual
         << "\nSerial gather residual:         " << serialGatherResidual
         << "\nInterleaved rows residual:      " << interleavedRowsResidual
         << "\nDegree-6 scalar residual:       " << degree6Residual
@@ -2964,6 +3371,12 @@ int runTest
         << "\nAVX-512 across-rows residual:   " << avx512AcrossRowsResidual
         << "\nPer-level OpenMP residual:      " << perLevelResidual
         << "\nPersistent OpenMP residual:     " << persistentResidual
+        << "\nSymmetric GS residual reduction: "
+        << (
+            std::isfinite(symmetricOneSweepResidual)
+         && symmetricOneSweepResidual < referenceInitialResidual
+          ? "PASS" : "FAIL"
+        )
         << "\nSerial gather residual difference:     "
         << std::abs(referenceOneSweepResidual - serialGatherResidual)
         << "\nInterleaved rows residual difference: "
@@ -3099,6 +3512,17 @@ int runTest
         << "\npersistent OMP equivalence:      " << status(persistentMaxAbs)
         << "\nequivalence tolerance:           " << equivalenceTolerance
         << "\n\n";
+    if
+    (
+        !std::isfinite(symmetricOneSweepResidual)
+     || !(symmetricOneSweepResidual < referenceInitialResidual)
+    )
+    {
+        throw std::runtime_error
+        (
+            "symmetric Gauss-Seidel one-sweep residual check failed"
+        );
+    }
     if
     (
         serialGatherMaxAbs > equivalenceTolerance
@@ -3313,6 +3737,18 @@ int runTest
             );
         }
     );
+    const ImplementationTiming symmetricTiming = timeSweepImplementation
+    (
+        initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+        warmupSweeps, [&](scalarField& timedPsi, const label nSweeps)
+        {
+            symGaussSeidelSmoother::smooth
+            (
+                "psi", timedPsi, matrix, source,
+                interfaceCoeffs, interfaces, 0, nSweeps
+            );
+        }
+    );
     const ImplementationTiming serialGatherTiming = timeSweepImplementation
     (
         initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
@@ -3450,6 +3886,21 @@ int runTest
                 for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
                 {
                     GaussSeidelSmoother::smooth
+                    (
+                        "psi", timedPsi, matrix, source,
+                        interfaceCoeffs, interfaces, 0,
+                        productionSweepsPerCall
+                    );
+                }
+            }
+        },
+        {
+            "Reference symmetric GS",
+            [&](scalarField& timedPsi, const label nSweeps)
+            {
+                for (label sweep=0; sweep<nSweeps; sweep += productionSweepsPerCall)
+                {
+                    symGaussSeidelSmoother::smooth
                     (
                         "psi", timedPsi, matrix, source,
                         interfaceCoeffs, interfaces, 0,
@@ -3603,20 +4054,21 @@ int runTest
             productionVariants
         );
     const ImplementationTiming& productionReferenceTiming = productionTimings[0];
-    const ImplementationTiming& productionPackedTiming = productionTimings[1];
-    const ImplementationTiming& productionInterleavedTiming = productionTimings[2];
-    const ImplementationTiming& productionDegree6Timing = productionTimings[3];
+    const ImplementationTiming& productionSymmetricTiming = productionTimings[1];
+    const ImplementationTiming& productionPackedTiming = productionTimings[2];
+    const ImplementationTiming& productionInterleavedTiming = productionTimings[3];
+    const ImplementationTiming& productionDegree6Timing = productionTimings[4];
     const ImplementationTiming& productionDegree6InterleavedTiming =
-        productionTimings[4];
-    const ImplementationTiming& productionMedianRowTiming = productionTimings[5];
+        productionTimings[5];
+    const ImplementationTiming& productionMedianRowTiming = productionTimings[6];
     const ImplementationTiming& productionWholeRowInt16Timing =
-        productionTimings[6];
-    const ImplementationTiming& productionDeltaEscapeInt16Timing =
         productionTimings[7];
-    const ImplementationTiming& productionPackedUint24Timing =
+    const ImplementationTiming& productionDeltaEscapeInt16Timing =
         productionTimings[8];
-    const ImplementationTiming& productionGeometryTiming = productionTimings[9];
-    const ImplementationTiming& productionXSortedTiming = productionTimings[10];
+    const ImplementationTiming& productionPackedUint24Timing =
+        productionTimings[9];
+    const ImplementationTiming& productionGeometryTiming = productionTimings[10];
+    const ImplementationTiming& productionXSortedTiming = productionTimings[11];
 
 
     scalarField psi = initialPsi;
@@ -3644,6 +4096,24 @@ int runTest
     scalar maxError = 0;
     for (label i=0; i<label(psi.size()); ++i)
         maxError = std::max(maxError, std::abs(psi[i] - exact[i]));
+
+    scalarField psiSymmetricFinal = initialPsi;
+    symGaussSeidelSmoother::smooth
+    (
+        "psi", psiSymmetricFinal, matrix, source,
+        interfaceCoeffs, interfaces, 0, totalCorrectnessSweeps
+    );
+    const scalar symmetricFinal =
+        relativeResidual(matrix, psiSymmetricFinal, source);
+    scalar symmetricMaxError = 0;
+    for (label i=0; i<label(psiSymmetricFinal.size()); ++i)
+    {
+        symmetricMaxError = std::max
+        (
+            symmetricMaxError,
+            std::abs(psiSymmetricFinal[i] - exact[i])
+        );
+    }
 
     const std::size_t totalLevelCells =
         std::accumulate
@@ -3882,6 +4352,7 @@ int runTest
         << "\n  OpenMP threads detected: " << persistentThreads
         << "\n  primary comparison statistic: median\n";
     printTiming("Reference sequential GS", sequentialTiming);
+    printTiming("Reference symmetric GS (forward + backward)", symmetricTiming);
     printTiming("Serial packed scalar", serialGatherTiming);
     for (std::size_t i=0; i<prefetchDistances.size(); ++i)
     {
@@ -3968,6 +4439,7 @@ int runTest
         << "\n  randomized variant-order seed: " << productionBenchmarkSeed
         << "\n  OpenMP threads detected: " << persistentThreads << '\n';
     printTiming("3-sweep Reference GS", productionReferenceTiming);
+    printTiming("3-sweep Reference symmetric GS", productionSymmetricTiming);
     printTiming("3-sweep Packed scalar", productionPackedTiming);
     printTiming
     (
@@ -3995,6 +4467,9 @@ int runTest
         << "\nreference        " << productionReferenceTiming.medianSeconds
         << "  " << productionReferenceTiming.medianNsPerCellSweep
         << "  " << productionReferenceTiming.cvPercent
+        << "\nsymmetric GS     " << productionSymmetricTiming.medianSeconds
+        << "  " << productionSymmetricTiming.medianNsPerCellSweep
+        << "  " << productionSymmetricTiming.cvPercent
         << "\npacked scalar    " << productionPackedTiming.medianSeconds
         << "  " << productionPackedTiming.medianNsPerCellSweep
         << "  " << productionPackedTiming.cvPercent
@@ -4112,9 +4587,14 @@ int runTest
         << " speedupRef=" << persistentSpeedupReference << '\n'
         << "\ncorrectness sweeps: " << executedCorrectnessSweeps
         << "\nfinal residual: " << final
-        << "\nmaximum error: " << maxError << '\n';
+        << "\nmaximum error: " << maxError
+        << "\nsymmetric GS correctness sweeps: " << totalCorrectnessSweeps
+        << "\nsymmetric GS final residual: " << symmetricFinal
+        << "\nsymmetric GS maximum error: " << symmetricMaxError << '\n';
     if (final > 1e-10 || maxError > 1e-10)
         throw std::runtime_error("Gauss-Seidel did not converge");
+    if (symmetricFinal > 1e-10 || symmetricMaxError > 1e-10)
+        throw std::runtime_error("symmetric Gauss-Seidel did not converge");
     std::cout << "PASS\n";
     return 0;
 }
@@ -4127,7 +4607,9 @@ int main(int argc, char** argv)
         "[--hpc-prefetch-series] [--hpc-best-series] [--hpc-hybrid-series] "
         "[--hpc-geometry-kernels] [--hpc-row-degree] "
         "[--hpc-blocked-row-degree] [--hpc-index-series] "
-        "[--hpc-index-small-series] [--profile-variant NAME]\n";
+        "[--hpc-index-small-series] [--hpc-direct-coeff-series] "
+        "[--index-validation-only] "
+        "[--profile-variant NAME]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
     {
         std::cout << usage;
@@ -4150,6 +4632,8 @@ int main(int argc, char** argv)
         bool hpcRowDegree = false;
         bool hpcIndexSeries = false;
         bool hpcIndexSmallSeries = false;
+        bool hpcDirectCoeffSeries = false;
+        bool indexValidationOnly = false;
         bool hpcBlockedRowDegree = false;
         std::string profileVariant;
         for (int argument=2; argument<argc; ++argument)
@@ -4200,6 +4684,16 @@ int main(int argc, char** argv)
                 hpcIndexSmallSeries = true;
                 continue;
             }
+            if (option == "--hpc-direct-coeff-series")
+            {
+                hpcDirectCoeffSeries = true;
+                continue;
+            }
+            if (option == "--index-validation-only")
+            {
+                indexValidationOnly = true;
+                continue;
+            }
             if (option == "--hpc-blocked-row-degree")
             {
                 hpcBlockedRowDegree = true;
@@ -4228,10 +4722,19 @@ int main(int argc, char** argv)
             }
         }
         if (hpcPrefetchSeries) return runHpcPrefetchSeries(argv[1]);
+        if (hpcDirectCoeffSeries)
+            return runHpcDirectCoefficientSeries(argv[1]);
         if (hpcHybridSeries) return runHpcHybridSeries(argv[1]);
         if (hpcGeometryKernels) return runHpcGeometryKernelSeries(argv[1]);
-        if (hpcIndexSmallSeries) return runHpcIndexSeries(argv[1], true);
-        if (hpcIndexSeries) return runHpcIndexSeries(argv[1], false);
+        if (hpcIndexSmallSeries)
+            return runHpcIndexSeries(argv[1], true, indexValidationOnly);
+        if (hpcIndexSeries)
+            return runHpcIndexSeries(argv[1], false, indexValidationOnly);
+        if (indexValidationOnly)
+            throw std::runtime_error
+            (
+                "--index-validation-only requires an index series"
+            );
         if (hpcRowDegree) return runHpcRowDegreeSeries(argv[1]);
         if (hpcBlockedRowDegree)
             return runHpcBlockedRowDegreeSeries(argv[1]);

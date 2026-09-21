@@ -1,0 +1,362 @@
+diff --git a/src/OpenFOAM/matrices/lduMatrix/lduMatrix/GSSolveCounters.H b/src/OpenFOAM/matrices/lduMatrix/lduMatrix/GSSolveCounters.H
+new file mode 100644
+--- /dev/null
++++ b/src/OpenFOAM/matrices/lduMatrix/lduMatrix/GSSolveCounters.H
+@@ -0,0 +1,50 @@
++#ifndef Foam_GSSolveCounters_H
++#define Foam_GSSolveCounters_H
++
++#include "label.H"
++#include "word.H"
++
++namespace Foam
++{
++namespace gsCallCounters
++{
++
++struct SolveRecord;
++
++// Scope one model-level fvMatrix solve.
++class FvSolveScope
++{
++    SolveRecord* record_;
++    SolveRecord* previous_;
++
++public:
++    explicit FvSolveScope(const word& fieldName);
++    ~FvSolveScope();
++
++    FvSolveScope(const FvSolveScope&) = delete;
++    FvSolveScope& operator=(const FvSolveScope&) = delete;
++};
++
++// Scope one smoothSolver::solve(), including all of its smooth() calls.
++class SmoothSolveScope
++{
++    SolveRecord* record_;
++    SolveRecord* previous_;
++
++public:
++    explicit SmoothSolveScope(const word& fieldName);
++    ~SmoothSolveScope();
++
++    SmoothSolveScope(const SmoothSolveScope&) = delete;
++    SmoothSolveScope& operator=(const SmoothSolveScope&) = delete;
++};
++
++// Called at the actual smoother factory, constructor, and sweep entry points.
++void noteSmootherNew();
++void noteGsConstructor();
++void noteGsSmooth(label nSweeps);
++
++} // namespace gsCallCounters
++} // namespace Foam
++
++#endif
+diff --git a/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSmoother.C b/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSmoother.C
+--- a/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSmoother.C
++++ b/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSmoother.C
+@@ -28,3 +28,222 @@
+ 
+ #include "lduMatrix.H"
++#include "GSSolveCounters.H"
++#include "UPstream.H"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++#include <mutex>
++#include <vector>
++
++namespace Foam
++{
++namespace gsCallCounters
++{
++
++struct SolveRecord
++{
++    std::uint64_t id = 0;
++    word fieldName;
++    std::uint64_t smoothSolverCalls = 0;
++    std::uint64_t smootherNew = 0;
++    std::uint64_t gsConstructors = 0;
++    std::uint64_t gsSmoothCalls = 0;
++    std::uint64_t gsSweeps = 0;
++};
++
++namespace
++{
++
++struct CounterState
++{
++    std::mutex mutex;
++    int rank = 0;
++    std::uint64_t fvSolves = 0;
++    std::uint64_t smoothSolverSolves = 0;
++    std::uint64_t smootherNew = 0;
++    std::uint64_t gsConstructors = 0;
++    std::uint64_t gsSmoothCalls = 0;
++    std::uint64_t gsSweeps = 0;
++    std::vector<SolveRecord> fvRecords;
++    std::vector<SolveRecord> smoothRecords;
++};
++
++CounterState& state();
++
++void printAtExit()
++{
++    CounterState& counters = state();
++    std::lock_guard<std::mutex> lock(counters.mutex);
++    std::sort
++    (
++        counters.fvRecords.begin(), counters.fvRecords.end(),
++        [](const SolveRecord& a, const SolveRecord& b) { return a.id < b.id; }
++    );
++    std::sort
++    (
++        counters.smoothRecords.begin(), counters.smoothRecords.end(),
++        [](const SolveRecord& a, const SolveRecord& b) { return a.id < b.id; }
++    );
++    std::fprintf
++    (
++        stderr,
++        "GS_COUNTERS_BEGIN rank=%d fvSolves=%llu smoothSolverSolves=%llu "
++        "smootherNew=%llu gsConstructors=%llu gsSmoothCalls=%llu "
++        "gsSweeps=%llu\n",
++        counters.rank,
++        static_cast<unsigned long long>(counters.fvSolves),
++        static_cast<unsigned long long>(counters.smoothSolverSolves),
++        static_cast<unsigned long long>(counters.smootherNew),
++        static_cast<unsigned long long>(counters.gsConstructors),
++        static_cast<unsigned long long>(counters.gsSmoothCalls),
++        static_cast<unsigned long long>(counters.gsSweeps)
++    );
++    for (const SolveRecord& record : counters.fvRecords)
++    {
++        std::fprintf
++        (
++            stderr,
++            "GS_COUNTERS_FV_SOLVE rank=%d id=%llu field=%s "
++            "smoothSolverCalls=%llu smootherNew=%llu gsConstructors=%llu "
++            "gsSmoothCalls=%llu gsSweeps=%llu\n",
++            counters.rank,
++            static_cast<unsigned long long>(record.id),
++            record.fieldName.c_str(),
++            static_cast<unsigned long long>(record.smoothSolverCalls),
++            static_cast<unsigned long long>(record.smootherNew),
++            static_cast<unsigned long long>(record.gsConstructors),
++            static_cast<unsigned long long>(record.gsSmoothCalls),
++            static_cast<unsigned long long>(record.gsSweeps)
++        );
++    }
++    for (const SolveRecord& record : counters.smoothRecords)
++    {
++        std::fprintf
++        (
++            stderr,
++            "GS_COUNTERS_SMOOTH_SOLVE rank=%d id=%llu field=%s "
++            "smootherNew=%llu gsConstructors=%llu gsSmoothCalls=%llu "
++            "gsSweeps=%llu\n",
++            counters.rank,
++            static_cast<unsigned long long>(record.id),
++            record.fieldName.c_str(),
++            static_cast<unsigned long long>(record.smootherNew),
++            static_cast<unsigned long long>(record.gsConstructors),
++            static_cast<unsigned long long>(record.gsSmoothCalls),
++            static_cast<unsigned long long>(record.gsSweeps)
++        );
++    }
++    std::fprintf(stderr, "GS_COUNTERS_END rank=%d\n", counters.rank);
++    std::fflush(stderr);
++}
++
++CounterState& state()
++{
++    static CounterState* counters = []()
++    {
++        CounterState* result = new CounterState;
++        result->rank = UPstream::myProcNo();
++        std::atexit(printAtExit);
++        return result;
++    }();
++    return *counters;
++}
++
++thread_local SolveRecord* currentFvSolve = nullptr;
++thread_local SolveRecord* currentSmoothSolve = nullptr;
++
++} // namespace
++
++FvSolveScope::FvSolveScope(const word& fieldName)
++:
++    record_(new SolveRecord),
++    previous_(currentFvSolve)
++{
++    record_->fieldName = fieldName;
++    CounterState& counters = state();
++    {
++        std::lock_guard<std::mutex> lock(counters.mutex);
++        record_->id = ++counters.fvSolves;
++    }
++    currentFvSolve = record_;
++}
++
++FvSolveScope::~FvSolveScope()
++{
++    currentFvSolve = previous_;
++    CounterState& counters = state();
++    {
++        std::lock_guard<std::mutex> lock(counters.mutex);
++        counters.fvRecords.push_back(*record_);
++    }
++    delete record_;
++}
++
++SmoothSolveScope::SmoothSolveScope(const word& fieldName)
++:
++    record_(new SolveRecord),
++    previous_(currentSmoothSolve)
++{
++    record_->fieldName = fieldName;
++    CounterState& counters = state();
++    {
++        std::lock_guard<std::mutex> lock(counters.mutex);
++        record_->id = ++counters.smoothSolverSolves;
++        if (currentFvSolve) ++currentFvSolve->smoothSolverCalls;
++    }
++    currentSmoothSolve = record_;
++}
++
++SmoothSolveScope::~SmoothSolveScope()
++{
++    currentSmoothSolve = previous_;
++    CounterState& counters = state();
++    {
++        std::lock_guard<std::mutex> lock(counters.mutex);
++        counters.smoothRecords.push_back(*record_);
++    }
++    delete record_;
++}
++
++void noteSmootherNew()
++{
++    CounterState& counters = state();
++    std::lock_guard<std::mutex> lock(counters.mutex);
++    ++counters.smootherNew;
++    if (currentFvSolve) ++currentFvSolve->smootherNew;
++    if (currentSmoothSolve) ++currentSmoothSolve->smootherNew;
++}
++
++void noteGsConstructor()
++{
++    CounterState& counters = state();
++    std::lock_guard<std::mutex> lock(counters.mutex);
++    ++counters.gsConstructors;
++    if (currentFvSolve) ++currentFvSolve->gsConstructors;
++    if (currentSmoothSolve) ++currentSmoothSolve->gsConstructors;
++}
++
++void noteGsSmooth(const label nSweeps)
++{
++    CounterState& counters = state();
++    const std::uint64_t sweeps = nSweeps > 0 ? nSweeps : 0;
++    std::lock_guard<std::mutex> lock(counters.mutex);
++    ++counters.gsSmoothCalls;
++    counters.gsSweeps += sweeps;
++    if (currentFvSolve)
++    {
++        ++currentFvSolve->gsSmoothCalls;
++        currentFvSolve->gsSweeps += sweeps;
++    }
++    if (currentSmoothSolve)
++    {
++        ++currentSmoothSolve->gsSmoothCalls;
++        currentSmoothSolve->gsSweeps += sweeps;
++    }
++}
++
++} // namespace gsCallCounters
++} // namespace Foam
+ 
+@@ -86,5 +305,7 @@ Foam::autoPtr<Foam::lduMatrix::smoother> Foam::lduMatrix::smoother::New
+ 
+     const dictionary& controls = e.isDict() ? e.dict() : dictionary::null;
+ 
++    gsCallCounters::noteSmootherNew();
++
+     if (matrix.symmetric())
+     {
+diff --git a/src/OpenFOAM/matrices/lduMatrix/solvers/smoothSolver/smoothSolver.C b/src/OpenFOAM/matrices/lduMatrix/solvers/smoothSolver/smoothSolver.C
+--- a/src/OpenFOAM/matrices/lduMatrix/solvers/smoothSolver/smoothSolver.C
++++ b/src/OpenFOAM/matrices/lduMatrix/solvers/smoothSolver/smoothSolver.C
+@@ -29,4 +29,5 @@
+ #include "smoothSolver.H"
+ #include "profiling.H"
+ #include "PrecisionAdaptor.H"
++#include "GSSolveCounters.H"
+ 
+@@ -85,5 +86,7 @@ Foam::solverPerformance Foam::smoothSolver::solve
+     const direction cmpt
+ ) const
+ {
++    gsCallCounters::SmoothSolveScope countScope(fieldName_);
++
+     PrecisionAdaptor<solveScalar, scalar> tpsi(psi_s);
+     solveScalarField& psi = tpsi.ref();
+diff --git a/src/OpenFOAM/matrices/lduMatrix/smoothers/GaussSeidel/GaussSeidelSmoother.C b/src/OpenFOAM/matrices/lduMatrix/smoothers/GaussSeidel/GaussSeidelSmoother.C
+--- a/src/OpenFOAM/matrices/lduMatrix/smoothers/GaussSeidel/GaussSeidelSmoother.C
++++ b/src/OpenFOAM/matrices/lduMatrix/smoothers/GaussSeidel/GaussSeidelSmoother.C
+@@ -29,3 +29,4 @@
+ #include "GaussSeidelSmoother.H"
+ #include "PrecisionAdaptor.H"
++#include "GSSolveCounters.H"
+ 
+@@ -61,5 +62,7 @@ Foam::GaussSeidelSmoother::GaussSeidelSmoother
+         interfaces
+     )
+-{}
++{
++    gsCallCounters::noteGsConstructor();
++}
+ 
+ 
+@@ -78,4 +81,6 @@ void Foam::GaussSeidelSmoother::smooth
+     const label nSweeps
+ )
+ {
++    gsCallCounters::noteGsSmooth(nSweeps);
++
+     solveScalar* __restrict__ psiPtr = psi.begin();
+diff --git a/src/finiteVolume/fvMatrices/fvMatrix/fvMatrixSolve.C b/src/finiteVolume/fvMatrices/fvMatrix/fvMatrixSolve.C
+--- a/src/finiteVolume/fvMatrices/fvMatrix/fvMatrixSolve.C
++++ b/src/finiteVolume/fvMatrices/fvMatrix/fvMatrixSolve.C
+@@ -30,4 +30,5 @@
+ #include "diagTensorField.H"
+ #include "profiling.H"
+ #include "PrecisionAdaptor.H"
++#include "GSSolveCounters.H"
+ 
+@@ -63,5 +64,7 @@ Foam::SolverPerformance<Type> Foam::fvMatrix<Type>::solveSegregatedOrCoupled
+     const dictionary& solverControls
+ )
+ {
++    gsCallCounters::FvSolveScope countScope(psi_.name());
++
+     word regionName;
+     if (psi_.mesh().name() != polyMesh::defaultRegion)
+diff --git a/src/finiteVolume/fvMatrices/fvScalarMatrix/fvScalarMatrix.C b/src/finiteVolume/fvMatrices/fvScalarMatrix/fvScalarMatrix.C
+--- a/src/finiteVolume/fvMatrices/fvScalarMatrix/fvScalarMatrix.C
++++ b/src/finiteVolume/fvMatrices/fvScalarMatrix/fvScalarMatrix.C
+@@ -33,3 +33,4 @@
+ #include "cyclicPolyPatch.H"
+ #include "cyclicAMIPolyPatch.H"
++#include "GSSolveCounters.H"
+ 
+@@ -119,4 +120,6 @@ Foam::solverPerformance Foam::fvMatrix<Foam::scalar>::fvSolver::solve
+     const dictionary& solverControls
+ )
+ {
++    gsCallCounters::FvSolveScope countScope(fvMat_.psi().name());
++
+     const int logLevel =

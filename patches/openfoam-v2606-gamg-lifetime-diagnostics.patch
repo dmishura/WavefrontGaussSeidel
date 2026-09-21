@@ -1,0 +1,281 @@
+diff --git a/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolver.C b/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolver.C
+--- a/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolver.C
++++ b/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolver.C
+@@ -32,5 +32,8 @@
+ #include "GAMGInterface.H"
+ #include "PCG.H"
+ #include "PBiCGStab.H"
++#include "defineDebugSwitch.H"
++
++#include <cstdint>
+ 
+ // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+@@ -37,5 +38,21 @@
+ namespace Foam
+ {
++namespace
++{
++    struct IndexKahnGAMGDebugSwitch
++    {
++        static int debug;
++    };
++}
++
++defineDebugSwitchWithName(IndexKahnGAMGDebugSwitch, "IndexKahnGAMGDebug", 0);
++registerDebugSwitchWithName(IndexKahnGAMGDebugSwitch, IndexKahnGAMGDebugSwitch, "IndexKahnGAMGDebug");
++
++bool indexKahnGAMGDebug()
++{
++    return IndexKahnGAMGDebugSwitch::debug;
++}
++
+     defineTypeNameAndDebug(GAMGSolver, 0);
+ 
+     lduMatrix::solver::addsymMatrixConstructorToTable<GAMGSolver>
+@@ -338,4 +342,14 @@
+             << exit(FatalError);
+     }
++
++    if (indexKahnGAMGDebug())
++    {
++        Pout<< "GAMGDBG event=solver-construct field=" << fieldName_
++            << " solver=" << reinterpret_cast<std::uintptr_t>(this)
++            << " agglomeration=" << reinterpret_cast<std::uintptr_t>(&agglomeration_)
++            << " levels=" << matrixLevels_.size() + 1
++            << " cacheAgglomeration=" << cacheAgglomeration_
++            << endl;
++    }
+ }
+ 
+@@ -345,6 +359,14 @@
+ 
+ Foam::GAMGSolver::~GAMGSolver()
+ {
++    if (indexKahnGAMGDebug())
++    {
++        Pout<< "GAMGDBG event=solver-destroy field=" << fieldName_
++            << " solver=" << reinterpret_cast<std::uintptr_t>(this)
++            << " agglomeration=" << reinterpret_cast<std::uintptr_t>(&agglomeration_)
++            << " deleteAgglomeration=" << !cacheAgglomeration_
++            << endl;
++    }
+     if (!cacheAgglomeration_)
+     {
+         delete &agglomeration_;
+diff --git a/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolverSolve.C b/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolverSolve.C
+--- a/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolverSolve.C
++++ b/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolverSolve.C
+@@ -32,4 +32,16 @@
+ #include "SubField.H"
+ #include "PrecisionAdaptor.H"
+ 
++#include <atomic>
++#include <cstdint>
++
++namespace Foam
++{
++    bool indexKahnGAMGDebug();
++namespace
++{
++    std::atomic<std::uint64_t> nextDiagnosticGAMGSolve{0};
++}
++}
++
+ // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
+@@ -48,6 +59,46 @@
+     // Setup class containing solver performance data
+     solverPerformance solverPerf(typeName, fieldName_);
+ 
++    // Per-process diagnostic ordinal. No global pointer is used as a key.
++    const std::uint64_t diagnosticSolve = indexKahnGAMGDebug()
++      ? ++nextDiagnosticGAMGSolve : 0;
++    if (indexKahnGAMGDebug())
++    {
++        Pout<< "GAMGDBG event=solve-begin solve=" << diagnosticSolve
++            << " field=" << fieldName_
++            << " solver=" << reinterpret_cast<std::uintptr_t>(this)
++            << " agglomeration=" << reinterpret_cast<std::uintptr_t>(&agglomeration_)
++            << " levels=" << matrixLevels_.size() + 1 << endl;
++
++        for (label level=0; level<=matrixLevels_.size(); ++level)
++        {
++            if (level == 0 || matrixLevels_.set(level - 1))
++            {
++                const lduMatrix& mat = matrixLevel(level);
++                const lduMesh& levelMesh = mat.mesh();
++                const lduAddressing& addr = levelMesh.lduAddr();
++                Pout<< "GAMGDBG event=level solve=" << diagnosticSolve
++                    << " field=" << fieldName_ << " level=" << level
++                    << " cells=" << addr.size()
++                    << " faces=" << addr.lowerAddr().size()
++                    << " mesh=" << reinterpret_cast<std::uintptr_t>(&levelMesh)
++                    << " addr=" << reinterpret_cast<std::uintptr_t>(&addr)
++                    << " matrix=" << reinterpret_cast<std::uintptr_t>(&mat)
++                    << " agglomeration=" << reinterpret_cast<std::uintptr_t>(&agglomeration_)
++                    << endl;
++            }
++            else
++            {
++                // A processor-agglomerated level can be absent on this rank.
++                Pout<< "GAMGDBG event=level solve=" << diagnosticSolve
++                    << " field=" << fieldName_ << " level=" << level
++                    << " matrix=none mesh=none addr=none"
++                    << " agglomeration=" << reinterpret_cast<std::uintptr_t>(&agglomeration_)
++                    << endl;
++            }
++        }
++    }
++
+     // Calculate A.psi used to calculate the initial residual
+     solveScalarField Apsi(psi.size());
+     matrix_.Amul(Apsi, psi, interfaceBouCoeffs_, interfaces_, cmpt);
+@@ -109,6 +163,25 @@
+             scratch2
+         );
+ 
++        if (indexKahnGAMGDebug())
++        {
++            for (label level=0; level<smoothers.size(); ++level)
++            {
++                if (smoothers.set(level))
++                {
++                    const lduMatrix& mat = matrixLevel(level);
++                    Pout<< "GAMGDBG event=smoother-create solve="
++                        << diagnosticSolve << " field=" << fieldName_
++                        << " level=" << level
++                        << " cells=" << mat.lduAddr().size()
++                        << " matrix=" << reinterpret_cast<std::uintptr_t>(&mat)
++                        << " addr=" << reinterpret_cast<std::uintptr_t>(&mat.lduAddr())
++                        << " smoother=" << reinterpret_cast<std::uintptr_t>(&smoothers[level])
++                        << endl;
++                }
++            }
++        }
++
+         do
+         {
+             Vcycle
+@@ -143,5 +217,16 @@
+          || solverPerf.nIterations() < minIter_
+         );
++        if (indexKahnGAMGDebug())
++        {
++            Pout<< "GAMGDBG event=smoothers-destroy solve="
++                << diagnosticSolve << " field=" << fieldName_ << endl;
++        }
+     }
++    else if (indexKahnGAMGDebug())
++    {
++        Pout<< "GAMGDBG event=smoothers-skipped solve="
++            << diagnosticSolve << " field=" << fieldName_
++            << " reason=initial-convergence" << endl;
++    }
+ 
+     matrix().setResidualField
+@@ -157,5 +243,10 @@
+         false
+     );
+ 
++    if (indexKahnGAMGDebug())
++    {
++        Pout<< "GAMGDBG event=solve-end solve=" << diagnosticSolve
++            << " field=" << fieldName_ << endl;
++    }
+     return solverPerf;
+ }
+diff --git a/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/GAMGAgglomeration/GAMGAgglomeration.C b/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/GAMGAgglomeration/GAMGAgglomeration.C
+--- a/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/GAMGAgglomeration/GAMGAgglomeration.C
++++ b/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/GAMGAgglomeration/GAMGAgglomeration.C
+@@ -35,4 +35,11 @@
+ #include "pairGAMGAgglomeration.H"
+ #include "IOmanip.H"
+ 
++#include <cstdint>
++
++namespace Foam
++{
++    bool indexKahnGAMGDebug();
++}
++
+ // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+@@ -302,4 +307,10 @@
+         procBoundaryFaceMap_.setSize(maxLevels_);
+     }
++
++    if (indexKahnGAMGDebug())
++    {
++        Pout<< "GAMGDBG event=agglomeration-construct object="
++            << reinterpret_cast<std::uintptr_t>(this) << " name=" << name() << endl;
++    }
+ }
+ 
+@@ -328,10 +339,22 @@
+     if (agglomPtr)
+     {
+         if (agglomPtr->requireUpdate_)
+         {
++            if (indexKahnGAMGDebug())
++            {
++                Pout<< "GAMGDBG event=agglomeration-rebuild object="
++                    << reinterpret_cast<std::uintptr_t>(agglomPtr)
++                    << " source=mesh" << endl;
++            }
+             mesh.thisDb().checkOut(const_cast<GAMGAgglomeration*>(agglomPtr));
+             return GAMGAgglomeration::New(mesh, controlDict);
+         }
+ 
++        if (indexKahnGAMGDebug())
++        {
++            Pout<< "GAMGDBG event=agglomeration-reuse object="
++                << reinterpret_cast<std::uintptr_t>(agglomPtr)
++                << " source=mesh" << endl;
++        }
+         return *agglomPtr;
+     }
+@@ -397,10 +419,22 @@
+     if (agglomPtr)
+     {
+         if (agglomPtr->requireUpdate_)
+         {
++            if (indexKahnGAMGDebug())
++            {
++                Pout<< "GAMGDBG event=agglomeration-rebuild object="
++                    << reinterpret_cast<std::uintptr_t>(agglomPtr)
++                    << " source=matrix" << endl;
++            }
+             mesh.thisDb().checkOut(const_cast<GAMGAgglomeration*>(agglomPtr));
+             return GAMGAgglomeration::New(matrix, controlDict);
+         }
+ 
++        if (indexKahnGAMGDebug())
++        {
++            Pout<< "GAMGDBG event=agglomeration-reuse object="
++                << reinterpret_cast<std::uintptr_t>(agglomPtr)
++                << " source=matrix" << endl;
++        }
+         return *agglomPtr;
+     }
+@@ -513,4 +546,10 @@
+ 
+ Foam::GAMGAgglomeration::~GAMGAgglomeration()
+-{}
++{
++    if (indexKahnGAMGDebug())
++    {
++        Pout<< "GAMGDBG event=agglomeration-destroy object="
++            << reinterpret_cast<std::uintptr_t>(this) << " name=" << name() << endl;
++    }
++}
+ 
+@@ -528,6 +567,11 @@
+ bool Foam::GAMGAgglomeration::movePoints()
+ {
+     if (requiresUpdate())
+     {
++        if (indexKahnGAMGDebug() && !requireUpdate_)
++        {
++            Pout<< "GAMGDBG event=agglomeration-mark-rebuild object="
++                << reinterpret_cast<std::uintptr_t>(this) << endl;
++        }
+         requireUpdate_ = true;
+     }

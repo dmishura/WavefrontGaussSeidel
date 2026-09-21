@@ -1,0 +1,603 @@
+diff --git a/src/indexKahnSmoother/IndexKahnScheduleCache.H b/src/indexKahnSmoother/IndexKahnScheduleCache.H
+new file mode 100644
+index 0000000..a3536bc
+--- /dev/null
++++ b/src/indexKahnSmoother/IndexKahnScheduleCache.H
+@@ -0,0 +1,61 @@
++#ifndef Foam_IndexKahnScheduleCache_H
++#define Foam_IndexKahnScheduleCache_H
++
++#include "MeshObject.H"
++#include "fvMesh.H"
++
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <vector>
++
++namespace Foam
++{
++
++// Contains topology and addressing only. No matrix coefficient or field data.
++struct IndexKahnSchedule
++{
++    label width = 0;
++    std::vector<label> levelStarts;
++    std::vector<label> waveCells;
++    std::vector<label> cols;
++    std::vector<label> faceIds;
++    std::vector<std::uint8_t> degrees;
++    std::vector<std::uint8_t> incomingDegrees;
++};
++
++
++class IndexKahnScheduleCache
++:
++    public MeshObject
++    <
++        fvMesh,
++        TopologicalMeshObject,
++        IndexKahnScheduleCache
++    >
++{
++    // Extend this key when another parameter changes schedule generation.
++    struct ScheduleKey
++    {
++        label width;
++
++        bool operator<(const ScheduleKey& other) const noexcept
++        {
++            return width < other.width;
++        }
++    };
++
++    mutable std::map<ScheduleKey, std::unique_ptr<IndexKahnSchedule>> schedules_;
++
++public:
++
++    TypeName("IndexKahnScheduleCache");
++
++    explicit IndexKahnScheduleCache(const fvMesh& mesh);
++
++    const IndexKahnSchedule& getOrCreate(label width) const;
++};
++
++} // namespace Foam
++
++#endif
+diff --git a/src/indexKahnSmoother/IndexKahnScheduleCache.C b/src/indexKahnSmoother/IndexKahnScheduleCache.C
+new file mode 100644
+index 0000000..f840126
+--- /dev/null
++++ b/src/indexKahnSmoother/IndexKahnScheduleCache.C
+@@ -0,0 +1,235 @@
++#include "IndexKahnScheduleCache.H"
++
++#include "IOstreams.H"
++#include "lduAddressing.H"
++#include "error.H"
++
++#include <algorithm>
++#include <limits>
++#include <set>
++
++namespace Foam
++{
++    defineTypeNameAndDebug(IndexKahnScheduleCache, 0);
++namespace
++{
++
++std::unique_ptr<Foam::IndexKahnSchedule> buildIndexKahnSchedule
++(
++    const Foam::lduAddressing& addr,
++    const Foam::label width
++)
++{
++    using Foam::label;
++
++    const label nCells = addr.size();
++    const Foam::labelUList& owners = addr.lowerAddr();
++    const Foam::labelUList& neighbours = addr.upperAddr();
++    const label nFaces = owners.size();
++    if (neighbours.size() != nFaces || nFaces > std::numeric_limits<label>::max()/2)
++    {
++        FatalErrorInFunction
++            << "invalid or oversized LDU addressing" << exit(FatalError);
++    }
++
++    const Foam::labelUList& ownerStarts = addr.ownerStartAddr();
++    if
++    (
++        ownerStarts.size() != nCells + 1
++     || ownerStarts[0] != 0
++     || ownerStarts[nCells] != nFaces
++    )
++    {
++        FatalErrorInFunction
++            << "invalid LDU owner-start addressing" << exit(FatalError);
++    }
++
++    // The standalone Index-Kahn scheduler uses owner -> neighbour edges.
++    // Normal OpenFOAM LDU addressing orders every edge lower cell first.
++    std::vector<label> predecessors(nCells, 0);
++    for (label face=0; face<nFaces; ++face)
++    {
++        const label owner = owners[face];
++        const label neighbour = neighbours[face];
++        if (owner < 0 || owner >= neighbour || neighbour >= nCells)
++        {
++            FatalErrorInFunction
++                << "Index-Kahn requires lowerAddr[face] < upperAddr[face]; "
++                << "invalid face " << face << exit(FatalError);
++        }
++        ++predecessors[neighbour];
++    }
++
++    std::set<label> ready;
++    for (label cell=0; cell<nCells; ++cell)
++    {
++        if (predecessors[cell] == 0) ready.insert(cell);
++    }
++
++    auto result = std::make_unique<Foam::IndexKahnSchedule>();
++    result->width = width;
++    result->levelStarts.push_back(0);
++    result->waveCells.reserve(nCells);
++    std::vector<label> levels(nCells, -1);
++    std::vector<label> current;
++    current.reserve(static_cast<std::size_t>(std::min(width, nCells)));
++
++    while (!ready.empty())
++    {
++        current.clear();
++        // Snapshot the ready set: newly unlocked cells enter the next level.
++        while (!ready.empty() && current.size() < std::size_t(width))
++        {
++            const auto it = ready.begin();
++            current.push_back(*it);
++            ready.erase(it);
++        }
++
++        const label level = static_cast<label>(result->levelStarts.size() - 1);
++        for (const label cell : current)
++        {
++            if (levels[cell] != -1 || predecessors[cell] != 0)
++            {
++                FatalErrorInFunction
++                    << "invalid Index-Kahn ready set" << exit(FatalError);
++            }
++            levels[cell] = level;
++            result->waveCells.push_back(cell);
++        }
++        result->levelStarts.push_back
++        (
++            static_cast<label>(result->waveCells.size())
++        );
++
++        for (const label cell : current)
++        {
++            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
++            {
++                const label neighbour = neighbours[face];
++                if (--predecessors[neighbour] == 0) ready.insert(neighbour);
++            }
++        }
++    }
++
++    if (result->waveCells.size() != std::size_t(nCells))
++    {
++        FatalErrorInFunction
++            << "Index-Kahn schedule does not cover all cells" << exit(FatalError);
++    }
++    for (label face=0; face<nFaces; ++face)
++    {
++        if (levels[owners[face]] >= levels[neighbours[face]])
++        {
++            FatalErrorInFunction
++                << "Index-Kahn dependency validation failed at face "
++                << face << exit(FatalError);
++        }
++    }
++
++    // losort retains the original face order within each upper cell. This
++    // matches the reference GS lower-side scatter arithmetic order.
++    const Foam::labelUList& incomingFaces = addr.losortAddr();
++    const Foam::labelUList& incomingStarts = addr.losortStartAddr();
++    if
++    (
++        incomingFaces.size() != nFaces
++     || incomingStarts.size() != nCells + 1
++     || incomingStarts[0] != 0
++     || incomingStarts[nCells] != nFaces
++    )
++    {
++        FatalErrorInFunction
++            << "invalid LDU losort addressing" << exit(FatalError);
++    }
++
++    result->cols.reserve(2*std::size_t(nFaces));
++    result->faceIds.reserve(2*std::size_t(nFaces));
++    result->degrees.reserve(nCells);
++    result->incomingDegrees.reserve(nCells);
++    for (const label cell : result->waveCells)
++    {
++        const label incoming = incomingStarts[cell + 1] - incomingStarts[cell];
++        const label outgoing = ownerStarts[cell + 1] - ownerStarts[cell];
++        const label degree = incoming + outgoing;
++        if (incoming < 0 || outgoing < 0
++         || degree > std::numeric_limits<std::uint8_t>::max())
++        {
++            FatalErrorInFunction
++                << "cell " << cell << " has degree " << degree
++                << ", which does not fit uint8_t" << exit(FatalError);
++        }
++        result->degrees.push_back(static_cast<std::uint8_t>(degree));
++        result->incomingDegrees.push_back(static_cast<std::uint8_t>(incoming));
++
++        for (label in=incomingStarts[cell]; in<incomingStarts[cell + 1]; ++in)
++        {
++            const label face = incomingFaces[in];
++            if (face < 0 || face >= nFaces || neighbours[face] != cell)
++            {
++                FatalErrorInFunction
++                    << "invalid LDU incoming face for cell " << cell
++                    << exit(FatalError);
++            }
++            result->cols.push_back(owners[face]);
++            result->faceIds.push_back(face);
++        }
++        for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
++        {
++            result->cols.push_back(neighbours[face]);
++            result->faceIds.push_back(face);
++        }
++    }
++    if (result->cols.size() != 2*std::size_t(nFaces))
++    {
++        FatalErrorInFunction
++            << "incomplete Index-Kahn contribution mapping" << exit(FatalError);
++    }
++    return result;
++}
++
++} // namespace
++} // namespace Foam
++
++
++Foam::IndexKahnScheduleCache::IndexKahnScheduleCache(const fvMesh& mesh)
++:
++    MeshObject<fvMesh, TopologicalMeshObject, IndexKahnScheduleCache>(mesh)
++{}
++
++
++const Foam::IndexKahnSchedule& Foam::IndexKahnScheduleCache::getOrCreate
++(
++    const label width
++) const
++{
++    if (width < 1)
++    {
++        FatalErrorInFunction
++            << "Index-Kahn width must be positive, got " << width
++            << exit(FatalError);
++    }
++
++    const ScheduleKey key{width};
++    const auto found = schedules_.find(key);
++    if (found != schedules_.end())
++    {
++        if (debug)
++        {
++            Info.masterStream(mesh().comm())
++                << "IndexKahn: reusing schedule width=" << width
++                << " cells=" << found->second->waveCells.size() << endl;
++        }
++        return *found->second;
++    }
++
++    if (debug)
++    {
++        Info.masterStream(mesh().comm())
++            << "IndexKahn: building schedule width=" << width
++            << " cells=" << mesh().nCells() << endl;
++    }
++    auto schedule = buildIndexKahnSchedule(mesh().lduAddr(), width);
++    const IndexKahnSchedule& result = *schedule;
++    schedules_.emplace(key, std::move(schedule));
++    return result;
++}
+diff --git a/src/indexKahnSmoother/IndexKahnSmoother.H b/src/indexKahnSmoother/IndexKahnSmoother.H
+new file mode 100644
+index 0000000..e4dbdf6
+--- /dev/null
++++ b/src/indexKahnSmoother/IndexKahnSmoother.H
+@@ -0,0 +1,63 @@
++#ifndef Foam_IndexKahnSmoother_H
++#define Foam_IndexKahnSmoother_H
++
++#include "lduMatrix.H"
++
++namespace Foam
++{
++
++struct IndexKahnSchedule;
++
++class IndexKahnSmoother
++:
++    public lduMatrix::smoother
++{
++    label width_;
++    const IndexKahnSchedule* schedule_;
++
++    // Current-matrix values only. These are rebuilt with each smoother
++    // instance, never stored in the mesh-owned topology cache.
++    scalarField coeffs_;
++
++    void smoothInternal
++    (
++        solveScalarField& psi,
++        const solveScalarField& source,
++        direction cmpt,
++        label nSweeps
++    ) const;
++
++public:
++
++    TypeName("indexKahn");
++
++    IndexKahnSmoother
++    (
++        const word& fieldName,
++        const lduMatrix& matrix,
++        const FieldField<Field, scalar>& interfaceBouCoeffs,
++        const FieldField<Field, scalar>& interfaceIntCoeffs,
++        const lduInterfaceFieldPtrsList& interfaces,
++        const dictionary& solverControls
++    );
++
++    virtual void smooth
++    (
++        solveScalarField& psi,
++        const scalarField& source,
++        direction cmpt,
++        label nSweeps
++    ) const;
++
++    virtual void scalarSmooth
++    (
++        solveScalarField& psi,
++        const solveScalarField& source,
++        direction cmpt,
++        label nSweeps
++    ) const;
++};
++
++} // namespace Foam
++
++#endif
+diff --git a/src/indexKahnSmoother/IndexKahnSmoother.C b/src/indexKahnSmoother/IndexKahnSmoother.C
+new file mode 100644
+index 0000000..6a12d3a
+--- /dev/null
++++ b/src/indexKahnSmoother/IndexKahnSmoother.C
+@@ -0,0 +1,197 @@
++#include "IndexKahnSmoother.H"
++#include "IndexKahnScheduleCache.H"
++
++#include "PrecisionAdaptor.H"
++#include "UPstream.H"
++#include "IOstreams.H"
++#include "error.H"
++#include "typeInfo.H"
++
++#include <chrono>
++
++namespace Foam
++{
++    defineTypeNameAndDebug(IndexKahnSmoother, 0);
++
++    lduMatrix::smoother::addsymMatrixConstructorToTable<IndexKahnSmoother>
++        addIndexKahnSmootherSymMatrixConstructorToTable_;
++
++    lduMatrix::smoother::addasymMatrixConstructorToTable<IndexKahnSmoother>
++        addIndexKahnSmootherAsymMatrixConstructorToTable_;
++}
++
++
++Foam::IndexKahnSmoother::IndexKahnSmoother
++(
++    const word& fieldName,
++    const lduMatrix& matrix,
++    const FieldField<Field, scalar>& interfaceBouCoeffs,
++    const FieldField<Field, scalar>& interfaceIntCoeffs,
++    const lduInterfaceFieldPtrsList& interfaces,
++    const dictionary& solverControls
++)
++:
++    lduMatrix::smoother
++    (
++        fieldName,
++        matrix,
++        interfaceBouCoeffs,
++        interfaceIntCoeffs,
++        interfaces
++    ),
++    width_(solverControls.getOrDefault<label>("width", 1024)),
++    schedule_(nullptr)
++{
++    if (width_ < 1)
++    {
++        FatalIOErrorInFunction(solverControls)
++            << "indexKahn width must be positive, got " << width_
++            << exit(FatalIOError);
++    }
++
++    const fvMesh* fvmesh = isA<fvMesh>(matrix_.mesh());
++    if (!fvmesh)
++    {
++        FatalErrorInFunction
++            << "indexKahn currently requires an fvMesh-backed matrix; "
++            << "keep GaussSeidel for GAMG coarse levels"
++            << exit(FatalError);
++    }
++    const IndexKahnScheduleCache& cache = IndexKahnScheduleCache::New(*fvmesh);
++    schedule_ = &cache.getOrCreate(width_);
++
++    if (schedule_->waveCells.size() != std::size_t(matrix_.diag().size()))
++    {
++        FatalErrorInFunction
++            << "Index-Kahn schedule and matrix sizes differ"
++            << exit(FatalError);
++    }
++
++    // Only current-matrix off-diagonal coefficients are packed here. The
++    // mesh cache contains face IDs and row order, never coefficient values.
++    // Time this separately from schedule construction and smoothing.
++    const auto packStart = std::chrono::steady_clock::now();
++    coeffs_.setSize(static_cast<label>(schedule_->faceIds.size()));
++    const scalar* const lower = matrix_.lower().begin();
++    const scalar* const upper = matrix_.upper().begin();
++    const label* const faceIds = schedule_->faceIds.data();
++    const std::uint8_t* const degrees = schedule_->degrees.data();
++    const std::uint8_t* const incomingDegrees = schedule_->incomingDegrees.data();
++    scalar* const packedCoeffs = coeffs_.begin();
++    const label nRows = static_cast<label>(schedule_->waveCells.size());
++
++    label p = 0;
++    for (label row=0; row<nRows; ++row)
++    {
++        const label split = p + incomingDegrees[row];
++        const label end = p + degrees[row];
++        for (; p<split; ++p) packedCoeffs[p] = lower[faceIds[p]];
++        for (; p<end; ++p) packedCoeffs[p] = upper[faceIds[p]];
++    }
++    if (debug)
++    {
++        const auto packEnd = std::chrono::steady_clock::now();
++        const double packMs =
++            std::chrono::duration<double, std::milli>(packEnd - packStart).count();
++        Info<< "IndexKahn: coefficient packing field=" << fieldName_
++            << " entries=" << coeffs_.size()
++            << " time=" << packMs << " ms" << endl;
++    }
++}
++
++
++void Foam::IndexKahnSmoother::smoothInternal
++(
++    solveScalarField& psi,
++    const solveScalarField& source,
++    const direction cmpt,
++    const label nSweeps
++) const
++{
++    const label nCells = psi.size();
++    solveScalarField& bPrime = matrix_.work(nCells);
++    const label* const waveCells = schedule_->waveCells.data();
++    const label* const cols = schedule_->cols.data();
++    const std::uint8_t* const degrees = schedule_->degrees.data();
++    const scalar* const coeffs = coeffs_.begin();
++    const scalar* const diag = matrix_.diag().begin();
++    solveScalar* const psiPtr = psi.begin();
++    solveScalar* const bPrimePtr = bPrime.begin();
++    std::chrono::duration<double> kernelTime = std::chrono::duration<double>::zero();
++
++    for (label sweep=0; sweep<nSweeps; ++sweep)
++    {
++        bPrime = source;
++
++        // Preserve the reference GaussSeidel coupled-boundary sequence.
++        const label startRequest = UPstream::nRequests();
++        matrix_.initMatrixInterfaces
++        (
++            false,
++            interfaceBouCoeffs_,
++            interfaces_,
++            psi,
++            bPrime,
++            cmpt
++        );
++        matrix_.updateMatrixInterfaces
++        (
++            false,
++            interfaceBouCoeffs_,
++            interfaces_,
++            psi,
++            bPrime,
++            cmpt,
++            startRequest
++        );
++
++        // waveCells is already a valid topological order. Levels are needed
++        // during preprocessing, but not for this serial sweep.
++        std::chrono::steady_clock::time_point kernelStart;
++        if (debug) kernelStart = std::chrono::steady_clock::now();
++        label p = 0;
++        for (label row=0; row<nCells; ++row)
++        {
++            const label cell = waveCells[row];
++            solveScalar psii = bPrimePtr[cell];
++            const label end = p + degrees[row];
++            for (; p<end; ++p) psii -= coeffs[p]*psiPtr[cols[p]];
++            psiPtr[cell] = psii/diag[cell];
++        }
++        if (debug) kernelTime += std::chrono::steady_clock::now() - kernelStart;
++    }
++    if (debug && nSweeps > 0)
++    {
++        const double kernelMs =
++            std::chrono::duration<double, std::milli>(kernelTime).count();
++        Info<< "IndexKahn: sweep kernel field=" << fieldName_
++            << " sweeps=" << nSweeps
++            << " total=" << kernelMs << " ms"
++            << " average=" << kernelMs/nSweeps << " ms/sweep" << endl;
++    }
++}
++
++
++void Foam::IndexKahnSmoother::smooth
++(
++    solveScalarField& psi,
++    const scalarField& source,
++    const direction cmpt,
++    const label nSweeps
++) const
++{
++    ConstPrecisionAdaptor<solveScalar, scalar> tsource(source);
++    smoothInternal(psi, tsource(), cmpt, nSweeps);
++}
++
++
++void Foam::IndexKahnSmoother::scalarSmooth
++(
++    solveScalarField& psi,
++    const solveScalarField& source,
++    const direction cmpt,
++    const label nSweeps
++) const
++{
++    smoothInternal(psi, source, cmpt, nSweeps);
++}
+diff --git a/src/indexKahnSmoother/Make/files b/src/indexKahnSmoother/Make/files
+new file mode 100644
+index 0000000..60e9526
+--- /dev/null
++++ b/src/indexKahnSmoother/Make/files
+@@ -0,0 +1,4 @@
++IndexKahnScheduleCache.C
++IndexKahnSmoother.C
++
++LIB = $(FOAM_USER_LIBBIN)/libIndexKahnSmoother
+diff --git a/src/indexKahnSmoother/Make/options b/src/indexKahnSmoother/Make/options
+new file mode 100644
+index 0000000..7c82f4a
+--- /dev/null
++++ b/src/indexKahnSmoother/Make/options
+@@ -0,0 +1,7 @@
++EXE_INC = \
++    -I$(LIB_SRC)/OpenFOAM/lnInclude \
++    -I$(LIB_SRC)/finiteVolume/lnInclude
++
++LIB_LIBS = \
++    -lfiniteVolume \
++    -lOpenFOAM
