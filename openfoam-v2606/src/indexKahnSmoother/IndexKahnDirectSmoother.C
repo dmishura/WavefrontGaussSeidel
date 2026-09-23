@@ -1,0 +1,234 @@
+#include "IndexKahnDirectSmoother.H"
+#include "IndexKahnScheduleCache.H"
+#include "IndexKahnSmoother.H"
+
+#include "GaussSeidelSmoother.H"
+#include "PrecisionAdaptor.H"
+#include "UPstream.H"
+#include "IOstreams.H"
+#include "error.H"
+#include "typeInfo.H"
+
+#include <chrono>
+
+namespace Foam
+{
+    defineTypeNameAndDebug(IndexKahnDirectSmoother, 0);
+
+    lduMatrix::smoother::addsymMatrixConstructorToTable
+    <
+        IndexKahnDirectSmoother
+    > addIndexKahnDirectSmootherSymMatrixConstructorToTable_;
+
+    lduMatrix::smoother::addasymMatrixConstructorToTable
+    <
+        IndexKahnDirectSmoother
+    > addIndexKahnDirectSmootherAsymMatrixConstructorToTable_;
+}
+
+
+Foam::IndexKahnDirectSmoother::IndexKahnDirectSmoother
+(
+    const word& fieldName,
+    const lduMatrix& matrix,
+    const FieldField<Field, scalar>& interfaceBouCoeffs,
+    const FieldField<Field, scalar>& interfaceIntCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const dictionary& solverControls
+)
+:
+    lduMatrix::smoother
+    (
+        fieldName,
+        matrix,
+        interfaceBouCoeffs,
+        interfaceIntCoeffs,
+        interfaces
+    ),
+    width_(solverControls.getOrDefault<label>("width", 1024)),
+    minCells_(solverControls.getOrDefault<label>("minCells", 10000)),
+    useIndexKahn_(matrix.diag().size() >= minCells_),
+    schedule_(nullptr)
+{
+    const bool debugEnabled = debug || IndexKahnSmoother::debug;
+
+    if (width_ < 1)
+    {
+        FatalIOErrorInFunction(solverControls)
+            << "indexKahnDirect width must be positive, got " << width_
+            << exit(FatalIOError);
+    }
+    if (minCells_ < 0)
+    {
+        FatalIOErrorInFunction(solverControls)
+            << "indexKahnDirect minCells must be non-negative, got "
+            << minCells_ << exit(FatalIOError);
+    }
+
+    const label nCells = matrix_.diag().size();
+    if (!useIndexKahn_)
+    {
+        if (debugEnabled)
+        {
+            Pout<< "IndexKahnDirect GAMG: cells=" << nCells
+                << " minCells=" << minCells_
+                << " action=GaussSeidel" << endl;
+        }
+        return;
+    }
+
+    const IndexKahnScheduleCache& cache =
+        IndexKahnScheduleCache::New(matrix_.mesh());
+    bool scheduleBuilt = false;
+    schedule_ = &cache.getOrCreate(width_, &scheduleBuilt);
+
+    if (debugEnabled)
+    {
+        Pout<< "IndexKahnDirect GAMG: cells=" << nCells
+            << " minCells=" << minCells_
+            << " action=IndexKahnDirect width=" << width_
+            << " schedule=" << (scheduleBuilt ? "build" : "reuse") << endl;
+    }
+
+    if
+    (
+        schedule_->waveCells.size() != std::size_t(nCells)
+     || schedule_->degrees.size() != std::size_t(nCells)
+     || schedule_->incomingDegrees.size() != std::size_t(nCells)
+     || schedule_->cols.size() != schedule_->faceIds.size()
+    )
+    {
+        FatalErrorInFunction
+            << "Index-Kahn direct schedule has inconsistent sizes"
+            << exit(FatalError);
+    }
+}
+
+
+void Foam::IndexKahnDirectSmoother::smoothInternal
+(
+    solveScalarField& psi,
+    const solveScalarField& source,
+    const direction cmpt,
+    const label nSweeps
+) const
+{
+    const bool debugEnabled = debug || IndexKahnSmoother::debug;
+
+    if (!useIndexKahn_)
+    {
+        GaussSeidelSmoother::smooth
+        (
+            fieldName_,
+            psi,
+            matrix_,
+            source,
+            interfaceBouCoeffs_,
+            interfaces_,
+            cmpt,
+            nSweeps
+        );
+        return;
+    }
+
+    const label nCells = psi.size();
+    solveScalarField& bPrime = matrix_.work(nCells);
+    const label* const waveCells = schedule_->waveCells.data();
+    const label* const cols = schedule_->cols.data();
+    const label* const faceIds = schedule_->faceIds.data();
+    const std::uint8_t* const degrees = schedule_->degrees.data();
+    const std::uint8_t* const incomingDegrees =
+        schedule_->incomingDegrees.data();
+    const scalar* const lower = matrix_.lower().begin();
+    const scalar* const upper = matrix_.upper().begin();
+    const scalar* const diag = matrix_.diag().begin();
+    solveScalar* const psiPtr = psi.begin();
+    solveScalar* const bPrimePtr = bPrime.begin();
+    std::chrono::duration<double> kernelTime =
+        std::chrono::duration<double>::zero();
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        bPrime = source;
+
+        // Preserve the reference GaussSeidel coupled-boundary sequence.
+        const label startRequest = UPstream::nRequests();
+        matrix_.initMatrixInterfaces
+        (
+            false,
+            interfaceBouCoeffs_,
+            interfaces_,
+            psi,
+            bPrime,
+            cmpt
+        );
+        matrix_.updateMatrixInterfaces
+        (
+            false,
+            interfaceBouCoeffs_,
+            interfaces_,
+            psi,
+            bPrime,
+            cmpt,
+            startRequest
+        );
+
+        std::chrono::steady_clock::time_point kernelStart;
+        if (debugEnabled) kernelStart = std::chrono::steady_clock::now();
+        label p = 0;
+        for (label row=0; row<nCells; ++row)
+        {
+            const label cell = waveCells[row];
+            solveScalar psii = bPrimePtr[cell];
+            const label split = p + incomingDegrees[row];
+            const label end = p + degrees[row];
+            for (; p<split; ++p)
+            {
+                psii -= lower[faceIds[p]]*psiPtr[cols[p]];
+            }
+            for (; p<end; ++p)
+            {
+                psii -= upper[faceIds[p]]*psiPtr[cols[p]];
+            }
+            psiPtr[cell] = psii/diag[cell];
+        }
+        if (debugEnabled)
+        {
+            kernelTime += std::chrono::steady_clock::now() - kernelStart;
+        }
+    }
+    if (debugEnabled && nSweeps > 0)
+    {
+        const double kernelMs =
+            std::chrono::duration<double, std::milli>(kernelTime).count();
+        Info<< "IndexKahnDirect: sweep kernel field=" << fieldName_
+            << " sweeps=" << nSweeps
+            << " total=" << kernelMs << " ms"
+            << " average=" << kernelMs/nSweeps << " ms/sweep" << endl;
+    }
+}
+
+
+void Foam::IndexKahnDirectSmoother::smooth
+(
+    solveScalarField& psi,
+    const scalarField& source,
+    const direction cmpt,
+    const label nSweeps
+) const
+{
+    ConstPrecisionAdaptor<solveScalar, scalar> tsource(source);
+    smoothInternal(psi, tsource(), cmpt, nSweeps);
+}
+
+
+void Foam::IndexKahnDirectSmoother::scalarSmooth
+(
+    solveScalarField& psi,
+    const solveScalarField& source,
+    const direction cmpt,
+    const label nSweeps
+) const
+{
+    smoothInternal(psi, source, cmpt, nSweeps);
+}

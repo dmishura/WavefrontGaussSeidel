@@ -30,7 +30,10 @@ SMOOTHER_OBJECTS := build/src/GaussSeidelSmoother.o \
 READER_OBJECTS := build/tests/Test-PolyMeshReader.o $(COMMON_OBJECTS)
 OBJECTS := $(sort $(SMOOTHER_OBJECTS) $(READER_OBJECTS))
 
-.PHONY: all test test-reader test-smoother run clean sync
+CMAKE_BUILD_DIR ?= build-cmake
+
+.PHONY: all test test-reader test-smoother run clean sync cmake-configure \
+	modern test-modern benchmark-smoke
 
 all: $(READER_TARGET) $(SMOOTHER_TARGET)
 
@@ -41,6 +44,18 @@ test-reader: $(READER_TARGET) $(MESH_STAMP)
 
 test-smoother run: $(SMOOTHER_TARGET) $(MESH_STAMP)
 	./$(SMOOTHER_TARGET) $(MESH_DIR) --history-sweeps $(HISTORY_SWEEPS)
+
+cmake-configure:
+	cmake -S . -B $(CMAKE_BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+modern: cmake-configure
+	cmake --build $(CMAKE_BUILD_DIR) -j
+
+test-modern: modern
+	ctest --test-dir $(CMAKE_BUILD_DIR) -L correctness --output-on-failure
+
+benchmark-smoke: modern
+	ctest --test-dir $(CMAKE_BUILD_DIR) -L benchmark --output-on-failure
 
 $(SMOOTHER_TARGET): $(SMOOTHER_OBJECTS)
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@

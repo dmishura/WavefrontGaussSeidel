@@ -2420,7 +2420,8 @@ int runHpcIndexSeries
 (
     const std::string& meshDirectory,
     const bool smallWidths,
-    const bool validationOnly
+    const bool validationOnly,
+    const bool allMeshWidths
 )
 {
     const int threads = omp_get_max_threads();
@@ -2439,10 +2440,16 @@ int runHpcIndexSeries
     const scalarField source = multiply(matrix, exact);
     FieldField<Field, scalar> interfaceCoeffs(0);
     lduInterfaceFieldPtrsList interfaces(0);
-    const std::array<label, 3> widths = smallWidths
+    const std::array<label, 3> widths = allMeshWidths
+        ? std::array<label, 3>{{1024, 2048, 4096}}
+        : smallWidths
         ? std::array<label, 3>{{512, 1024, 2048}}
         : std::array<label, 3>{{1024, 2048, 8192}};
-    const std::size_t scheduleCount = smallWidths ? 4 : 7;
+    const bool includeGeometry = !allMeshWidths;
+    const std::size_t firstIndexSchedule = includeGeometry ? 1 : 0;
+    const std::size_t scheduleCount = allMeshWidths
+        ? widths.size()
+        : smallWidths ? 4 : 7;
     // Allocate all elements before compact schedules retain pointers to packed.
     std::vector<WavefrontStatistics> statistics(scheduleCount);
     std::vector<WavefrontSchedule> packed(scheduleCount);
@@ -2450,12 +2457,19 @@ int runHpcIndexSeries
     std::vector<BlockedRowDegreeSchedule> blocked(scheduleCount);
     std::vector<int> detectedThreads(scheduleCount, 1);
     std::vector<std::string> names(scheduleCount);
-    names[0] = "Geometry-X row-degree 2048";
-    statistics[0] = constructWidthConstrainedGeometryWavefronts(mesh, 256, 2048);
-    for (std::size_t i=1; i<packed.size(); ++i)
+    if (includeGeometry)
     {
-        const bool window = i > widths.size();
-        const label width = widths[(i - 1)%widths.size()];
+        names[0] = "Geometry-X row-degree 2048";
+        statistics[0] = constructWidthConstrainedGeometryWavefronts
+        (
+            mesh, 256, 2048
+        );
+    }
+    for (std::size_t i=firstIndexSchedule; i<packed.size(); ++i)
+    {
+        const std::size_t widthIndex = i - firstIndexSchedule;
+        const bool window = !allMeshWidths && widthIndex >= widths.size();
+        const label width = widths[widthIndex%widths.size()];
         names[i] = std::string(window ? "Index-window Kahn " : "Index-Kahn ")
             + std::to_string(width);
         statistics[i] = constructIndexWavefronts(mesh, matrix, width, window);
@@ -2607,8 +2621,8 @@ int runHpcIndexSeries
     {
         printTiming(variants[i].name.c_str(), timings[i]);
         std::cout << "speedupRef=" << timings[0].medianSeconds/timings[i].medianSeconds
-            << " speedupGeometry=" << timings[1].medianSeconds/timings[i].medianSeconds
-            << '\n';
+            << (allMeshWidths ? " speedupIndex1024=" : " speedupGeometry=")
+            << timings[1].medianSeconds/timings[i].medianSeconds << '\n';
     }
     std::cout << "PASS\n";
     return 0;
@@ -3121,6 +3135,12 @@ int runTest
         "psi", psiReference, matrix, source,
         interfaceCoeffs, interfaces, 0, 1
     );
+    scalarField psiTwoForwardSweeps = initialPsi;
+    GaussSeidelSmoother::smooth
+    (
+        "psi", psiTwoForwardSweeps, matrix, source,
+        interfaceCoeffs, interfaces, 0, 2
+    );
     scalarField psiSymmetricReference = initialPsi;
     symGaussSeidelSmoother::smooth
     (
@@ -3285,8 +3305,14 @@ int runTest
         relativeResidual(matrix, psiReference, source);
     const scalar referenceInitialResidual =
         relativeResidual(matrix, initialPsi, source);
+    const scalar twoForwardSweepsResidual =
+        relativeResidual(matrix, psiTwoForwardSweeps, source);
     const scalar symmetricOneSweepResidual =
         relativeResidual(matrix, psiSymmetricReference, source);
+    const scalar twoForwardSweepsMaxError =
+        maxAbsDifference(psiTwoForwardSweeps, exact);
+    const scalar symmetricOneSweepMaxError =
+        maxAbsDifference(psiSymmetricReference, exact);
     const scalar serialGatherResidual =
         relativeResidual(matrix, psiSerialGather, source);
     const scalar interleavedRowsResidual =
@@ -3511,6 +3537,20 @@ int runTest
         << "\nper-level OMP equivalence:       " << status(perLevelMaxAbs)
         << "\npersistent OMP equivalence:      " << status(persistentMaxAbs)
         << "\nequivalence tolerance:           " << equivalenceTolerance
+        << "\n\n";
+    std::cout << "Two-pass quality comparison:"
+        << "\n  two forward GS sweeps residual: "
+        << twoForwardSweepsResidual
+        << "\n  one symmetric GS sweep residual: "
+        << symmetricOneSweepResidual
+        << "\n  two forward GS sweeps max error: "
+        << twoForwardSweepsMaxError
+        << "\n  one symmetric GS sweep max error: "
+        << symmetricOneSweepMaxError
+        << "\n  residual ratio symmetric/two-forward: "
+        << symmetricOneSweepResidual/twoForwardSweepsResidual
+        << "\n  max-error ratio symmetric/two-forward: "
+        << symmetricOneSweepMaxError/twoForwardSweepsMaxError
         << "\n\n";
     if
     (
@@ -3870,6 +3910,41 @@ int runTest
             );
         }
     );
+
+    constexpr std::uint32_t twoPassComparisonSeed = 0x2F0B4C4Bu;
+    const std::vector<RandomizedBenchmarkVariant> twoPassVariants
+    {
+        {
+            "Two forward GS sweeps",
+            [&](scalarField& timedPsi, const label comparisons)
+            {
+                GaussSeidelSmoother::smooth
+                (
+                    "psi", timedPsi, matrix, source,
+                    interfaceCoeffs, interfaces, 0, 2*comparisons
+                );
+            }
+        },
+        {
+            "One symmetric GS sweep",
+            [&](scalarField& timedPsi, const label comparisons)
+            {
+                symGaussSeidelSmoother::smooth
+                (
+                    "psi", timedPsi, matrix, source,
+                    interfaceCoeffs, interfaces, 0, comparisons
+                );
+            }
+        }
+    };
+    const std::vector<ImplementationTiming> twoPassTimings =
+        timeRandomizedImplementations
+        (
+            initialPsi, mesh.nCells, timingSamples, timingSweepsPerSample,
+            warmupSweeps, twoPassComparisonSeed, twoPassVariants
+        );
+    const ImplementationTiming& twoForwardSweepsTiming = twoPassTimings[0];
+    const ImplementationTiming& oneSymmetricSweepTiming = twoPassTimings[1];
 
     constexpr label productionSweepsPerCall = 3;
     constexpr label productionCallsPerSample = 100;
@@ -4373,6 +4448,26 @@ int runTest
     printTiming("Wavefront per-level OpenMP", perLevelTiming);
     printTiming("Wavefront persistent OpenMP", persistentTiming);
 
+    std::cout << "\nTwo-pass randomized timing comparison:"
+        << "\n  samples: " << timingSamples
+        << "\n  comparisons/sample: " << timingSweepsPerSample
+        << "\n  seed: " << twoPassComparisonSeed
+        << "\nvariant                  median(ms)  ns/cell  CV(%)"
+        << "\ntwo forward GS sweeps    "
+        << 1e3*twoForwardSweepsTiming.medianSeconds << "  "
+        << twoForwardSweepsTiming.medianNsPerCellSweep << "  "
+        << twoForwardSweepsTiming.cvPercent
+        << "\none symmetric GS sweep  "
+        << 1e3*oneSymmetricSweepTiming.medianSeconds << "  "
+        << oneSymmetricSweepTiming.medianNsPerCellSweep << "  "
+        << oneSymmetricSweepTiming.cvPercent
+        << "\n  time ratio symmetric/two-forward: "
+        << oneSymmetricSweepTiming.medianSeconds
+          /twoForwardSweepsTiming.medianSeconds
+        << "\n  symmetric speedup vs two-forward: "
+        << twoForwardSweepsTiming.medianSeconds
+          /oneSymmetricSweepTiming.medianSeconds << "x\n";
+
     const scalar productionInterleavedSpeedupPacked =
         productionPackedTiming.medianSeconds
        /productionInterleavedTiming.medianSeconds;
@@ -4608,6 +4703,7 @@ int main(int argc, char** argv)
         "[--hpc-geometry-kernels] [--hpc-row-degree] "
         "[--hpc-blocked-row-degree] [--hpc-index-series] "
         "[--hpc-index-small-series] [--hpc-direct-coeff-series] "
+        "[--all-mesh-index-series] "
         "[--index-validation-only] "
         "[--profile-variant NAME]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
@@ -4632,6 +4728,7 @@ int main(int argc, char** argv)
         bool hpcRowDegree = false;
         bool hpcIndexSeries = false;
         bool hpcIndexSmallSeries = false;
+        bool allMeshIndexSeries = false;
         bool hpcDirectCoeffSeries = false;
         bool indexValidationOnly = false;
         bool hpcBlockedRowDegree = false;
@@ -4684,6 +4781,11 @@ int main(int argc, char** argv)
                 hpcIndexSmallSeries = true;
                 continue;
             }
+            if (option == "--all-mesh-index-series")
+            {
+                allMeshIndexSeries = true;
+                continue;
+            }
             if (option == "--hpc-direct-coeff-series")
             {
                 hpcDirectCoeffSeries = true;
@@ -4727,9 +4829,20 @@ int main(int argc, char** argv)
         if (hpcHybridSeries) return runHpcHybridSeries(argv[1]);
         if (hpcGeometryKernels) return runHpcGeometryKernelSeries(argv[1]);
         if (hpcIndexSmallSeries)
-            return runHpcIndexSeries(argv[1], true, indexValidationOnly);
+            return runHpcIndexSeries
+            (
+                argv[1], true, indexValidationOnly, false
+            );
         if (hpcIndexSeries)
-            return runHpcIndexSeries(argv[1], false, indexValidationOnly);
+            return runHpcIndexSeries
+            (
+                argv[1], false, indexValidationOnly, false
+            );
+        if (allMeshIndexSeries)
+            return runHpcIndexSeries
+            (
+                argv[1], false, indexValidationOnly, true
+            );
         if (indexValidationOnly)
             throw std::runtime_error
             (

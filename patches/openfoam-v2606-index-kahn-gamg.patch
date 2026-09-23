@@ -1,28 +1,31 @@
 diff --git a/src/OpenFOAM/meshes/lduMesh/lduPrimitiveMesh.H b/src/OpenFOAM/meshes/lduMesh/lduPrimitiveMesh.H
+index a44ecca..6c1fc82 100644
 --- a/src/OpenFOAM/meshes/lduMesh/lduPrimitiveMesh.H
 +++ b/src/OpenFOAM/meshes/lduMesh/lduPrimitiveMesh.H
-@@ -39,4 +39,7 @@
+@@ -41,6 +41,9 @@ SourceFiles
  #include "lduMesh.H"
  #include "labelList.H"
- 
+
 +#include <memory>
 +#include <utility>
 +
  // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
-@@ -75,5 +78,8 @@
+
+ namespace Foam
+@@ -76,6 +79,9 @@ class lduPrimitiveMesh
          //- Communicator to use for any parallel communication
          const label comm_;
- 
+
 +        //- Opaque Index-Kahn topology cache; owned by this coarse mesh.
 +        mutable std::shared_ptr<void> indexKahnScheduleCachePtr_;
 +
- 
+
      // Private Member Functions
-@@ -207,6 +214,19 @@
-             {
+
+@@ -207,6 +213,19 @@ public:
                  return *this;
              }
- 
+
 +            const std::shared_ptr<void>& indexKahnScheduleCache() const noexcept
 +            {
 +                return indexKahnScheduleCachePtr_;
@@ -38,78 +41,26 @@ diff --git a/src/OpenFOAM/meshes/lduMesh/lduPrimitiveMesh.H b/src/OpenFOAM/meshe
 +
              //- Return a list of pointers for each patch
              //- with only those pointing to interfaces being set
-diff --git a/src/indexKahnSmoother/IndexKahnScheduleCache.H b/src/indexKahnSmoother/IndexKahnScheduleCache.H
-index a3536bc..c4818c2 100644
---- a/src/indexKahnSmoother/IndexKahnScheduleCache.H
-+++ b/src/indexKahnSmoother/IndexKahnScheduleCache.H
-@@ -1,8 +1,8 @@
- #ifndef Foam_IndexKahnScheduleCache_H
- #define Foam_IndexKahnScheduleCache_H
- 
--#include "MeshObject.H"
--#include "fvMesh.H"
-+#include "lduAddressing.H"
-+#include "typeInfo.H"
- 
- #include <cstdint>
- #include <map>
-@@ -12,6 +12,8 @@
- namespace Foam
- {
- 
-+class lduMesh;
-+
- // Contains topology and addressing only. No matrix coefficient or field data.
- struct IndexKahnSchedule
- {
-@@ -26,14 +28,9 @@ struct IndexKahnSchedule
- 
- 
- class IndexKahnScheduleCache
--:
--    public MeshObject
--    <
--        fvMesh,
--        TopologicalMeshObject,
--        IndexKahnScheduleCache
--    >
- {
-+    const lduAddressing& addressing_;
-+
-     // Extend this key when another parameter changes schedule generation.
-     struct ScheduleKey
-     {
-@@ -51,7 +48,10 @@ public:
- 
-     TypeName("IndexKahnScheduleCache");
- 
--    explicit IndexKahnScheduleCache(const fvMesh& mesh);
-+    explicit IndexKahnScheduleCache(const lduAddressing& addressing);
-+
-+    // Fine fvMesh and coarse lduPrimitiveMesh own their respective caches.
-+    static const IndexKahnScheduleCache& New(const lduMesh& mesh);
- 
-     const IndexKahnSchedule& getOrCreate(label width) const;
- };
+             virtual lduInterfacePtrsList interfaces() const
 diff --git a/src/indexKahnSmoother/IndexKahnScheduleCache.C b/src/indexKahnSmoother/IndexKahnScheduleCache.C
-index f840126..6061832 100644
+index f840126..e76dcb9 100644
 --- a/src/indexKahnSmoother/IndexKahnScheduleCache.C
 +++ b/src/indexKahnSmoother/IndexKahnScheduleCache.C
 @@ -1,7 +1,10 @@
  #include "IndexKahnScheduleCache.H"
- 
+
  #include "IOstreams.H"
 +#include "MeshObject.H"
 +#include "fvMesh.H"
  #include "lduAddressing.H"
 +#include "lduPrimitiveMesh.H"
  #include "error.H"
- 
+
  #include <algorithm>
-@@ -191,12 +194,71 @@ std::unique_ptr<Foam::IndexKahnSchedule> buildIndexKahnSchedule
+@@ -191,15 +194,75 @@ std::unique_ptr<Foam::IndexKahnSchedule> buildIndexKahnSchedule
  } // namespace Foam
- 
- 
+
+
 -Foam::IndexKahnScheduleCache::IndexKahnScheduleCache(const fvMesh& mesh)
 +Foam::IndexKahnScheduleCache::IndexKahnScheduleCache
 +(
@@ -119,8 +70,8 @@ index f840126..6061832 100644
 -    MeshObject<fvMesh, TopologicalMeshObject, IndexKahnScheduleCache>(mesh)
 +    addressing_(addressing)
  {}
- 
- 
+
+
 +namespace Foam
 +{
 +
@@ -179,9 +130,17 @@ index f840126..6061832 100644
 +
  const Foam::IndexKahnSchedule& Foam::IndexKahnScheduleCache::getOrCreate
  (
-     const label width
-@@ -215,7 +277,7 @@ const Foam::IndexKahnSchedule& Foam::IndexKahnScheduleCache::getOrCreate
+-    const label width
++    const label width,
++    bool* const scheduleBuilt
+ ) const
+ {
+     if (width < 1)
+@@ -213,9 +276,10 @@ const Foam::IndexKahnSchedule& Foam::IndexKahnScheduleCache::getOrCreate
+     const auto found = schedules_.find(key);
+     if (found != schedules_.end())
      {
++        if (scheduleBuilt) *scheduleBuilt = false;
          if (debug)
          {
 -            Info.masterStream(mesh().comm())
@@ -189,8 +148,8 @@ index f840126..6061832 100644
                  << "IndexKahn: reusing schedule width=" << width
                  << " cells=" << found->second->waveCells.size() << endl;
          }
-@@ -224,11 +286,11 @@ const Foam::IndexKahnSchedule& Foam::IndexKahnScheduleCache::getOrCreate
- 
+@@ -224,11 +288,12 @@ const Foam::IndexKahnSchedule& Foam::IndexKahnScheduleCache::getOrCreate
+
      if (debug)
      {
 -        Info.masterStream(mesh().comm())
@@ -201,28 +160,172 @@ index f840126..6061832 100644
      }
 -    auto schedule = buildIndexKahnSchedule(mesh().lduAddr(), width);
 +    auto schedule = buildIndexKahnSchedule(addressing_, width);
++    if (scheduleBuilt) *scheduleBuilt = true;
      const IndexKahnSchedule& result = *schedule;
      schedules_.emplace(key, std::move(schedule));
      return result;
+diff --git a/src/indexKahnSmoother/IndexKahnScheduleCache.H b/src/indexKahnSmoother/IndexKahnScheduleCache.H
+index a3536bc..ce49c56 100644
+--- a/src/indexKahnSmoother/IndexKahnScheduleCache.H
++++ b/src/indexKahnSmoother/IndexKahnScheduleCache.H
+@@ -1,8 +1,8 @@
+ #ifndef Foam_IndexKahnScheduleCache_H
+ #define Foam_IndexKahnScheduleCache_H
+
+-#include "MeshObject.H"
+-#include "fvMesh.H"
++#include "lduAddressing.H"
++#include "typeInfo.H"
+
+ #include <cstdint>
+ #include <map>
+@@ -12,6 +12,8 @@
+ namespace Foam
+ {
+
++class lduMesh;
++
+ // Contains topology and addressing only. No matrix coefficient or field data.
+ struct IndexKahnSchedule
+ {
+@@ -26,14 +28,9 @@ struct IndexKahnSchedule
+
+
+ class IndexKahnScheduleCache
+-:
+-    public MeshObject
+-    <
+-        fvMesh,
+-        TopologicalMeshObject,
+-        IndexKahnScheduleCache
+-    >
+ {
++    const lduAddressing& addressing_;
++
+     // Extend this key when another parameter changes schedule generation.
+     struct ScheduleKey
+     {
+@@ -51,9 +48,18 @@ public:
+
+     TypeName("IndexKahnScheduleCache");
+
+-    explicit IndexKahnScheduleCache(const fvMesh& mesh);
++    explicit IndexKahnScheduleCache(const lduAddressing& addressing);
++
++    // Fine fvMesh and coarse lduPrimitiveMesh own their respective caches.
++    static const IndexKahnScheduleCache& New(const lduMesh& mesh);
++
++    const IndexKahnSchedule& getOrCreate
++    (
++        label width,
++        bool* scheduleBuilt = nullptr
++    ) const;
+
+-    const IndexKahnSchedule& getOrCreate(label width) const;
++    virtual ~IndexKahnScheduleCache() = default;
+ };
+
+ } // namespace Foam
 diff --git a/src/indexKahnSmoother/IndexKahnSmoother.C b/src/indexKahnSmoother/IndexKahnSmoother.C
-index ddea096..1777fe2 100644
+index ddea096..8b7698e 100644
 --- a/src/indexKahnSmoother/IndexKahnSmoother.C
 +++ b/src/indexKahnSmoother/IndexKahnSmoother.C
-@@ -49,15 +49,8 @@ Foam::IndexKahnSmoother::IndexKahnSmoother
+@@ -1,6 +1,7 @@
+ #include "IndexKahnSmoother.H"
+ #include "IndexKahnScheduleCache.H"
+
++#include "GaussSeidelSmoother.H"
+ #include "PrecisionAdaptor.H"
+ #include "UPstream.H"
+ #include "IOstreams.H"
+@@ -40,6 +41,8 @@ Foam::IndexKahnSmoother::IndexKahnSmoother
+         interfaces
+     ),
+     width_(solverControls.getOrDefault<label>("width", 1024)),
++    minCells_(solverControls.getOrDefault<label>("minCells", 10000)),
++    useIndexKahn_(matrix.diag().size() >= minCells_),
+     schedule_(nullptr)
+ {
+     if (width_ < 1)
+@@ -48,17 +51,37 @@ Foam::IndexKahnSmoother::IndexKahnSmoother
+             << "indexKahn width must be positive, got " << width_
              << exit(FatalIOError);
      }
- 
++    if (minCells_ < 0)
++    {
++        FatalIOErrorInFunction(solverControls)
++            << "indexKahn minCells must be non-negative, got " << minCells_
++            << exit(FatalIOError);
++    }
+
 -    const fvMesh* fvmesh = isA<fvMesh>(matrix_.mesh());
 -    if (!fvmesh)
--    {
++    const label nCells = matrix_.diag().size();
++    if (!useIndexKahn_)
+     {
 -        FatalErrorInFunction
 -            << "indexKahn currently requires an fvMesh-backed matrix; "
 -            << "keep GaussSeidel for GAMG coarse levels"
 -            << exit(FatalError);
--    }
--    const IndexKahnScheduleCache& cache = IndexKahnScheduleCache::New(*fvmesh);
++        if (debug)
++        {
++            Pout<< "IndexKahn GAMG: cells=" << nCells
++                << " minCells=" << minCells_
++                << " action=GaussSeidel" << endl;
++        }
++        return;
++    }
++
 +    const IndexKahnScheduleCache& cache =
 +        IndexKahnScheduleCache::New(matrix_.mesh());
-     schedule_ = &cache.getOrCreate(width_);
- 
++    bool scheduleBuilt = false;
++    schedule_ = &cache.getOrCreate(width_, &scheduleBuilt);
++
++    if (debug)
++    {
++        Pout<< "IndexKahn GAMG: cells=" << nCells
++            << " minCells=" << minCells_
++            << " action=IndexKahn width=" << width_
++            << " schedule=" << (scheduleBuilt ? "build" : "reuse") << endl;
+     }
+-    const IndexKahnScheduleCache& cache = IndexKahnScheduleCache::New(*fvmesh);
+-    schedule_ = &cache.getOrCreate(width_);
+
      if (schedule_->waveCells.size() != std::size_t(matrix_.diag().size()))
+     {
+@@ -108,6 +131,22 @@ void Foam::IndexKahnSmoother::smoothInternal
+     const label nSweeps
+ ) const
+ {
++    if (!useIndexKahn_)
++    {
++        GaussSeidelSmoother::smooth
++        (
++            fieldName_,
++            psi,
++            matrix_,
++            source,
++            interfaceBouCoeffs_,
++            interfaces_,
++            cmpt,
++            nSweeps
++        );
++        return;
++    }
++
+     const label nCells = psi.size();
+     solveScalarField& bPrime = matrix_.work(nCells);
+     const label* const waveCells = schedule_->waveCells.data();
+diff --git a/src/indexKahnSmoother/IndexKahnSmoother.H b/src/indexKahnSmoother/IndexKahnSmoother.H
+index 14322da..b63def4 100644
+--- a/src/indexKahnSmoother/IndexKahnSmoother.H
++++ b/src/indexKahnSmoother/IndexKahnSmoother.H
+@@ -13,6 +13,8 @@ class IndexKahnSmoother
+     public lduMatrix::smoother
+ {
+     label width_;
++    label minCells_;
++    bool useIndexKahn_;
+     const IndexKahnSchedule* schedule_;
+
+     // Current-matrix values only. These are rebuilt with each smoother

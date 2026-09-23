@@ -1,0 +1,5 @@
+IndexKahnScheduleCache.C
+IndexKahnSmoother.C
+IndexKahnDirectSmoother.C
+
+LIB = $(FOAM_USER_LIBBIN)/libIndexKahnSmoother

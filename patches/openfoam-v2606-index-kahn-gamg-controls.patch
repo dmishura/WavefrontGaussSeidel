@@ -1,0 +1,163 @@
+diff --git a/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrix.H b/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrix.H
+index 4017908..d9d2443 100644
+--- a/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrix.H
++++ b/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrix.H
+@@ -444,6 +444,18 @@ public:
+                 const dictionary& solverControls
+             );
+ 
++            //- Return a named smoother with its exact controls dictionary
++            static autoPtr<smoother> New
++            (
++                const word& smootherName,
++                const word& fieldName,
++                const lduMatrix& matrix,
++                const FieldField<Field, scalar>& interfaceBouCoeffs,
++                const FieldField<Field, scalar>& interfaceIntCoeffs,
++                const lduInterfaceFieldPtrsList& interfaces,
++                const dictionary& smootherControls
++            );
++
+ 
+         //- Destructor
+         virtual ~smoother() = default;
+diff --git a/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSmoother.C b/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSmoother.C
+index c5d90df..33d0ad5 100644
+--- a/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSmoother.C
++++ b/src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSmoother.C
+@@ -309,6 +309,31 @@ Foam::autoPtr<Foam::lduMatrix::smoother> Foam::lduMatrix::smoother::New
+ 
+     const dictionary& controls = e.isDict() ? e.dict() : dictionary::null;
+ 
++    return New
++    (
++        name,
++        fieldName,
++        matrix,
++        interfaceBouCoeffs,
++        interfaceIntCoeffs,
++        interfaces,
++        controls
++    );
++}
++
++
++Foam::autoPtr<Foam::lduMatrix::smoother> Foam::lduMatrix::smoother::New
++(
++    const word& name,
++    const word& fieldName,
++    const lduMatrix& matrix,
++    const FieldField<Field, scalar>& interfaceBouCoeffs,
++    const FieldField<Field, scalar>& interfaceIntCoeffs,
++    const lduInterfaceFieldPtrsList& interfaces,
++    const dictionary& smootherControls
++)
++{
++
+     gsCallCounters::noteSmootherNew();
+ 
+     if (matrix.symmetric())
+@@ -319,7 +344,7 @@ Foam::autoPtr<Foam::lduMatrix::smoother> Foam::lduMatrix::smoother::New
+         {
+             FatalIOErrorInLookup
+             (
+-                solverControls,
++                smootherControls,
+                 "symmetric matrix smoother",
+                 name,
+                 *symMatrixConstructorTablePtr_
+@@ -335,7 +360,7 @@ Foam::autoPtr<Foam::lduMatrix::smoother> Foam::lduMatrix::smoother::New
+                 interfaceBouCoeffs,
+                 interfaceIntCoeffs,
+                 interfaces,
+-                controls
++                smootherControls
+             )
+         );
+     }
+@@ -347,7 +372,7 @@ Foam::autoPtr<Foam::lduMatrix::smoother> Foam::lduMatrix::smoother::New
+         {
+             FatalIOErrorInLookup
+             (
+-                solverControls,
++                smootherControls,
+                 "asymmetric matrix smoother",
+                 name,
+                 *asymMatrixConstructorTablePtr_
+@@ -363,12 +388,12 @@ Foam::autoPtr<Foam::lduMatrix::smoother> Foam::lduMatrix::smoother::New
+                 interfaceBouCoeffs,
+                 interfaceIntCoeffs,
+                 interfaces,
+-                controls
++                smootherControls
+             )
+         );
+     }
+ 
+-    FatalIOErrorInFunction(solverControls)
++    FatalIOErrorInFunction(smootherControls)
+         << "cannot solve incomplete matrix, "
+         "no diagonal or off-diagonal coefficient"
+         << exit(FatalIOError);
+diff --git a/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolverSolve.C b/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolverSolve.C
+index 86b65f9..1bb44a7 100644
+--- a/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolverSolve.C
++++ b/src/OpenFOAM/matrices/lduMatrix/solvers/GAMG/GAMGSolverSolve.C
+@@ -565,18 +565,27 @@ void Foam::GAMGSolver::initVcycle
+     coarseSources.setSize(matrixLevels_.size());
+     smoothers.setSize(matrixLevels_.size() + 1);
+ 
++    const word smootherName = lduMatrix::smoother::getName(controlDict_);
++    const entry& smootherEntry =
++        controlDict_.lookupEntry("smoother", keyType::LITERAL);
++    const dictionary& smootherControls =
++        smootherEntry.isDict()
++      ? smootherEntry.dict()
++      : dictionary::null;
++
+     // Create the smoother for the finest level
+     smoothers.set
+     (
+         0,
+         lduMatrix::smoother::New
+         (
++            smootherName,
+             fieldName_,
+             matrix_,
+             interfaceBouCoeffs_,
+             interfaceIntCoeffs_,
+             interfaces_,
+-            controlDict_
++            smootherControls
+         )
+     );
+ 
+@@ -604,12 +613,13 @@ void Foam::GAMGSolver::initVcycle
+                 leveli + 1,
+                 lduMatrix::smoother::New
+                 (
++                    smootherName,
+                     fieldName_,
+                     matrixLevels_[leveli],
+                     interfaceLevelsBouCoeffs_[leveli],
+                     interfaceLevelsIntCoeffs_[leveli],
+                     interfaceLevels_[leveli],
+-                    controlDict_
++                    smootherControls
+                 )
+             );
+         }
+diff --git a/src/indexKahnSmoother/IndexKahnSmoother.C b/src/indexKahnSmoother/IndexKahnSmoother.C
+index 8b7698e..7f3d3b8 100644
+--- a/src/indexKahnSmoother/IndexKahnSmoother.C
++++ b/src/indexKahnSmoother/IndexKahnSmoother.C
+@@ -45,6 +45,9 @@ Foam::IndexKahnSmoother::IndexKahnSmoother
+     useIndexKahn_(matrix.diag().size() >= minCells_),
+     schedule_(nullptr)
+ {
++    Pout<< "IndexKahnSmoother controls: width=" << width_
++        << " minCells=" << minCells_ << endl;
++
+     if (width_ < 1)
+     {
+         FatalIOErrorInFunction(solverControls)
