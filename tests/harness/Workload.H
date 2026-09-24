@@ -28,6 +28,7 @@ struct Workload
     Foam::FieldField<Foam::Field, Foam::scalar> interfaceCoeffs;
     Foam::lduInterfaceFieldPtrsList interfaces;
 
+    LexicographicPackedSchedule lexicographicPacked;
     WavefrontStatistics minimalStatistics;
     WavefrontSchedule packed;
     WavefrontSchedule locality;
@@ -58,6 +59,7 @@ struct Workload
     std::map<Foam::label, WavefrontSchedule> indexWindowSchedules;
     std::map<Foam::label, RowDegreeSchedule> indexWindowRowDegrees;
 
+    Foam::scalar lexicographicPackedPreprocessingSeconds = 0;
     Foam::scalar preprocessingSeconds = 0;
     bool dependenciesValid = false;
 

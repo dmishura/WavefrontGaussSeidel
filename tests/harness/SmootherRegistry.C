@@ -92,6 +92,20 @@ SmootherRegistry createSmootherRegistry(Workload& workload)
     });
     registry.add
     ({
+        "Packed Reference GS", "PackedReferenceGS",
+        [&](Foam::scalarField& psi, const Foam::label nSweeps)
+        {
+            serialLexicographicPackedSmooth
+            (
+                psi, source, workload.lexicographicPacked, nSweeps
+            );
+        },
+        CorrectnessPolicy::ExactReference, 0,
+        true, true, 3, false,
+        VariantTier::Core, {"reference", "packed", "lexicographic", "sequential"}
+    });
+    registry.add
+    ({
         "Reference symmetric GS", "SymmetricGS",
         [&](Foam::scalarField& psi, const Foam::label nSweeps)
         {

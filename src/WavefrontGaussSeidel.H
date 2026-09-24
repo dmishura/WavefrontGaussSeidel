@@ -9,6 +9,21 @@
 namespace smootherTest
 {
 
+// Packed gather rows in the original lexicographic cell order. Unlike the
+// wavefront schedules, row i always represents original cell i.
+struct LexicographicPackedSchedule
+{
+    std::vector<Foam::label> rowStarts;
+    std::vector<Foam::label> cols;
+    std::vector<Foam::scalar> coeffs;
+    std::vector<Foam::scalar> diag;
+};
+
+LexicographicPackedSchedule makeLexicographicPackedSchedule
+(
+    const Foam::lduMatrix& matrix
+);
+
 struct WavefrontSchedule
 {
     std::vector<Foam::label> levelStarts;
@@ -87,6 +102,14 @@ struct PackedUint24Schedule
     std::vector<std::uint8_t> cols;
     std::vector<Foam::scalar> coeffs, diag;
 };
+
+void serialLexicographicPackedSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const LexicographicPackedSchedule& schedule,
+    Foam::label nSweeps
+);
 
 void serialGatherSmooth
 (

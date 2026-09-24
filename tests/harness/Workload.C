@@ -62,6 +62,16 @@ std::unique_ptr<Workload> createMeshWorkload
     workload->initialPsi = Foam::scalarField(workload->mesh.nCells, 0.0);
 
     const auto begin = std::chrono::steady_clock::now();
+    const auto lexicographicPackedBegin = std::chrono::steady_clock::now();
+    workload->lexicographicPacked = makeLexicographicPackedSchedule
+    (
+        *workload->matrix
+    );
+    workload->lexicographicPackedPreprocessingSeconds =
+        std::chrono::duration<Foam::scalar>
+        (
+            std::chrono::steady_clock::now() - lexicographicPackedBegin
+        ).count();
     workload->minimalStatistics = constructMinimalWavefronts(workload->mesh);
     workload->packed = makeWavefrontSchedule
     (

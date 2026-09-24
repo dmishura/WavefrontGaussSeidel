@@ -2,12 +2,93 @@
 
 #include <limits>
 #include <omp.h>
+#include <stdexcept>
 
 namespace smootherTest
 {
 
 using Foam::label;
 using Foam::scalar;
+
+LexicographicPackedSchedule makeLexicographicPackedSchedule
+(
+    const Foam::lduMatrix& matrix
+)
+{
+    LexicographicPackedSchedule schedule;
+    const auto& ownerStarts = matrix.lduAddr().ownerStartAddr();
+    const auto& neighbours = matrix.lduAddr().upperAddr();
+    const label nCells = static_cast<label>(matrix.diag().size());
+    const label nFaces = static_cast<label>(matrix.upper().size());
+
+    std::vector<label> incomingCounts(nCells, 0);
+    for (label face=0; face<nFaces; ++face) ++incomingCounts[neighbours[face]];
+
+    schedule.rowStarts.resize(nCells + 1, 0);
+    for (label cell=0; cell<nCells; ++cell)
+    {
+        schedule.rowStarts[cell + 1] = schedule.rowStarts[cell]
+            + incomingCounts[cell]
+            + ownerStarts[cell + 1] - ownerStarts[cell];
+    }
+    schedule.cols.resize(2*static_cast<std::size_t>(nFaces));
+    schedule.coeffs.resize(schedule.cols.size());
+    schedule.diag.assign(matrix.diag().begin(), matrix.diag().end());
+
+    std::vector<label> incomingCursor(schedule.rowStarts.begin(), schedule.rowStarts.end());
+    for (label owner=0; owner<nCells; ++owner)
+    {
+        label outgoing = schedule.rowStarts[owner] + incomingCounts[owner];
+        for (label face=ownerStarts[owner]; face<ownerStarts[owner + 1]; ++face)
+        {
+            const label neighbour = neighbours[face];
+            const label incoming = incomingCursor[neighbour]++;
+            schedule.cols[incoming] = owner;
+            schedule.coeffs[incoming] = matrix.lower()[face];
+            schedule.cols[outgoing] = neighbour;
+            schedule.coeffs[outgoing] = matrix.upper()[face];
+            ++outgoing;
+        }
+    }
+
+    if
+    (
+        schedule.rowStarts.back() != 2*nFaces
+     || schedule.cols.size() != 2*static_cast<std::size_t>(nFaces)
+     || schedule.coeffs.size() != schedule.cols.size()
+     || schedule.diag.size() != static_cast<std::size_t>(nCells)
+    ) throw std::runtime_error("invalid lexicographic packed schedule");
+
+    return schedule;
+}
+
+void serialLexicographicPackedSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const LexicographicPackedSchedule& schedule,
+    const label nSweeps
+)
+{
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const label nCells = static_cast<label>(schedule.diag.size());
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (label cell=0; cell<nCells; ++cell)
+        {
+            scalar psii = source[cell];
+            for (label p=rowStarts[cell]; p<rowStarts[cell + 1]; ++p)
+                psii -= coeffs[p]*psi[cols[p]];
+            psi[cell] = psii/diag[cell];
+        }
+    }
+}
 
 void serialGatherSmooth
 (

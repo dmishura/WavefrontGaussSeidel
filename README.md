@@ -25,7 +25,7 @@ use.
 
 - `ReferenceGS` — original OpenFOAM-style Gauss–Seidel implementation
 - `PackedReferenceGS` — the same lexicographic Gauss–Seidel sweep on a packed CSR-like matrix representation
-- `IndexKahn1024` — packed Index-Kahn traversal with width 1024
+- `IndexKahn1024` — packed Index-Kahn traversal with width 1024 (IH1)
 
 Benchmark conditions:
 

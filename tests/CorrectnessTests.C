@@ -226,7 +226,9 @@ int main(int argc, char** argv)
             << " selected="
             << selectedCount
             << " total=" << solvers.variants().size()
-            << " preprocessing=" << workload->preprocessingSeconds << " s\n";
+            << " preprocessing=" << workload->preprocessingSeconds << " s"
+            << " packed_reference_preprocessing="
+            << workload->lexicographicPackedPreprocessingSeconds << " s\n";
         return RUN_ALL_TESTS();
     }
     catch (const std::exception& error)

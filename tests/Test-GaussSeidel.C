@@ -33,6 +33,7 @@ using smootherTest::DeltaEscapeInt16Schedule;
 using smootherTest::PackedUint24Schedule;
 using smootherTest::WholeRowInt16Schedule;
 using smootherTest::WavefrontSchedule;
+using smootherTest::LexicographicPackedSchedule;
 using smootherTest::HybridWavefrontSchedule;
 using smootherTest::RowDegreeSchedule;
 using smootherTest::BlockedRowDegreeSchedule;
@@ -50,6 +51,8 @@ using smootherTest::serialGatherAvx512AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2AcrossRowsSmooth;
 using smootherTest::serialGatherAvx2Smooth;
 using smootherTest::serialGatherSmooth;
+using smootherTest::makeLexicographicPackedSchedule;
+using smootherTest::serialLexicographicPackedSmooth;
 using smootherTest::serialHybridSmooth;
 using smootherTest::serialRowDegreeSmooth;
 using smootherTest::serialDirectCoefficientSmooth;
@@ -2421,7 +2424,8 @@ int runHpcIndexSeries
     const std::string& meshDirectory,
     const bool smallWidths,
     const bool validationOnly,
-    const bool allMeshWidths
+    const bool allMeshWidths,
+    const bool packedReferenceComparison
 )
 {
     const int threads = omp_get_max_threads();
@@ -2440,14 +2444,17 @@ int runHpcIndexSeries
     const scalarField source = multiply(matrix, exact);
     FieldField<Field, scalar> interfaceCoeffs(0);
     lduInterfaceFieldPtrsList interfaces(0);
-    const std::array<label, 3> widths = allMeshWidths
+    const std::array<label, 3> widths =
+        (allMeshWidths || packedReferenceComparison)
         ? std::array<label, 3>{{1024, 2048, 4096}}
         : smallWidths
         ? std::array<label, 3>{{512, 1024, 2048}}
         : std::array<label, 3>{{1024, 2048, 8192}};
-    const bool includeGeometry = !allMeshWidths;
+    const bool includeGeometry = !allMeshWidths && !packedReferenceComparison;
     const std::size_t firstIndexSchedule = includeGeometry ? 1 : 0;
-    const std::size_t scheduleCount = allMeshWidths
+    const std::size_t scheduleCount = packedReferenceComparison
+        ? 1
+        : allMeshWidths
         ? widths.size()
         : smallWidths ? 4 : 7;
     // Allocate all elements before compact schedules retain pointers to packed.
@@ -2502,6 +2509,50 @@ int runHpcIndexSeries
         "psi", nonzeroReferenceSix, matrix, source,
         interfaceCoeffs, interfaces, 0, 6
     );
+    LexicographicPackedSchedule packedReference;
+    scalar packedReferencePreprocessing = 0;
+    if (packedReferenceComparison)
+    {
+        const auto packedBegin = std::chrono::steady_clock::now();
+        packedReference = makeLexicographicPackedSchedule(matrix);
+        packedReferencePreprocessing = std::chrono::duration<scalar>
+        (
+            std::chrono::steady_clock::now() - packedBegin
+        ).count();
+        scalarField candidate = initialPsi;
+        serialLexicographicPackedSmooth(candidate, source, packedReference, 1);
+        const scalar zeroOneDifference = maxAbsDifference(reference, candidate);
+        candidate = nonzeroInitial;
+        serialLexicographicPackedSmooth(candidate, source, packedReference, 1);
+        const scalar nonzeroOneDifference =
+            maxAbsDifference(nonzeroReferenceOne, candidate);
+        candidate = nonzeroInitial;
+        serialLexicographicPackedSmooth(candidate, source, packedReference, 3);
+        const scalar nonzeroThreeDifference =
+            maxAbsDifference(nonzeroReferenceThree, candidate);
+        candidate = nonzeroInitial;
+        serialLexicographicPackedSmooth(candidate, source, packedReference, 3);
+        serialLexicographicPackedSmooth(candidate, source, packedReference, 3);
+        const scalar nonzeroTwoCallsDifference =
+            maxAbsDifference(nonzeroReferenceSix, candidate);
+        if
+        (
+            zeroOneDifference != 0
+         || nonzeroOneDifference != 0
+         || nonzeroThreeDifference != 0
+         || nonzeroTwoCallsDifference != 0
+        ) throw std::runtime_error
+        (
+            "Packed Reference GS exact equivalence failed"
+        );
+        std::cout << "Packed Reference GS: preprocessing="
+            << packedReferencePreprocessing
+            << " maxDifferenceZero1=" << zeroOneDifference
+            << " maxDifferenceNonzero1=" << nonzeroOneDifference
+            << " maxDifferenceNonzero3=" << nonzeroThreeDifference
+            << " maxDifferenceNonzero2x3=" << nonzeroTwoCallsDifference
+            << " exact=PASS\n" << std::flush;
+    }
     std::cout << "Index schedule series: cells=" << mesh.nCells
         << " requested threads=" << threads
         << "; Reference GS always serial; parallel block size=" << blockSize
@@ -2596,6 +2647,19 @@ int runHpcIndexSeries
                 "psi", psi, matrix, source, interfaceCoeffs, interfaces, 0, 3
             );
     }});
+    if (packedReferenceComparison)
+        variants.push_back
+        ({
+            "Packed Reference GS",
+            [&](scalarField& psi, const label n)
+            {
+                for (label sweep=0; sweep<n; sweep += 3)
+                    serialLexicographicPackedSmooth
+                    (
+                        psi, source, packedReference, 3
+                    );
+            }
+        });
     for (std::size_t i=0; i<packed.size(); ++i)
         variants.push_back({names[i], [&, i](scalarField& psi, const label n)
         {
@@ -2621,7 +2685,9 @@ int runHpcIndexSeries
     {
         printTiming(variants[i].name.c_str(), timings[i]);
         std::cout << "speedupRef=" << timings[0].medianSeconds/timings[i].medianSeconds
-            << (allMeshWidths ? " speedupIndex1024=" : " speedupGeometry=")
+            << (packedReferenceComparison
+                ? " speedupPackedReference="
+                : allMeshWidths ? " speedupIndex1024=" : " speedupGeometry=")
             << timings[1].medianSeconds/timings[i].medianSeconds << '\n';
     }
     std::cout << "PASS\n";
@@ -4704,6 +4770,7 @@ int main(int argc, char** argv)
         "[--hpc-blocked-row-degree] [--hpc-index-series] "
         "[--hpc-index-small-series] [--hpc-direct-coeff-series] "
         "[--all-mesh-index-series] "
+        "[--all-mesh-packed-reference-series] "
         "[--index-validation-only] "
         "[--profile-variant NAME]\n";
     if (argc >= 2 && std::string(argv[1]) == "--help")
@@ -4729,6 +4796,7 @@ int main(int argc, char** argv)
         bool hpcIndexSeries = false;
         bool hpcIndexSmallSeries = false;
         bool allMeshIndexSeries = false;
+        bool allMeshPackedReferenceSeries = false;
         bool hpcDirectCoeffSeries = false;
         bool indexValidationOnly = false;
         bool hpcBlockedRowDegree = false;
@@ -4786,6 +4854,11 @@ int main(int argc, char** argv)
                 allMeshIndexSeries = true;
                 continue;
             }
+            if (option == "--all-mesh-packed-reference-series")
+            {
+                allMeshPackedReferenceSeries = true;
+                continue;
+            }
             if (option == "--hpc-direct-coeff-series")
             {
                 hpcDirectCoeffSeries = true;
@@ -4831,17 +4904,22 @@ int main(int argc, char** argv)
         if (hpcIndexSmallSeries)
             return runHpcIndexSeries
             (
-                argv[1], true, indexValidationOnly, false
+                argv[1], true, indexValidationOnly, false, false
             );
         if (hpcIndexSeries)
             return runHpcIndexSeries
             (
-                argv[1], false, indexValidationOnly, false
+                argv[1], false, indexValidationOnly, false, false
             );
         if (allMeshIndexSeries)
             return runHpcIndexSeries
             (
-                argv[1], false, indexValidationOnly, true
+                argv[1], false, indexValidationOnly, true, false
+            );
+        if (allMeshPackedReferenceSeries)
+            return runHpcIndexSeries
+            (
+                argv[1], false, indexValidationOnly, false, true
             );
         if (indexValidationOnly)
             throw std::runtime_error

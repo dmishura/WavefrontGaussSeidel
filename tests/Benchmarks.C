@@ -195,6 +195,8 @@ int main(int argc, char** argv)
             << selectedCount
             << " total=" << solvers.variants().size()
             << " preprocessing=" << workload->preprocessingSeconds << " s"
+            << " packed_reference_preprocessing="
+            << workload->lexicographicPackedPreprocessingSeconds << " s"
             << " OpenMP_threads=" << detectedThreads << '\n';
         benchmark::RunSpecifiedBenchmarks();
         benchmark::Shutdown();

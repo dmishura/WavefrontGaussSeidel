@@ -33,9 +33,9 @@ schedule.
 
 ## Variant selection
 
-The registry contains all 89 variants, but both executables select the Core
-tier by default. The current counts are 14 Core, 44 Experimental, and 31
-Legacy variants.
+The registry keeps all variants available, but both executables select the
+Core tier by default. Use `--list-variants` to print the current total and the
+counts for the Core, Experimental, and Legacy tiers.
 
 ```bash
 ./build-cmake/smoother_tests --tier core
