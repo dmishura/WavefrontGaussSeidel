@@ -1,0 +1,8 @@
+{
+  "dataset": {
+    "repository": "dmishura/OpenFOAM-Benchmark-Meshes",
+    "release": "dataset-v1",
+    "catalog": "mesh_catalog.json",
+    "catalog_ref": "7d9e068f3309f8607b9c12e333cf7cf7421c0bbf"
+  }
+}

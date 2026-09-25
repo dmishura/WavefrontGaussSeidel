@@ -17,6 +17,7 @@ SYM_GS_DIR := $(OPENFOAM_DIR)/src/OpenFOAM/matrices/lduMatrix/smoothers/symGauss
 MESH_ARCHIVE := meshes/MTB_example_polyMesh.tgz
 MESH_DIR := build/mesh-data/MTB_example_polyMesh
 MESH_STAMP := $(MESH_DIR)/.extracted
+MESH_FETCH := python3 meshes/fetch_mesh.py MTB_example
 
 SMOOTHER_TARGET := build/Test-GaussSeidel
 READER_TARGET := build/Test-PolyMeshReader
@@ -40,9 +41,11 @@ all: $(READER_TARGET) $(SMOOTHER_TARGET)
 test: test-reader test-smoother
 
 test-reader: $(READER_TARGET) $(MESH_STAMP)
+	$(MESH_FETCH)
 	./$(READER_TARGET) $(MESH_DIR)
 
 test-smoother run: $(SMOOTHER_TARGET) $(MESH_STAMP)
+	$(MESH_FETCH)
 	./$(SMOOTHER_TARGET) $(MESH_DIR) --history-sweeps $(HISTORY_SWEEPS)
 
 cmake-configure:
@@ -62,6 +65,9 @@ $(SMOOTHER_TARGET): $(SMOOTHER_OBJECTS)
 
 $(READER_TARGET): $(READER_OBJECTS)
 	$(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+$(MESH_ARCHIVE): meshes/fetch_mesh.py mesh_dataset.json
+	$(MESH_FETCH)
 
 $(MESH_STAMP): $(MESH_ARCHIVE)
 	mkdir -p build/mesh-data

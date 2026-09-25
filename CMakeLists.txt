@@ -19,6 +19,7 @@ option(
 )
 
 find_package(OpenMP REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(GTest QUIET)
 find_package(benchmark QUIET)
 
@@ -91,6 +92,16 @@ set(MOTORBIKE_ARCHIVE ${CMAKE_CURRENT_SOURCE_DIR}/meshes/MTB_example_polyMesh.tg
 set(MOTORBIKE_ROOT ${CMAKE_CURRENT_BINARY_DIR}/mesh-data)
 set(MOTORBIKE_MESH ${MOTORBIKE_ROOT}/MTB_example_polyMesh)
 if(NOT EXISTS ${MOTORBIKE_MESH}/owner)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/meshes/fetch_mesh.py
+            MTB_example
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        RESULT_VARIABLE MOTORBIKE_FETCH_RESULT
+    )
+    if(NOT MOTORBIKE_FETCH_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to fetch the MTB_example benchmark mesh")
+    endif()
     file(MAKE_DIRECTORY ${MOTORBIKE_ROOT})
     execute_process(
         COMMAND ${CMAKE_COMMAND} -E tar xzf ${MOTORBIKE_ARCHIVE}

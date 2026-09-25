@@ -1,4 +1,6 @@
 /build/
 /build-cmake/
 /meshes/*.tgz
+/meshes/*.tgz.*
+/meshes/.dataset-*.json
 /REQUIREMENTS.md

@@ -1,39 +1,32 @@
-# Benchmark meshes
+# Benchmark mesh cache
 
-The archives are local benchmark inputs and are intentionally ignored by Git.
-Their exact sizes, SHA-256 digests, and topology statistics are recorded in
-[`manifest.json`](manifest.json).
+Benchmark meshes are published separately in the
+[`dmishura/OpenFOAM-Benchmark-Meshes`](https://github.com/dmishura/OpenFOAM-Benchmark-Meshes)
+repository, release `dataset-v1`. This directory is the local archive cache;
+mesh archives are intentionally not tracked by Git.
 
-| Mesh | Variant | Cells | Internal faces | Archive size (bytes) |
-|---|---|---:|---:|---:|
-| AHBody | original | 2,845,652 | 8,592,613 | 111,531,462 |
-| AHBody | renumbered | 2,845,652 | 8,592,613 | 112,158,065 |
-| MTBHPC_small | original | 8,613,999 | 25,952,973 | 465,922,322 |
-| MTBHPC_small | renumbered | 8,613,999 | 25,952,973 | 472,156,064 |
-| MTB_example | original | 352,253 | 1,053,964 | 19,252,028 |
-| WD_DamBreak | original | 9,376,387 | 27,975,312 | 330,305,556 |
-| WD_DamBreak | renumbered | 9,376,387 | 27,975,312 | 336,870,809 |
+Fetch a single archive with:
 
-## Metadata generation
+```bash
+python3 meshes/fetch_mesh.py MTB_example
+python3 meshes/fetch_mesh.py MTBHPC_small original
+python3 meshes/fetch_mesh.py MTBHPC_small renumbered
+```
 
-Each archive was unpacked into a temporary directory and read with the
-project's existing `PolyMeshReader`. The recorded topology fields are
-`cells`, `internal_faces`, total `faces`, and `points`. The reader does not
-currently expose the number of boundary patches, so that field is omitted
-instead of introducing a separate metadata parser.
+Fetch the complete dataset explicitly with:
 
-Archive sizes were obtained from the local files and digests were computed
-with SHA-256. No archive content was modified.
+```bash
+python3 meshes/fetch_mesh.py --all
+```
 
-## Original/renumbered invariants
+The fetcher obtains the authoritative catalog from the external repository,
+caches it locally, and verifies both archive size and SHA-256. Downloads use a
+temporary file that is renamed only after verification. A valid cached archive
+is never downloaded again. The cached catalog and archive make subsequent
+runs work without network access.
 
-For every available original/renumbered pair (`AHBody`, `MTBHPC_small`, and
-`WD_DamBreak`), the following values are identical:
-
-- cells;
-- internal faces;
-- total faces;
-- points.
-
-No topology-count discrepancies were found. Archive byte sizes and SHA-256
-digests differ, as expected after renumbering.
+The default Make and CMake MotorBike preparation paths call the fetcher before
+extracting `MTB_example_polyMesh.tgz`. A benchmark that uses an explicitly
+supplied `--mesh=/path/to/polyMesh` continues to use that prepared directory
+directly; fetch and extract its corresponding archive before invoking the
+benchmark.

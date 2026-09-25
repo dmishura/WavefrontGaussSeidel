@@ -63,8 +63,21 @@ Across most tested meshes, packing dominates the single-thread speedup, while In
 
 ## Test meshes
 
-The benchmark mesh archives will be published as soon as a suitable way to
-host these large files is available.
+The benchmark meshes used by this project are published in the dedicated
+[`dmishura/OpenFOAM-Benchmark-Meshes`](https://github.com/dmishura/OpenFOAM-Benchmark-Meshes)
+repository as GitHub Release assets. The current dataset is `dataset-v1`.
+Archives are downloaded on demand and cached under `meshes/`; they are not
+stored in this repository.
+
+```bash
+python3 meshes/fetch_mesh.py MTB_example
+python3 meshes/fetch_mesh.py MTBHPC_small renumbered
+python3 meshes/fetch_mesh.py --all
+```
+
+The default Make and CMake MotorBike preparation paths fetch the one required
+archive automatically. See [`meshes/README.md`](meshes/README.md) for cache,
+verification, offline-use, and custom-workload details.
 
 ## Usage and attribution
 

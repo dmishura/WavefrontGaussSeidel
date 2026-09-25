@@ -12,6 +12,21 @@ System GoogleTest and Google Benchmark packages are used by default. An
 explicit network fallback is available with
 `-DSMOOTHER_TEST_FETCH_DEPENDENCIES=ON`.
 
+The default MotorBike workload is fetched from the external benchmark dataset
+and cached under `meshes/` when it is not already available. Only MotorBike is
+requested by the default build; other large meshes are never downloaded
+implicitly. They can be prepared explicitly, for example:
+
+```bash
+python3 meshes/fetch_mesh.py MTBHPC_small renumbered
+mkdir -p build/mesh-data
+tar -xzf meshes/MTBHPC_small_renumbered.tgz -C build/mesh-data
+```
+
+Then pass the extracted `polyMesh` directory with `--mesh`. Fetching,
+verification, and extraction happen before workload construction and are never
+part of the measured benchmark region.
+
 ## Correctness
 
 ```bash
