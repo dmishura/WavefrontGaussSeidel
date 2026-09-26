@@ -79,6 +79,8 @@ const char* suiteFor(const harness::CorrectnessPolicy policy)
             return "ReferenceCorrectness";
         case harness::CorrectnessPolicy::ExactReference:
             return "OneSweepExactEquality";
+        case harness::CorrectnessPolicy::ExactSymmetricReference:
+            return "OneSweepSymmetricExactEquality";
         case harness::CorrectnessPolicy::ToleranceReference:
             return "OneSweepToleranceEquality";
         case harness::CorrectnessPolicy::ResidualReduction:
@@ -128,6 +130,7 @@ void registerCorrectnessTests
         if
         (
             variant.correctness == harness::CorrectnessPolicy::ExactReference
+         || variant.correctness == harness::CorrectnessPolicy::ExactSymmetricReference
          || variant.correctness == harness::CorrectnessPolicy::ToleranceReference
         )
         {

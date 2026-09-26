@@ -63,6 +63,15 @@ struct BlockedRowDegreeSchedule
     std::vector<Foam::label> blockPStarts;
 };
 
+struct AdaptiveBlockedRowDegreeSchedule
+{
+    const BlockedRowDegreeSchedule* blocked = nullptr;
+    Foam::label minWidth2Threads = 0;
+    Foam::label minWidthFullTeam = 0;
+    int configuredThreads = 1;
+    std::vector<std::uint8_t> activeThreads;
+};
+
 // Topology-only packed rows. Coefficients and diagonal remain in the live
 // lduMatrix, so this representation needs no per-matrix coefficient copy.
 struct DirectCoefficientSchedule
@@ -119,6 +128,14 @@ void serialGatherSmooth
     Foam::label nSweeps
 );
 
+void serialSymmetricGatherSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const WavefrontSchedule& schedule,
+    Foam::label nSweeps
+);
+
 void serialRowDegreeSmooth
 (
     Foam::scalarField& psi,
@@ -167,6 +184,24 @@ void persistentOpenMpBlockedRowDegreeSmooth
     Foam::scalarField& psi,
     const Foam::scalarField& source,
     const BlockedRowDegreeSchedule& schedule,
+    Foam::label nSweeps,
+    int& detectedThreads
+);
+
+void persistentOpenMpAdaptiveBlockedRowDegreeSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const AdaptiveBlockedRowDegreeSchedule& schedule,
+    Foam::label nSweeps,
+    int& detectedThreads
+);
+
+void persistentOpenMpThresholdBlockedRowDegreeSmooth
+(
+    Foam::scalarField& psi,
+    const Foam::scalarField& source,
+    const AdaptiveBlockedRowDegreeSchedule& schedule,
     Foam::label nSweeps,
     int& detectedThreads
 );

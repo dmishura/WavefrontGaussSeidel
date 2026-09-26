@@ -676,6 +676,45 @@ BlockedRowDegreeSchedule makeBlockedRowDegreeSchedule
     return result;
 }
 
+AdaptiveBlockedRowDegreeSchedule makeAdaptiveBlockedRowDegreeSchedule
+(
+    const BlockedRowDegreeSchedule& blocked,
+    const int configuredThreads,
+    const Foam::label minWidth2Threads,
+    const Foam::label minWidthFullTeam
+)
+{
+    if (!blocked.packed) throw std::runtime_error("adaptive schedule has no packed rows");
+    if (configuredThreads < 1)
+        throw std::runtime_error("adaptive schedule needs at least one thread");
+    if
+    (
+        minWidth2Threads < 0
+     || minWidthFullTeam < minWidth2Threads
+    ) throw std::runtime_error("invalid adaptive OpenMP thresholds");
+
+    AdaptiveBlockedRowDegreeSchedule result;
+    result.blocked = &blocked;
+    result.minWidth2Threads = minWidth2Threads;
+    result.minWidthFullTeam = minWidthFullTeam;
+    result.configuredThreads = configuredThreads;
+    const std::vector<Foam::label>& starts = blocked.packed->levelStarts;
+    result.activeThreads.reserve(starts.size() - 1);
+    for (std::size_t level=0; level + 1<starts.size(); ++level)
+    {
+        const Foam::label width = starts[level + 1] - starts[level];
+        int active = 1;
+        if (configuredThreads > 1 && width >= minWidth2Threads)
+            active = std::min(2, configuredThreads);
+        if (configuredThreads > 2 && width >= minWidthFullTeam)
+            active = configuredThreads;
+        if (active > std::numeric_limits<std::uint8_t>::max())
+            throw std::runtime_error("adaptive active-thread count does not fit uint8_t");
+        result.activeThreads.push_back(static_cast<std::uint8_t>(active));
+    }
+    return result;
+}
+
 HybridWavefrontSchedule makeHybridSchedule
 (
     const PolyMeshTopology& mesh,

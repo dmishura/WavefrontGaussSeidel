@@ -54,12 +54,21 @@ struct Workload
     std::map<Foam::label, RowDegreeSchedule> indexRowDegrees;
     std::map<Foam::label, BlockedRowDegreeSchedule> indexBlocked64;
     std::map<Foam::label, DirectCoefficientSchedule> indexDirect;
+    std::map<Foam::label, AdaptiveBlockedRowDegreeSchedule>
+        index1024AdaptiveThresholds;
+    std::map
+    <
+        std::pair<Foam::label, Foam::label>,
+        AdaptiveBlockedRowDegreeSchedule
+    > index1024AdaptiveClasses;
 
     std::map<Foam::label, WavefrontStatistics> indexWindowStatistics;
     std::map<Foam::label, WavefrontSchedule> indexWindowSchedules;
     std::map<Foam::label, RowDegreeSchedule> indexWindowRowDegrees;
 
     Foam::scalar lexicographicPackedPreprocessingSeconds = 0;
+    Foam::scalar adaptiveIh1PreprocessingSeconds = 0;
+    std::size_t adaptiveIh1MetadataBytes = 0;
     Foam::scalar preprocessingSeconds = 0;
     bool dependenciesValid = false;
 

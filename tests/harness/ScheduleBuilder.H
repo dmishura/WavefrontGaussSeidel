@@ -92,6 +92,14 @@ BlockedRowDegreeSchedule makeBlockedRowDegreeSchedule
     Foam::label blockSize
 );
 
+AdaptiveBlockedRowDegreeSchedule makeAdaptiveBlockedRowDegreeSchedule
+(
+    const BlockedRowDegreeSchedule& blocked,
+    int configuredThreads,
+    Foam::label minWidth2Threads,
+    Foam::label minWidthFullTeam
+);
+
 HybridWavefrontSchedule makeHybridSchedule
 (
     const PolyMeshTopology& mesh,

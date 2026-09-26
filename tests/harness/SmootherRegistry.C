@@ -119,6 +119,20 @@ SmootherRegistry createSmootherRegistry(Workload& workload)
         true, true, 3, false,
         VariantTier::Core, {"reference", "symmetric"}
     });
+    registry.add
+    ({
+        "Symmetric Index-Kahn 1024", "SymIndexKahn1024",
+        [&](Foam::scalarField& psi, const Foam::label nSweeps)
+        {
+            serialSymmetricGatherSmooth
+            (
+                psi, source, workload.indexSchedules.at(1024), nSweeps
+            );
+        },
+        CorrectnessPolicy::ExactSymmetricReference, 0,
+        true, true, 3, false,
+        VariantTier::Core, {"index-kahn", "symmetric", "packed", "sequential"}
+    });
 
     const auto addPacked =
     [&]
@@ -769,6 +783,54 @@ SmootherRegistry createSmootherRegistry(Workload& workload)
             CorrectnessPolicy::ExactReference, 0,
             true, true, 3, true, mainWidthTier,
             {"index-kahn", "direct-coefficients", "openmp", "persistent"}
+        });
+    }
+
+    for (const auto& entry : workload.index1024AdaptiveThresholds)
+    {
+        const Foam::label threshold = entry.first;
+        const AdaptiveBlockedRowDegreeSchedule* const adaptive = &entry.second;
+        const std::string suffix = std::to_string(threshold);
+        registry.add
+        ({
+            "Index-Kahn 1024 adaptive threshold " + suffix,
+            "IndexKahn1024AdaptiveT" + suffix,
+            [&, adaptive](Foam::scalarField& psi, const Foam::label nSweeps)
+            {
+                int threads = 1;
+                persistentOpenMpThresholdBlockedRowDegreeSmooth
+                (
+                    psi, source, *adaptive, nSweeps, threads
+                );
+            },
+            CorrectnessPolicy::ExactReference, 0,
+            true, true, 3, true, VariantTier::Experimental,
+            {"index-kahn", "row-degree", "openmp", "persistent", "adaptive"}
+        });
+    }
+
+    for (const auto& entry : workload.index1024AdaptiveClasses)
+    {
+        const Foam::label minWidth2 = entry.first.first;
+        const Foam::label minWidthFull = entry.first.second;
+        const AdaptiveBlockedRowDegreeSchedule* const adaptive = &entry.second;
+        const std::string suffix = std::to_string(minWidth2)
+            + "_" + std::to_string(minWidthFull);
+        registry.add
+        ({
+            "Index-Kahn 1024 adaptive classes " + suffix,
+            "IndexKahn1024AdaptiveClasses" + suffix,
+            [&, adaptive](Foam::scalarField& psi, const Foam::label nSweeps)
+            {
+                int threads = 1;
+                persistentOpenMpAdaptiveBlockedRowDegreeSmooth
+                (
+                    psi, source, *adaptive, nSweeps, threads
+                );
+            },
+            CorrectnessPolicy::ExactReference, 0,
+            true, true, 3, true, VariantTier::Experimental,
+            {"index-kahn", "row-degree", "openmp", "persistent", "adaptive"}
         });
     }
 

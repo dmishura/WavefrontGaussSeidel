@@ -3,9 +3,11 @@
 #include <benchmark/benchmark.h>
 #include <omp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -44,6 +46,81 @@ Foam::label parsePositive(const std::string& text, const std::string& option)
     if (parsed != text.size() || value < 1)
         throw std::runtime_error(option + " must be a positive integer");
     return value;
+}
+
+bool hasTag
+(
+    const harness::VariantMetadata& metadata,
+    const std::string& wanted
+)
+{
+    return std::find(metadata.tags.begin(), metadata.tags.end(), wanted)
+        != metadata.tags.end();
+}
+
+void printAdaptiveIh1Diagnostics(const harness::Workload& workload)
+{
+    const auto& statistics = workload.indexStatistics.at(1024);
+    const auto& starts = workload.indexSchedules.at(1024).levelStarts;
+    std::cout << "\nIH1 level-width statistics:"
+        << "\n  levels: " << statistics.widths.size()
+        << "\n  min/mean/median/p90/p95/max: "
+        << statistics.minimumWidth << " / " << statistics.meanWidth
+        << " / " << statistics.medianWidth << " / " << statistics.p90Width
+        << " / " << statistics.p95Width << " / " << statistics.maximumWidth
+        << '\n';
+    for (const std::size_t cutoff : {32, 64, 128, 256, 512, 1024})
+    {
+        std::size_t levels = 0;
+        std::size_t cells = 0;
+        for (std::size_t level=0; level<statistics.widths.size(); ++level)
+        {
+            if (statistics.widths[level] >= cutoff) continue;
+            ++levels;
+            cells += statistics.widths[level];
+        }
+        std::cout << "  width < " << cutoff << ": levels=" << levels
+            << " (" << 100.0*levels/statistics.widths.size() << "%)"
+            << " cells=" << cells
+            << " (" << 100.0*cells/workload.mesh.nCells << "%)\n";
+    }
+
+    const auto printClasses = [&starts](
+        const std::string& name,
+        const smootherTest::AdaptiveBlockedRowDegreeSchedule& schedule
+    )
+    {
+        std::map<int, std::pair<std::size_t, std::size_t>> classes;
+        for (std::size_t level=0; level<schedule.activeThreads.size(); ++level)
+        {
+            auto& values = classes[schedule.activeThreads[level]];
+            ++values.first;
+            values.second += starts[level + 1] - starts[level];
+        }
+        std::cout << "  " << name
+            << " configured_threads=" << schedule.configuredThreads
+            << " metadata=" << schedule.activeThreads.size()
+                *sizeof(std::uint8_t) << " bytes";
+        for (const auto& entry : classes)
+            std::cout << " " << entry.first << "T:levels=" << entry.second.first
+                << "(" << 100.0*entry.second.first/schedule.activeThreads.size()
+                << "%),cells=" << entry.second.second
+                << "(" << 100.0*entry.second.second/starts.back() << "%)";
+        std::cout << '\n';
+    };
+
+    std::cout << "IH1 adaptive execution classes:"
+        << " preprocessing=" << workload.adaptiveIh1PreprocessingSeconds << " s"
+        << " metadata=" << workload.adaptiveIh1MetadataBytes << " bytes\n";
+    for (const auto& entry : workload.index1024AdaptiveThresholds)
+        printClasses("threshold=" + std::to_string(entry.first), entry.second);
+    for (const auto& entry : workload.index1024AdaptiveClasses)
+        printClasses
+        (
+            "thresholds=" + std::to_string(entry.first.first)
+          + "/" + std::to_string(entry.first.second),
+            entry.second
+        );
 }
 
 BenchmarkOptions consumeHarnessArguments(int& argc, char** argv)
@@ -188,6 +265,15 @@ int main(int argc, char** argv)
         if (!selectedCount)
             throw std::runtime_error("variant selection matched no smoothers");
         const int detectedThreads = detectOpenMpThreads();
+        bool adaptiveSelected = false;
+        for (const harness::SmootherVariant& variant : solvers.variants())
+            adaptiveSelected = adaptiveSelected
+                ||
+                (
+                    harness::matchesSelection(variant.meta, selection)
+                 && hasTag(variant.meta, "adaptive")
+                );
+        if (adaptiveSelected) printAdaptiveIh1Diagnostics(*workload);
         registerBenchmarks(*workload, solvers, options, selection);
         std::cout << "Registry: workload=" << workload->name
             << " cells=" << workload->mesh.nCells

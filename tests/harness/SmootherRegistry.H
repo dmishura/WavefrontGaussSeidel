@@ -22,6 +22,7 @@ enum class CorrectnessPolicy
 {
     Reference,
     ExactReference,
+    ExactSymmetricReference,
     ToleranceReference,
     ResidualReduction
 };

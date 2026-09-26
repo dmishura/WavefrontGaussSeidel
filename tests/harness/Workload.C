@@ -4,8 +4,10 @@
 
 #include "Workload.H"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <omp.h>
 #include <stdexcept>
 #include <utility>
 
@@ -191,6 +193,49 @@ std::unique_ptr<Workload> createMeshWorkload
             )
         );
     }
+
+    const auto adaptiveBegin = std::chrono::steady_clock::now();
+    const int configuredThreads = std::max(1, omp_get_max_threads());
+    const BlockedRowDegreeSchedule& ih1Blocked =
+        workload->indexBlocked64.at(1024);
+    for (const Foam::label threshold : {0, 16, 32, 64, 128, 256, 512, 1024, 2048})
+    {
+        workload->index1024AdaptiveThresholds.emplace
+        (
+            threshold,
+            makeAdaptiveBlockedRowDegreeSchedule
+            (
+                ih1Blocked, configuredThreads, threshold, threshold
+            )
+        );
+    }
+    for (const auto& thresholds : {
+            std::pair<Foam::label, Foam::label>{32, 128},
+            {64, 256},
+            {128, 512}
+        })
+    {
+        workload->index1024AdaptiveClasses.emplace
+        (
+            thresholds,
+            makeAdaptiveBlockedRowDegreeSchedule
+            (
+                ih1Blocked, configuredThreads,
+                thresholds.first, thresholds.second
+            )
+        );
+    }
+    workload->adaptiveIh1PreprocessingSeconds =
+        std::chrono::duration<Foam::scalar>
+        (
+            std::chrono::steady_clock::now() - adaptiveBegin
+        ).count();
+    for (const auto& entry : workload->index1024AdaptiveThresholds)
+        workload->adaptiveIh1MetadataBytes +=
+            entry.second.activeThreads.size()*sizeof(std::uint8_t);
+    for (const auto& entry : workload->index1024AdaptiveClasses)
+        workload->adaptiveIh1MetadataBytes +=
+            entry.second.activeThreads.size()*sizeof(std::uint8_t);
 
     for (const Foam::label width : {1024, 2048, 8192})
     {

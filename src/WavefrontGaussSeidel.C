@@ -1,5 +1,6 @@
 #include "WavefrontGaussSeidel.H"
 
+#include <algorithm>
 #include <limits>
 #include <omp.h>
 #include <stdexcept>
@@ -113,6 +114,52 @@ void serialGatherSmooth
         for (std::size_t level=0; level<nLevels; ++level)
         {
             for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                    psii -= coeffs[p]*psi[cols[p]];
+                psi[cell] = psii/diag[row];
+            }
+        }
+    }
+}
+
+void serialSymmetricGatherSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const WavefrontSchedule& schedule,
+    const label nSweeps
+)
+{
+    const label* const levelStarts = schedule.levelStarts.data();
+    const label* const waveCells = schedule.waveCells.data();
+    const label* const rowStarts = schedule.rowStarts.data();
+    const label* const cols = schedule.cols.data();
+    const scalar* const coeffs = schedule.coeffs.data();
+    const scalar* const diag = schedule.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = schedule.levelStarts.size() - 1;
+
+    for (label sweep=0; sweep<nSweeps; ++sweep)
+    {
+        for (std::size_t level=0; level<nLevels; ++level)
+        {
+            for (label row=levelStarts[level]; row<levelStarts[level + 1]; ++row)
+            {
+                const label cell = waveCells[row];
+                scalar psii = source[cell];
+                for (label p=rowStarts[row]; p<rowStarts[row + 1]; ++p)
+                    psii -= coeffs[p]*psi[cols[p]];
+                psi[cell] = psii/diag[row];
+            }
+        }
+
+        for (std::size_t level=nLevels; level-- > 0;)
+        {
+            for (label row=levelStarts[level + 1]; row-- > levelStarts[level];)
             {
                 const label cell = waveCells[row];
                 scalar psii = source[cell];
@@ -385,6 +432,154 @@ void persistentOpenMpBlockedRowDegreeSmooth
                         for (; p<end; ++p)
                             psii -= coeffs[p]*psi[cols[p]];
                         psi[cell] = psii/diag[row];
+                    }
+                }
+            }
+        }
+    }
+}
+
+void persistentOpenMpAdaptiveBlockedRowDegreeSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const AdaptiveBlockedRowDegreeSchedule& adaptive,
+    const label nSweeps,
+    int& detectedThreads
+)
+{
+    const BlockedRowDegreeSchedule& schedule = *adaptive.blocked;
+    const WavefrontSchedule& packed = *schedule.packed;
+    const label* const waveCells = packed.waveCells.data();
+    const std::uint8_t* const degrees = schedule.degrees.data();
+    const label* const levelBlockStarts = schedule.levelBlockStarts.data();
+    const label* const blockRowStarts = schedule.blockRowStarts.data();
+    const label* const blockRowEnds = schedule.blockRowEnds.data();
+    const label* const blockPStarts = schedule.blockPStarts.data();
+    const std::uint8_t* const scheduledThreads = adaptive.activeThreads.data();
+    const label* const cols = packed.cols.data();
+    const scalar* const coeffs = packed.coeffs.data();
+    const scalar* const diag = packed.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = packed.levelStarts.size() - 1;
+
+    #pragma omp parallel
+    {
+        const int thread = omp_get_thread_num();
+        const int teamThreads = omp_get_num_threads();
+        #pragma omp single nowait
+        detectedThreads = teamThreads;
+
+        for (label sweep=0; sweep<nSweeps; ++sweep)
+        {
+            for (std::size_t level=0; level<nLevels; ++level)
+            {
+                const int activeThreads = std::min
+                (
+                    teamThreads, static_cast<int>(scheduledThreads[level])
+                );
+                const label firstBlock = levelBlockStarts[level];
+                const label nBlocks = levelBlockStarts[level + 1] - firstBlock;
+                if (thread < activeThreads)
+                {
+                    const label begin = firstBlock
+                        + nBlocks*thread/activeThreads;
+                    const label end = firstBlock
+                        + nBlocks*(thread + 1)/activeThreads;
+                    for (label block=begin; block<end; ++block)
+                    {
+                        label p = blockPStarts[block];
+                        for (label row=blockRowStarts[block]; row<blockRowEnds[block]; ++row)
+                        {
+                            const label cell = waveCells[row];
+                            scalar psii = source[cell];
+                            const label contributionEnd = p + degrees[row];
+                            for (; p<contributionEnd; ++p)
+                                psii -= coeffs[p]*psi[cols[p]];
+                            psi[cell] = psii/diag[row];
+                        }
+                    }
+                }
+                #pragma omp barrier
+            }
+        }
+    }
+}
+
+void persistentOpenMpThresholdBlockedRowDegreeSmooth
+(
+    Foam::scalarField& psiField,
+    const Foam::scalarField& sourceField,
+    const AdaptiveBlockedRowDegreeSchedule& adaptive,
+    const label nSweeps,
+    int& detectedThreads
+)
+{
+    const BlockedRowDegreeSchedule& schedule = *adaptive.blocked;
+    const WavefrontSchedule& packed = *schedule.packed;
+    const label* const waveCells = packed.waveCells.data();
+    const std::uint8_t* const degrees = schedule.degrees.data();
+    const label* const levelBlockStarts = schedule.levelBlockStarts.data();
+    const label* const blockRowStarts = schedule.blockRowStarts.data();
+    const label* const blockRowEnds = schedule.blockRowEnds.data();
+    const label* const blockPStarts = schedule.blockPStarts.data();
+    const std::uint8_t* const scheduledThreads = adaptive.activeThreads.data();
+    const label* const cols = packed.cols.data();
+    const scalar* const coeffs = packed.coeffs.data();
+    const scalar* const diag = packed.diag.data();
+    const scalar* const source = sourceField.data();
+    scalar* const psi = psiField.data();
+    const std::size_t nLevels = packed.levelStarts.size() - 1;
+
+    #pragma omp parallel
+    {
+        const int thread = omp_get_thread_num();
+        const int teamThreads = omp_get_num_threads();
+        #pragma omp single nowait
+        detectedThreads = teamThreads;
+
+        for (label sweep=0; sweep<nSweeps; ++sweep)
+        {
+            for (std::size_t level=0; level<nLevels; ++level)
+            {
+                const label firstBlock = levelBlockStarts[level];
+                const label lastBlock = levelBlockStarts[level + 1];
+                if (scheduledThreads[level] == 1 && teamThreads > 1)
+                {
+                    if (thread == 0)
+                    {
+                        for (label block=firstBlock; block<lastBlock; ++block)
+                        {
+                            label p = blockPStarts[block];
+                            for (label row=blockRowStarts[block]; row<blockRowEnds[block]; ++row)
+                            {
+                                const label cell = waveCells[row];
+                                scalar psii = source[cell];
+                                const label contributionEnd = p + degrees[row];
+                                for (; p<contributionEnd; ++p)
+                                    psii -= coeffs[p]*psi[cols[p]];
+                                psi[cell] = psii/diag[row];
+                            }
+                        }
+                    }
+                    #pragma omp barrier
+                }
+                else
+                {
+                    #pragma omp for schedule(static)
+                    for (label block=firstBlock; block<lastBlock; ++block)
+                    {
+                        label p = blockPStarts[block];
+                        for (label row=blockRowStarts[block]; row<blockRowEnds[block]; ++row)
+                        {
+                            const label cell = waveCells[row];
+                            scalar psii = source[cell];
+                            const label contributionEnd = p + degrees[row];
+                            for (; p<contributionEnd; ++p)
+                                psii -= coeffs[p]*psi[cols[p]];
+                            psi[cell] = psii/diag[row];
+                        }
                     }
                 }
             }

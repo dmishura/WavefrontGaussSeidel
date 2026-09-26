@@ -1,5 +1,6 @@
 #include "CorrectnessRunner.H"
 #include "GaussSeidelSmoother.H"
+#include "symGaussSeidelSmoother.H"
 
 #include <cmath>
 
@@ -19,11 +20,22 @@ CorrectnessResult runCorrectness
     result.sweeps = nSweeps;
 
     Foam::scalarField reference = workload.initialPsi;
-    Foam::GaussSeidelSmoother::smooth
-    (
-        "psi", reference, *workload.matrix, workload.source,
-        workload.interfaceCoeffs, workload.interfaces, 0, nSweeps
-    );
+    if (variant.correctness == CorrectnessPolicy::ExactSymmetricReference)
+    {
+        Foam::symGaussSeidelSmoother::smooth
+        (
+            "psi", reference, *workload.matrix, workload.source,
+            workload.interfaceCoeffs, workload.interfaces, 0, nSweeps
+        );
+    }
+    else
+    {
+        Foam::GaussSeidelSmoother::smooth
+        (
+            "psi", reference, *workload.matrix, workload.source,
+            workload.interfaceCoeffs, workload.interfaces, 0, nSweeps
+        );
+    }
     Foam::scalarField candidate = workload.initialPsi;
     variant.run(candidate, nSweeps);
 
@@ -52,6 +64,11 @@ CorrectnessResult runCorrectness
         case CorrectnessPolicy::ExactReference:
             result.passed = result.exact;
             if (!result.passed) result.failure = "not exactly equal to Reference GS";
+            break;
+        case CorrectnessPolicy::ExactSymmetricReference:
+            result.passed = result.exact;
+            if (!result.passed)
+                result.failure = "not exactly equal to symmetric Reference GS";
             break;
         case CorrectnessPolicy::ToleranceReference:
             result.passed =
