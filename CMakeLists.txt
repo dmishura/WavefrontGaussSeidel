@@ -59,6 +59,16 @@ add_library(
 target_include_directories(smoother_kernels PUBLIC compat src)
 target_compile_options(smoother_kernels PRIVATE ${SMOOTHER_COMMON_OPTIONS})
 target_link_libraries(smoother_kernels PUBLIC OpenMP::OpenMP_CXX)
+
+add_library(
+    gamg_standalone
+    src/GAMG/GAMGAgglomeration.C
+    src/GAMG/GAMGMatrix.C
+    src/GAMG/GAMGKernels.C
+    src/GAMG/GAMGSolver.C
+)
+target_include_directories(gamg_standalone PUBLIC compat src src/GAMG)
+target_compile_options(gamg_standalone PRIVATE ${SMOOTHER_COMMON_OPTIONS})
 set_source_files_properties(
     src/WavefrontGaussSeidelAVX2.C
     PROPERTIES COMPILE_OPTIONS "-mavx2"
@@ -132,6 +142,13 @@ add_executable(Test-GaussSeidel tests/Test-GaussSeidel.C)
 target_compile_options(Test-GaussSeidel PRIVATE ${SMOOTHER_COMMON_OPTIONS})
 target_link_libraries(Test-GaussSeidel PRIVATE smoother_kernels)
 
+add_executable(gamg_tests tests/GAMGTests.C)
+target_compile_options(gamg_tests PRIVATE ${SMOOTHER_COMMON_OPTIONS})
+target_compile_definitions(
+    gamg_tests PRIVATE SMOOTHER_TEST_DEFAULT_MESH="${MOTORBIKE_MESH}"
+)
+target_link_libraries(gamg_tests PRIVATE gamg_standalone smoother_harness GTest::gtest)
+
 if(BUILD_TESTING)
     add_test(
         NAME motorBike_reader_correctness
@@ -149,6 +166,15 @@ if(BUILD_TESTING)
     set_tests_properties(
         motorBike_smoother_correctness
         PROPERTIES LABELS "correctness;core;motorBike"
+    )
+
+    add_test(
+        NAME motorBike_gamg_correctness
+        COMMAND gamg_tests --mesh=${MOTORBIKE_MESH}
+    )
+    set_tests_properties(
+        motorBike_gamg_correctness
+        PROPERTIES LABELS "correctness;gamg;motorBike"
     )
 
     # A one-sweep smoke test verifies benchmark registration without placing

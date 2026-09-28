@@ -3,4 +3,5 @@
 /meshes/*.tgz
 /meshes/*.tgz.*
 /meshes/.dataset-*.json
-/REQUIREMENTS.md
+/HISTORY.md
+/tools/openfoam/*/Make/linux*/
