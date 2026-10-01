@@ -10,8 +10,10 @@
 \*---------------------------------------------------------------------------*/
 
 #include "GAMGAgglomeration.H"
+#include "GAMGTiming.H"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -184,9 +186,14 @@ GAMGAgglomerationLevel makeCoarseAddressing
 GAMGAgglomeration::GAMGAgglomeration
 (
     const GAMGMatrix& finest,
-    const GAMGControls& controls
+    const GAMGControls& controls,
+    GAMGTimingStats* const timing,
+    double* const temporaryCoarseMatrixSeconds
 )
 {
+    const auto timingBegin = timing && timing->enabled()
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     if (controls.maxLevels < 1)
         throw std::runtime_error("GAMG maxLevels must be positive");
 
@@ -220,13 +227,27 @@ GAMGAgglomeration::GAMGAgglomeration
             if (addressing.faceToCoarse[face] >= 0)
                 coarseWeights[addressing.faceToCoarse[face]] += faceWeights[face];
 
+        const auto coarseMatrixBegin = temporaryCoarseMatrixSeconds
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         current = agglomerateMatrix(current, addressing);
+        if (temporaryCoarseMatrixSeconds)
+            *temporaryCoarseMatrixSeconds += std::chrono::duration<double>
+            (
+                std::chrono::steady_clock::now() - coarseMatrixBegin
+            ).count();
         levels_.push_back(std::move(addressing));
         faceWeights = std::move(coarseWeights);
     }
 
     if (levels_.empty())
         throw std::runtime_error("GAMG pair agglomeration produced no coarse level");
+
+    if (timing && timing->enabled())
+        timing->hierarchyBuildSeconds += std::chrono::duration<double>
+        (
+            std::chrono::steady_clock::now() - timingBegin
+        ).count();
 }
 
 } // namespace smootherTest::gamg

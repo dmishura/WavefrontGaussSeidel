@@ -14,11 +14,21 @@
 #include "GAMGAgglomeration.H"
 #include "GAMGControls.H"
 #include "GAMGMatrix.H"
+#include "GAMGKernels.H"
+#include "GAMGTiming.H"
 
+#include <chrono>
+#include <cstdint>
 #include <vector>
 
 namespace smootherTest::gamg
 {
+
+enum class GAMGSpmvTraversal
+{
+    NativeLdu,
+    DirectFlat
+};
 
 struct GAMGLevelDiagnostics
 {
@@ -43,9 +53,41 @@ struct GAMGSolverPerformance
 
 class GAMGSolver
 {
+    std::chrono::steady_clock::time_point setupBegin_;
     GAMGControls controls_;
     GAMGAgglomeration agglomeration_;
     GAMGMatrixHierarchy matrices_;
+    GAMGSpmvTraversal spmvTraversal_ = GAMGSpmvTraversal::NativeLdu;
+    std::vector<DirectFlatMatrix> directFlatMatrices_;
+    bool evictL1BeforeDirectFlat_ = false;
+    std::vector<std::uint8_t> l1EvictionBuffer_;
+    mutable volatile std::uint64_t l1EvictionChecksum_ = 0;
+    GAMGTimingStats* timing_ = nullptr;
+
+    void evictL1BeforeDirectFlat() const;
+
+    void multiplyLevel
+    (
+        std::size_t level,
+        Foam::scalarField& result,
+        const Foam::scalarField& field
+    ) const;
+
+    void residualLevel
+    (
+        std::size_t level,
+        Foam::scalarField& result,
+        const Foam::scalarField& field,
+        const Foam::scalarField& source
+    ) const;
+
+    void scaleCorrectionLevel
+    (
+        std::size_t level,
+        Foam::scalarField& field,
+        const Foam::scalarField& source,
+        Foam::scalarField& work
+    ) const;
 
     void vCycle
     (
@@ -62,13 +104,30 @@ class GAMGSolver
     ) const;
 
 public:
-    GAMGSolver(const Foam::lduMatrix& matrix, GAMGControls controls = {});
+    GAMGSolver
+    (
+        const Foam::lduMatrix& matrix,
+        GAMGControls controls = {},
+        GAMGTimingStats* timing = nullptr,
+        GAMGSpmvTraversal spmvTraversal = GAMGSpmvTraversal::NativeLdu,
+        bool evictL1BeforeDirectFlat = false
+    );
 
     GAMGSolverPerformance solve
     (
         Foam::scalarField& psi,
         const Foam::scalarField& source
     ) const;
+
+    void applyVCycle
+    (
+        Foam::scalarField& psi,
+        const Foam::scalarField& source,
+        const Foam::scalarField& finestResidual
+    ) const
+    {
+        vCycle(psi, source, finestResidual);
+    }
 
     const GAMGAgglomeration& agglomeration() const noexcept
     {

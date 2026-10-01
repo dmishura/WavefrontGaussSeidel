@@ -31,3 +31,34 @@ solver replacing `LUscalarMatrix`.
 Files adapted from OpenFOAM remain under the GNU General Public License,
 version 3 or later, with their original project attribution retained in the
 source headers.
+
+## Baseline timing
+
+`GAMGTimingStats` is an optional accumulator passed to `GAMGSolver`. A null
+pointer leaves instrumentation disabled. Enabled instrumentation times whole
+operations with `std::chrono::steady_clock`; timer calls are never placed in
+cell or face loops.
+
+The timing conventions are:
+
+- topology hierarchy construction and per-transition coarse matrix
+  construction are separate setup categories;
+- smoothing, `Amul`, residual update, restriction, prolongation and the
+  coarsest solve are exclusive kernel timings;
+- complete `scaleCorrection` is inclusive of its separately recorded `Amul`;
+- V-cycle and solve durations are inclusive wall times, so overlapping
+  categories must not be summed.
+
+The dedicated Google Benchmark executable provides setup, V-cycle and full
+solve entries, plus an accumulated per-level timing report after warm-up:
+
+```bash
+OMP_NUM_THREADS=1 taskset -c 2 ./build-cmake/gamg_bench \
+    --mesh=build-cmake/mesh-data/MTB_example_polyMesh \
+    --gamg_warmup=1 \
+    --gamg_samples=7 \
+    --benchmark_repetitions=7 \
+    --benchmark_report_aggregates_only=true
+```
+
+Add `--gamg_csv` to print the per-level counters as CSV.

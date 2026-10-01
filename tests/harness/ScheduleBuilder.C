@@ -265,41 +265,68 @@ WavefrontStatistics constructIndexWavefronts
     const bool window
 )
 {
-    if (targetWidth < 1) throw std::runtime_error("invalid Index-Kahn width");
     const auto& starts = matrix.lduAddr().ownerStartAddr();
     const auto& neighbours = matrix.lduAddr().upperAddr();
-    std::vector<Foam::label> predecessors(mesh.nCells, 0);
-    for (const Foam::label cell : neighbours) ++predecessors[cell];
-    std::set<Foam::label> ready;
-    for (Foam::label cell=0; cell<Foam::label(mesh.nCells); ++cell)
-        if (predecessors[cell] == 0) ready.insert(cell);
+    if (window)
+    {
+        if (targetWidth < 1) throw std::runtime_error("invalid Index-Kahn width");
+        std::vector<Foam::label> predecessors(mesh.nCells, 0);
+        for (const Foam::label cell : neighbours) ++predecessors[cell];
+        std::set<Foam::label> ready;
+        for (Foam::label cell=0; cell<Foam::label(mesh.nCells); ++cell)
+            if (predecessors[cell] == 0) ready.insert(cell);
+        WavefrontStatistics result;
+        result.levels.assign(mesh.nCells, -1);
+        Foam::label cursor = 0;
+        std::size_t assigned = 0;
+        while (!ready.empty())
+        {
+            std::vector<Foam::label> current;
+            current.reserve(targetWidth);
+            auto position = ready.lower_bound(cursor);
+            while (!ready.empty() && current.size()<std::size_t(targetWidth))
+            {
+                if (position == ready.end()) position = ready.begin();
+                current.push_back(*position);
+                position = ready.erase(position);
+            }
+            cursor = current.back() + 1;
+            const Foam::label level = result.widths.size();
+            result.widths.push_back(current.size());
+            assigned += current.size();
+            for (const Foam::label cell : current) result.levels[cell] = level;
+            for (const Foam::label cell : current)
+                for (Foam::label face=starts[cell]; face<starts[cell + 1]; ++face)
+                    if (--predecessors[neighbours[face]] == 0)
+                        ready.insert(neighbours[face]);
+        }
+        if (assigned != mesh.nCells)
+            throw std::runtime_error("Index-window scheduler did not cover all cells");
+        finishStatistics(result, mesh.nCells);
+        if (!validateDependencies(mesh, result))
+            throw std::runtime_error("Index-window dependency validation failed");
+        return result;
+    }
+
+    const IndexKahnOrdering ordering = makeIndexKahnOrdering
+    (
+        static_cast<Foam::label>(mesh.nCells), starts, neighbours, targetWidth
+    );
     WavefrontStatistics result;
     result.levels.assign(mesh.nCells, -1);
-    Foam::label cursor = 0;
-    std::size_t assigned = 0;
-    while (!ready.empty())
+    for (std::size_t level=0; level + 1<ordering.levelStarts.size(); ++level)
     {
-        std::vector<Foam::label> current;
-        current.reserve(targetWidth);
-        auto position = window ? ready.lower_bound(cursor) : ready.begin();
-        while (!ready.empty() && current.size()<std::size_t(targetWidth))
-        {
-            if (position == ready.end()) position = ready.begin();
-            current.push_back(*position);
-            position = ready.erase(position);
-        }
-        cursor = current.back() + 1;
-        const Foam::label level = result.widths.size();
-        result.widths.push_back(current.size());
-        assigned += current.size();
-        for (const Foam::label cell : current) result.levels[cell] = level;
-        for (const Foam::label cell : current)
-            for (Foam::label face=starts[cell]; face<starts[cell + 1]; ++face)
-                if (--predecessors[neighbours[face]] == 0)
-                    ready.insert(neighbours[face]);
+        result.widths.push_back
+        (
+            ordering.levelStarts[level + 1] - ordering.levelStarts[level]
+        );
+        for
+        (
+            Foam::label row=ordering.levelStarts[level];
+            row<ordering.levelStarts[level + 1];
+            ++row
+        ) result.levels[ordering.newToOld[row]] = level;
     }
-    if (assigned != mesh.nCells)
-        throw std::runtime_error("Index-Kahn scheduler did not cover all cells");
     finishStatistics(result, mesh.nCells);
     if (!validateDependencies(mesh, result))
         throw std::runtime_error("Index-Kahn dependency validation failed");

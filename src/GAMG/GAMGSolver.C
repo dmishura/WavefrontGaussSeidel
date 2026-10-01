@@ -14,6 +14,7 @@
 #include "GAMGKernels.H"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -28,15 +29,43 @@ namespace smootherTest::gamg
 GAMGSolver::GAMGSolver
 (
     const Foam::lduMatrix& matrix,
-    GAMGControls controls
+    GAMGControls controls,
+    GAMGTimingStats* const timing,
+    const GAMGSpmvTraversal spmvTraversal,
+    const bool evictL1BeforeDirectFlat
 )
 :
+    setupBegin_(std::chrono::steady_clock::now()),
     controls_(std::move(controls)),
-    agglomeration_(GAMGMatrix::fromLduMatrix(matrix), controls_),
-    matrices_(GAMGMatrix::fromLduMatrix(matrix), agglomeration_.levels())
+    agglomeration_(GAMGMatrix::fromLduMatrix(matrix), controls_, timing),
+    matrices_
+    (
+        GAMGMatrix::fromLduMatrix(matrix),
+        agglomeration_.levels(),
+        timing
+    ),
+    spmvTraversal_(spmvTraversal),
+    evictL1BeforeDirectFlat_(evictL1BeforeDirectFlat),
+    timing_(timing)
 {
+    if (spmvTraversal_ == GAMGSpmvTraversal::DirectFlat)
+    {
+        directFlatMatrices_.reserve(matrices_.size());
+        for (const GAMGMatrix& levelMatrix : matrices_.levels())
+            directFlatMatrices_.push_back(makeDirectFlatMatrix(levelMatrix));
+    }
+    if (evictL1BeforeDirectFlat_)
+        l1EvictionBuffer_.assign(l1EvictionBufferBytes, std::uint8_t{1});
     if (controls_.maxIterations < 1 || controls_.minIterations < 0)
         throw std::runtime_error("invalid GAMG iteration controls");
+    if (timing_ && timing_->enabled())
+    {
+        timing_->configure(matrices_, agglomeration_);
+        timing_->setupWallSeconds += std::chrono::duration<double>
+        (
+            std::chrono::steady_clock::now() - setupBegin_
+        ).count();
+    }
     if (controls_.diagnostics)
     {
         std::cout << "GAMG hierarchy:\n";
@@ -53,6 +82,79 @@ GAMGSolver::GAMGSolver
                 << " coeffL1=" << level.coefficientL1 << '\n';
         }
     }
+}
+
+void GAMGSolver::evictL1BeforeDirectFlat() const
+{
+    if (!evictL1BeforeDirectFlat_) return;
+    l1EvictionChecksum_ = evictL1
+    (
+        l1EvictionBuffer_.data(), l1EvictionBuffer_.size()
+    );
+}
+
+void GAMGSolver::multiplyLevel
+(
+    const std::size_t level,
+    Foam::scalarField& result,
+    const Foam::scalarField& field
+) const
+{
+    if (spmvTraversal_ == GAMGSpmvTraversal::DirectFlat)
+    {
+        evictL1BeforeDirectFlat();
+        multiplyDirectFlat
+        (
+            result, directFlatMatrices_.at(level), field, timing_, level
+        );
+    }
+    else
+        multiply(result, matrices_[level], field, timing_, level);
+}
+
+void GAMGSolver::residualLevel
+(
+    const std::size_t level,
+    Foam::scalarField& result,
+    const Foam::scalarField& field,
+    const Foam::scalarField& source
+) const
+{
+    if (spmvTraversal_ == GAMGSpmvTraversal::DirectFlat)
+    {
+        evictL1BeforeDirectFlat();
+        residualDirectFlat
+        (
+            result, directFlatMatrices_.at(level), field, source,
+            timing_, level
+        );
+    }
+    else
+        residual(result, matrices_[level], field, source, timing_, level);
+}
+
+void GAMGSolver::scaleCorrectionLevel
+(
+    const std::size_t level,
+    Foam::scalarField& field,
+    const Foam::scalarField& source,
+    Foam::scalarField& work
+) const
+{
+    if (spmvTraversal_ == GAMGSpmvTraversal::DirectFlat)
+    {
+        evictL1BeforeDirectFlat();
+        scaleCorrectionDirectFlat
+        (
+            field, directFlatMatrices_.at(level), source, work,
+            timing_, level
+        );
+    }
+    else
+        scaleCorrection
+        (
+            field, matrices_[level], source, work, timing_, level
+        );
 }
 
 Foam::scalar GAMGSolver::normFactor
@@ -88,6 +190,9 @@ void GAMGSolver::vCycle
     const Foam::scalarField& finestResidual
 ) const
 {
+    const auto vcycleBegin = timing_ && timing_->enabled()
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     const std::size_t nLevels = matrices_.size();
     std::vector<Foam::scalarField> corrections(nLevels);
     std::vector<Foam::scalarField> sources(nLevels);
@@ -95,7 +200,14 @@ void GAMGSolver::vCycle
     for (std::size_t level=1; level<nLevels; ++level)
     {
         corrections[level].assign(matrices_[level].nCells(), 0.0);
-        restrictField(sources[level], sources[level - 1], agglomeration_[level - 1]);
+        restrictField
+        (
+            sources[level],
+            sources[level - 1],
+            agglomeration_[level - 1],
+            timing_,
+            level - 1
+        );
         if (level + 1 == nLevels) break;
 
         if (controls_.nPreSweeps > 0)
@@ -108,23 +220,21 @@ void GAMGSolver::vCycle
             );
             gaussSeidelSmooth
             (
-                corrections[level], matrices_[level], sources[level], sweeps
+                corrections[level], matrices_[level], sources[level], sweeps,
+                timing_, level
             );
             if (controls_.scaleCorrection && level + 2 < nLevels)
             {
                 Foam::scalarField work;
-                scaleCorrection
+                scaleCorrectionLevel
                 (
-                    corrections[level], matrices_[level], sources[level], work
+                    level, corrections[level], sources[level], work
                 );
             }
             Foam::scalarField levelResidual;
-            residual
+            residualLevel
             (
-                levelResidual,
-                matrices_[level],
-                corrections[level],
-                sources[level]
+                level, levelResidual, corrections[level], sources[level]
             );
             sources[level] = std::move(levelResidual);
         }
@@ -132,7 +242,8 @@ void GAMGSolver::vCycle
 
     solveCoarsest
     (
-        corrections.back(), matrices_[nLevels - 1], sources.back()
+        corrections.back(), matrices_[nLevels - 1], sources.back(),
+        timing_, nLevels - 1
     );
 
     if (nLevels > 2)
@@ -143,14 +254,15 @@ void GAMGSolver::vCycle
             if (controls_.nPreSweeps > 0) preSmoothed = corrections[level];
             prolongField
             (
-                corrections[level], corrections[level + 1], agglomeration_[level]
+                corrections[level], corrections[level + 1], agglomeration_[level],
+                timing_, level
             );
             if (controls_.scaleCorrection && level + 2 < nLevels)
             {
                 Foam::scalarField work;
-                scaleCorrection
+                scaleCorrectionLevel
                 (
-                    corrections[level], matrices_[level], sources[level], work
+                    level, corrections[level], sources[level], work
                 );
             }
             if (controls_.nPreSweeps > 0)
@@ -165,27 +277,36 @@ void GAMGSolver::vCycle
             );
             gaussSeidelSmooth
             (
-                corrections[level], matrices_[level], sources[level], sweeps
+                corrections[level], matrices_[level], sources[level], sweeps,
+                timing_, level
             );
         }
     }
 
     Foam::scalarField finestCorrection;
-    prolongField(finestCorrection, corrections[1], agglomeration_[0]);
+    prolongField
+    (
+        finestCorrection, corrections[1], agglomeration_[0], timing_, 0
+    );
     if (controls_.scaleCorrection)
     {
         Foam::scalarField work;
-        scaleCorrection
-        (
-            finestCorrection, matrices_[0], finestResidual, work
-        );
+        scaleCorrectionLevel(0, finestCorrection, finestResidual, work);
     }
     for (Foam::label cell=0; cell<matrices_[0].nCells(); ++cell)
         psi[cell] += finestCorrection[cell];
     gaussSeidelSmooth
     (
-        psi, matrices_[0], source, controls_.nFinestSweeps
+        psi, matrices_[0], source, controls_.nFinestSweeps, timing_, 0
     );
+    if (timing_ && timing_->enabled())
+        timing_->vcycleDurations.push_back
+        (
+            std::chrono::duration<double>
+            (
+                std::chrono::steady_clock::now() - vcycleBegin
+            ).count()
+        );
 }
 
 GAMGSolverPerformance GAMGSolver::solve
@@ -201,12 +322,28 @@ GAMGSolverPerformance GAMGSolver::solve
     )
         throw std::runtime_error("GAMG solve field size mismatch");
 
+    const auto solveBegin = timing_ && timing_->enabled()
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+
     Foam::scalarField matrixPsi;
-    multiply(matrixPsi, matrices_[0], psi);
+    multiplyLevel(0, matrixPsi, psi);
     const Foam::scalar normalization = normFactor(psi, source, matrixPsi);
     Foam::scalarField finestResidual(source.size());
+    const auto initialResidualBegin = timing_ && timing_->enabled()
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     for (Foam::label cell=0; cell<matrices_[0].nCells(); ++cell)
         finestResidual[cell] = source[cell] - matrixPsi[cell];
+    if (timing_ && timing_->enabled())
+        timing_->recordResidual
+        (
+            0,
+            std::chrono::duration<double>
+            (
+                std::chrono::steady_clock::now() - initialResidualBegin
+            ).count()
+        );
 
     GAMGSolverPerformance performance;
     performance.initialResidual = l1Norm(finestResidual)/normalization;
@@ -231,15 +368,35 @@ GAMGSolverPerformance GAMGSolver::solve
     )
     {
         vCycle(psi, source, finestResidual);
-        multiply(matrixPsi, matrices_[0], psi);
+        multiplyLevel(0, matrixPsi, psi);
+        const auto residualBegin = timing_ && timing_->enabled()
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         for (Foam::label cell=0; cell<matrices_[0].nCells(); ++cell)
             finestResidual[cell] = source[cell] - matrixPsi[cell];
+        if (timing_ && timing_->enabled())
+            timing_->recordResidual
+            (
+                0,
+                std::chrono::duration<double>
+                (
+                    std::chrono::steady_clock::now() - residualBegin
+                ).count()
+            );
         ++performance.iterations;
         performance.finalResidual = l1Norm(finestResidual)/normalization;
         performance.residualHistory.push_back(performance.finalResidual);
         performance.converged = converged()
             && performance.iterations >= controls_.minIterations;
     }
+    if (timing_ && timing_->enabled())
+        timing_->solveDurations.push_back
+        (
+            std::chrono::duration<double>
+            (
+                std::chrono::steady_clock::now() - solveBegin
+            ).count()
+        );
     return performance;
 }
 

@@ -36,6 +36,23 @@ struct WavefrontSchedule
     std::vector<Foam::scalar> diag;
 };
 
+// Topology-only Index-Kahn ordering shared by the smoother harness and
+// multigrid implementations. newToOld is grouped by dependency level.
+struct IndexKahnOrdering
+{
+    std::vector<Foam::label> levelStarts;
+    std::vector<Foam::label> newToOld;
+    std::vector<Foam::label> oldToNew;
+};
+
+IndexKahnOrdering makeIndexKahnOrdering
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label targetWidth
+);
+
 struct HybridWavefrontSchedule
 {
     const WavefrontSchedule* packed = nullptr;

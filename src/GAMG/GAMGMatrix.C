@@ -11,7 +11,9 @@
 #include "GAMGMatrix.H"
 
 #include "GAMGAgglomeration.H"
+#include "GAMGTiming.H"
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -115,13 +117,34 @@ GAMGMatrix agglomerateMatrix
 GAMGMatrixHierarchy::GAMGMatrixHierarchy
 (
     const GAMGMatrix& finest,
-    const std::vector<GAMGAgglomerationLevel>& agglomeration
+    const std::vector<GAMGAgglomerationLevel>& agglomeration,
+    GAMGTimingStats* const timing
 )
 {
     levels_.reserve(agglomeration.size() + 1);
     levels_.push_back(finest);
-    for (const GAMGAgglomerationLevel& level : agglomeration)
-        levels_.push_back(agglomerateMatrix(levels_.back(), level));
+    for (std::size_t level=0; level<agglomeration.size(); ++level)
+    {
+        const GAMGMatrix& fine = levels_.back();
+        const auto begin = timing && timing->enabled()
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        GAMGMatrix coarse = agglomerateMatrix(fine, agglomeration[level]);
+        if (timing && timing->enabled())
+            timing->recordCoarseMatrixBuild
+            (
+                level,
+                fine.nCells(),
+                fine.nFaces(),
+                coarse.nCells(),
+                coarse.nFaces(),
+                std::chrono::duration<double>
+                (
+                    std::chrono::steady_clock::now() - begin
+                ).count()
+            );
+        levels_.push_back(std::move(coarse));
+    }
 }
 
 } // namespace smootherTest::gamg

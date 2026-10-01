@@ -19,6 +19,8 @@
 namespace smootherTest::gamg
 {
 
+class GAMGTimingStats;
+
 struct GAMGAgglomerationLevel
 {
     Foam::label nFineCells = 0;
@@ -38,7 +40,9 @@ public:
     GAMGAgglomeration
     (
         const GAMGMatrix& finest,
-        const GAMGControls& controls
+        const GAMGControls& controls,
+        GAMGTimingStats* timing = nullptr,
+        double* temporaryCoarseMatrixSeconds = nullptr
     );
 
     std::size_t size() const noexcept { return levels_.size(); }

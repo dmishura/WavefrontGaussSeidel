@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <omp.h>
+#include <set>
 #include <stdexcept>
 
 namespace smootherTest
@@ -10,6 +11,58 @@ namespace smootherTest
 
 using Foam::label;
 using Foam::scalar;
+
+IndexKahnOrdering makeIndexKahnOrdering
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label targetWidth
+)
+{
+    if (targetWidth < 1) throw std::runtime_error("invalid Index-Kahn width");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error("invalid Index-Kahn LDU addressing");
+
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    while (!ready.empty())
+    {
+        std::vector<label> current;
+        current.reserve(targetWidth);
+        auto position = ready.begin();
+        while (!ready.empty() && current.size()<static_cast<std::size_t>(targetWidth))
+        {
+            current.push_back(*position);
+            position = ready.erase(position);
+        }
+        result.newToOld.insert
+        (
+            result.newToOld.end(), current.begin(), current.end()
+        );
+        result.levelStarts.push_back(result.newToOld.size());
+        for (const label cell : current)
+            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+                if (--predecessors[upperAddr[face]] == 0)
+                    ready.insert(upperAddr[face]);
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error("Index-Kahn scheduler did not cover all cells");
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
 
 LexicographicPackedSchedule makeLexicographicPackedSchedule
 (

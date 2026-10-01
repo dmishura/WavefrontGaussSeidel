@@ -66,9 +66,21 @@ add_library(
     src/GAMG/GAMGMatrix.C
     src/GAMG/GAMGKernels.C
     src/GAMG/GAMGSolver.C
+    src/GAMG/GAMGTiming.C
 )
 target_include_directories(gamg_standalone PUBLIC compat src src/GAMG)
 target_compile_options(gamg_standalone PRIVATE ${SMOOTHER_COMMON_OPTIONS})
+
+add_library(
+    fw_gamg
+    src/fwGAMG/fwGAMG.C
+    src/fwGAMG/fwHierarchy.C
+    src/fwGAMG/fwMatrix.C
+    src/fwGAMG/fwTiming.C
+)
+target_include_directories(fw_gamg PUBLIC compat src src/GAMG src/fwGAMG)
+target_compile_options(fw_gamg PRIVATE ${SMOOTHER_COMMON_OPTIONS})
+target_link_libraries(fw_gamg PUBLIC gamg_standalone smoother_kernels)
 set_source_files_properties(
     src/WavefrontGaussSeidelAVX2.C
     PROPERTIES COMPILE_OPTIONS "-mavx2"
@@ -147,7 +159,28 @@ target_compile_options(gamg_tests PRIVATE ${SMOOTHER_COMMON_OPTIONS})
 target_compile_definitions(
     gamg_tests PRIVATE SMOOTHER_TEST_DEFAULT_MESH="${MOTORBIKE_MESH}"
 )
-target_link_libraries(gamg_tests PRIVATE gamg_standalone smoother_harness GTest::gtest)
+target_link_libraries(
+    gamg_tests PRIVATE fw_gamg gamg_standalone smoother_harness GTest::gtest
+)
+
+add_executable(gamg_bench tests/GAMGBenchmarks.C)
+target_compile_options(gamg_bench PRIVATE ${SMOOTHER_COMMON_OPTIONS})
+target_compile_definitions(
+    gamg_bench PRIVATE SMOOTHER_TEST_DEFAULT_MESH="${MOTORBIKE_MESH}"
+)
+target_link_libraries(
+    gamg_bench PRIVATE fw_gamg gamg_standalone smoother_harness benchmark::benchmark
+)
+
+add_executable(gamg_level_bench tests/GAMGLevelBenchmarks.C)
+target_compile_options(gamg_level_bench PRIVATE ${SMOOTHER_COMMON_OPTIONS})
+target_compile_definitions(
+    gamg_level_bench PRIVATE SMOOTHER_TEST_DEFAULT_MESH="${MOTORBIKE_MESH}"
+)
+target_link_libraries(
+    gamg_level_bench
+    PRIVATE fw_gamg gamg_standalone smoother_harness benchmark::benchmark
+)
 
 if(BUILD_TESTING)
     add_test(

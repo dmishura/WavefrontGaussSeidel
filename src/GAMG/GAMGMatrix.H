@@ -20,6 +20,7 @@ namespace smootherTest::gamg
 {
 
 struct GAMGAgglomerationLevel;
+class GAMGTimingStats;
 
 class GAMGMatrix
 {
@@ -68,7 +69,8 @@ public:
     GAMGMatrixHierarchy
     (
         const GAMGMatrix& finest,
-        const std::vector<GAMGAgglomerationLevel>& agglomeration
+        const std::vector<GAMGAgglomerationLevel>& agglomeration,
+        GAMGTimingStats* timing = nullptr
     );
 
     std::size_t size() const noexcept { return levels_.size(); }
