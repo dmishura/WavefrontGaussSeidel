@@ -1,0 +1,32 @@
+{
+  "executable": "build-cmake/smoother_bench",
+  "output": "benchmark-results/process-isolated",
+  "prefix": ["taskset", "-c", "2"],
+  "env": {
+    "OMP_NUM_THREADS": "1"
+  },
+  "common_args": [
+    "--smoother_sweeps=250",
+    "--smoother_warmup=10",
+    "--tier=all"
+  ],
+  "meshes": [
+    {
+      "name": "motorBike",
+      "path": "build-cmake/mesh-data/MTB_example_polyMesh"
+    }
+  ],
+  "solvers": [
+    {
+      "name": "ReferenceGS",
+      "benchmark": "MotorBike/ReferenceGS/iterations:1/manual_time"
+    },
+    {
+      "name": "IndexKahn1024",
+      "benchmark": "MotorBike/IndexKahn1024/iterations:1/manual_time"
+    }
+  ],
+  "repetitions": 15,
+  "timeout_seconds": 900,
+  "random_seed": 439041101
+}

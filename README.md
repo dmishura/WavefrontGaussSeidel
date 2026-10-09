@@ -79,6 +79,27 @@ The default Make and CMake MotorBike preparation paths fetch the one required
 archive automatically. See [`meshes/README.md`](meshes/README.md) for cache,
 verification, offline-use, and custom-workload details.
 
+## Process-isolated benchmark runner
+
+`tools/benchmark_runner.py` runs every mesh/solver/repetition tuple in a fresh
+process. Child stdout/stderr is retained in per-run log files instead of being
+echoed to the terminal. Successful runs are resumable, checkpoints are written
+atomically, and `results.csv` plus `summary.csv` are refreshed after each run.
+Runner diagnostics support `quiet` (default), `normal`, and `debug` modes.
+The run fingerprint covers the benchmark binary, mesh contents, solver
+arguments, plan, and effective OpenMP settings, so incompatible results are
+kept in separate namespaces. Failed attempts retain their own logs, and only
+hash-verified complete JSON contributes to CSV output.
+
+Copy and edit `tools/benchmark_plan.example.json`, then run:
+
+```bash
+python3 tools/benchmark_runner.py --plan tools/benchmark_plan.example.json
+```
+
+The existing benchmark executables and Google Benchmark output remain
+unchanged; the runner stores their native JSON beside each complete raw log.
+
 ## Usage and attribution
 
 The original work in this repository may be used, modified, and redistributed
