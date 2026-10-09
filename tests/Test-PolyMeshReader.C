@@ -27,6 +27,8 @@ void testMotorBike(const fs::path& meshDir)
     require(mesh.nFaces == 1104083, "unexpected motorBike face count");
     require(mesh.nInternalFaces() == 1053964, "unexpected internal-face count");
     require(mesh.cellCentreX.size() == mesh.nCells, "cell centres were not read");
+    require(mesh.cellCentreY.size() == mesh.nCells, "cell centre Y was not read");
+    require(mesh.cellCentreZ.size() == mesh.nCells, "cell centre Z was not read");
     require
     (
         std::all_of
@@ -35,6 +37,20 @@ void testMotorBike(const fs::path& meshDir)
             [](const double x) { return std::isfinite(x); }
         ),
         "cell centre contains a non-finite X coordinate"
+    );
+    require
+    (
+        std::all_of
+        (
+            mesh.cellCentreY.begin(), mesh.cellCentreY.end(),
+            [](const double value) { return std::isfinite(value); }
+        )
+     && std::all_of
+        (
+            mesh.cellCentreZ.begin(), mesh.cellCentreZ.end(),
+            [](const double value) { return std::isfinite(value); }
+        ),
+        "cell centre contains a non-finite Y/Z coordinate"
     );
     const auto centreBounds = std::minmax_element
     (

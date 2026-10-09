@@ -150,6 +150,10 @@ add_executable(Test-PolyMeshReader tests/Test-PolyMeshReader.C)
 target_compile_options(Test-PolyMeshReader PRIVATE ${SMOOTHER_COMMON_OPTIONS})
 target_link_libraries(Test-PolyMeshReader PRIVATE smoother_kernels)
 
+add_executable(mesh_centres_export tools/ExportCellCentres.C)
+target_compile_options(mesh_centres_export PRIVATE ${SMOOTHER_COMMON_OPTIONS})
+target_link_libraries(mesh_centres_export PRIVATE smoother_kernels)
+
 add_executable(Test-GaussSeidel tests/Test-GaussSeidel.C)
 target_compile_options(Test-GaussSeidel PRIVATE ${SMOOTHER_COMMON_OPTIONS})
 target_link_libraries(Test-GaussSeidel PRIVATE smoother_kernels)
@@ -182,6 +186,32 @@ target_link_libraries(
     PRIVATE fw_gamg gamg_standalone smoother_harness benchmark::benchmark
 )
 
+# Optional AMDuProf profile-control integration for setup-free diagnostic ROIs.
+# This is intentionally limited to the level benchmark executable.
+find_path(
+    AMDUPROF_CONTROLLER_INCLUDE_DIR
+    AMDProfileController.h
+    HINTS ENV AMDUPROF_ROOT /opt/AMDuProf_5.3-521/include
+)
+find_library(
+    AMDUPROF_CONTROLLER_LIBRARY
+    AMDProfileController
+    HINTS
+        ENV AMDUPROF_ROOT
+        /opt/AMDuProf_5.3-521/lib/x64/shared
+        /opt/AMDuProf_5.3-521/lib/x64
+    PATH_SUFFIXES lib/x64/shared lib/x64
+)
+if(AMDUPROF_CONTROLLER_INCLUDE_DIR AND AMDUPROF_CONTROLLER_LIBRARY)
+    target_compile_definitions(gamg_level_bench PRIVATE HAVE_AMDUPROF_CONTROLLER)
+    target_include_directories(
+        gamg_level_bench PRIVATE ${AMDUPROF_CONTROLLER_INCLUDE_DIR}
+    )
+    target_link_libraries(
+        gamg_level_bench PRIVATE ${AMDUPROF_CONTROLLER_LIBRARY}
+    )
+endif()
+
 if(BUILD_TESTING)
     add_test(
         NAME motorBike_reader_correctness
@@ -190,6 +220,44 @@ if(BUILD_TESTING)
     set_tests_properties(
         motorBike_reader_correctness
         PROPERTIES LABELS "correctness;core;motorBike"
+    )
+
+    add_test(
+        NAME python_mesh_reader_correctness
+        COMMAND ${CMAKE_COMMAND} -E env
+            OPENFOAM_TEST_POLYMESH=${MOTORBIKE_MESH}
+            ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests
+            -p test_openfoam_mesh_reader.py
+            -v
+    )
+    set_tests_properties(
+        python_mesh_reader_correctness
+        PROPERTIES LABELS "correctness;core;motorBike;python"
+    )
+
+    add_test(
+        NAME python_ih_permutation_correctness
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests
+            -p test_ih_permutation.py
+            -v
+    )
+    set_tests_properties(
+        python_ih_permutation_correctness
+        PROPERTIES LABELS "correctness;core;python"
+    )
+
+    add_test(
+        NAME python_ih_locality_visualization_correctness
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests
+            -p test_visualize_ih1_locality.py
+            -v
+    )
+    set_tests_properties(
+        python_ih_locality_visualization_correctness
+        PROPERTIES LABELS "correctness;core;python"
     )
 
     add_test(

@@ -53,6 +53,84 @@ IndexKahnOrdering makeIndexKahnOrdering
     Foam::label targetWidth
 );
 
+// The same bounded incremental Index-Kahn chunks as makeIndexKahnOrdering,
+// with only the orientation of each completed chunk chosen to minimise the
+// jump from the final cell of the preceding chunk.
+IndexKahnOrdering makeIndexKahnOrderingOriented
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label targetWidth
+);
+
+// Incremental Kahn ordering with a FIFO active window.  Up to advanceStep
+// cells are executed and released at a time; the window is then refilled to
+// activeWidth from the smallest currently-ready cell indices.
+IndexKahnOrdering makeIndexKahnOrderingSlidingWindow
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label activeWidth,
+    Foam::label advanceStep
+);
+
+// Incremental Index-Kahn ordering with ordinary IH1W ready-set semantics and
+// an adaptive chunk boundary.  Chunk membership is the smallest ready cells;
+// the cut is placed immediately before the largest adjacent index gap in the
+// inclusive [minWidth,maxWidth] range.  Successors are released only after
+// the complete selected chunk has been appended.
+IndexKahnOrdering makeIndexKahnOrderingAdaptiveGap
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label minWidth,
+    Foam::label targetWidth,
+    Foam::label maxWidth
+);
+
+// Index-Kahn ordering using complete natural dependency levels.  Unlike the
+// fixed-width builder, this never splits the current ready set.
+IndexKahnOrdering makeIndexKahnOrderingUnbounded
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr
+);
+
+// Index-Kahn ordering using complete natural dependency frontiers for the
+// permutation, with each frozen frontier sliced into bounded execution levels.
+IndexKahnOrdering makeIndexKahnOrderingSliced
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label targetWidth
+);
+
+// Incremental Index-Kahn ordering that continues the next ready-set selection
+// after the final cell selected by the preceding bounded chunk.
+IndexKahnOrdering makeIndexKahnOrderingContinuing
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label targetWidth
+);
+
+// Incremental Index-Kahn ordering with continuation confined to the cells
+// that belonged to a natural frontier when that frontier began.  Successors
+// are released after every bounded chunk, but enter only the next frontier.
+IndexKahnOrdering makeIndexKahnOrderingFrontierContinuing
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label targetWidth
+);
+
 struct HybridWavefrontSchedule
 {
     const WavefrontSchedule* packed = nullptr;

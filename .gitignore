@@ -5,3 +5,5 @@
 /meshes/.dataset-*.json
 /HISTORY.md
 /tools/openfoam/*/Make/linux*/
+__pycache__/
+*.py[cod]

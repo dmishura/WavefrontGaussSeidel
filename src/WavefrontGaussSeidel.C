@@ -1,6 +1,7 @@
 #include "WavefrontGaussSeidel.H"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <omp.h>
 #include <set>
@@ -58,6 +59,559 @@ IndexKahnOrdering makeIndexKahnOrdering
     }
     if (result.newToOld.size() != static_cast<std::size_t>(nCells))
         throw std::runtime_error("Index-Kahn scheduler did not cover all cells");
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
+IndexKahnOrdering makeIndexKahnOrderingOriented
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label targetWidth
+)
+{
+    if (targetWidth < 1)
+        throw std::runtime_error("invalid oriented Index-Kahn width");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error("invalid oriented Index-Kahn LDU addressing");
+
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    bool havePrevious = false;
+    label previous = 0;
+    while (!ready.empty())
+    {
+        // This is deliberately identical to the production IH1W membership
+        // selection: take the first targetWidth entries from the same sorted
+        // ready set before releasing any successors.
+        std::vector<label> current;
+        current.reserve(targetWidth);
+        auto position = ready.begin();
+        while
+        (
+            !ready.empty()
+         && current.size() < static_cast<std::size_t>(targetWidth)
+        )
+        {
+            current.push_back(*position);
+            position = ready.erase(position);
+        }
+
+        bool reverse = false;
+        if (havePrevious)
+        {
+            const auto distance = [](const label a, const label b)
+            {
+                return a > b ? a - b : b - a;
+            };
+            reverse = distance(previous, current.back())
+                    < distance(previous, current.front());
+        }
+        if (reverse)
+            result.newToOld.insert
+            (
+                result.newToOld.end(), current.rbegin(), current.rend()
+            );
+        else
+            result.newToOld.insert
+            (
+                result.newToOld.end(), current.begin(), current.end()
+            );
+        previous = result.newToOld.back();
+        havePrevious = true;
+        result.levelStarts.push_back(result.newToOld.size());
+
+        // Release only after the complete, immutable chunk has been appended.
+        // Use the original ascending membership order; orientation cannot
+        // influence dependency processing or the following ready set.
+        for (const label cell : current)
+            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+                if (--predecessors[upperAddr[face]] == 0)
+                    ready.insert(upperAddr[face]);
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error
+        (
+            "oriented Index-Kahn scheduler did not cover all cells"
+        );
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
+IndexKahnOrdering makeIndexKahnOrderingSlidingWindow
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label activeWidth,
+    const label advanceStep
+)
+{
+    if (activeWidth < 1 || advanceStep < 1 || advanceStep > activeWidth)
+        throw std::runtime_error("invalid sliding-window Index-Kahn controls");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error
+      (
+          "invalid sliding-window Index-Kahn LDU addressing"
+      );
+
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    std::deque<label> active;
+    const auto refill = [&]
+    {
+        while
+        (
+            active.size() < static_cast<std::size_t>(activeWidth)
+         && !ready.empty()
+        )
+        {
+            const auto first = ready.begin();
+            active.push_back(*first);
+            ready.erase(first);
+        }
+    };
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    refill();
+    while (!active.empty())
+    {
+        const std::size_t count = std::min
+        (
+            active.size(), static_cast<std::size_t>(advanceStep)
+        );
+        std::vector<label> current;
+        current.reserve(count);
+        for (std::size_t i=0; i<count; ++i)
+        {
+            current.push_back(active.front());
+            active.pop_front();
+        }
+        result.newToOld.insert
+        (
+            result.newToOld.end(), current.begin(), current.end()
+        );
+        result.levelStarts.push_back(result.newToOld.size());
+
+        // Cells released by this step become eligible only for a later step.
+        for (const label cell : current)
+            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+                if (--predecessors[upperAddr[face]] == 0)
+                    ready.insert(upperAddr[face]);
+        refill();
+    }
+    if (!ready.empty() || result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error
+        (
+            "sliding-window Index-Kahn scheduler did not cover all cells"
+        );
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
+IndexKahnOrdering makeIndexKahnOrderingAdaptiveGap
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label minWidth,
+    const label targetWidth,
+    const label maxWidth
+)
+{
+    if
+    (
+        minWidth < 1
+     || targetWidth < minWidth
+     || targetWidth > maxWidth
+    ) throw std::runtime_error("invalid adaptive-gap Index-Kahn controls");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error
+      (
+          "invalid adaptive-gap Index-Kahn LDU addressing"
+      );
+
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    while (!ready.empty())
+    {
+        const std::size_t readySize = ready.size();
+        std::size_t chunkSize = std::min
+        (
+            readySize, static_cast<std::size_t>(maxWidth)
+        );
+        if (readySize > static_cast<std::size_t>(minWidth))
+        {
+            const std::size_t largestCandidateCut = std::min
+            (
+                static_cast<std::size_t>(maxWidth), readySize - 1
+            );
+            std::vector<label> candidates;
+            candidates.reserve(largestCandidateCut + 1);
+            auto position = ready.begin();
+            for
+            (
+                std::size_t index=0;
+                index<=largestCandidateCut;
+                ++index, ++position
+            ) candidates.push_back(*position);
+
+            chunkSize = static_cast<std::size_t>(minWidth);
+            label largestGap = candidates[chunkSize] - candidates[chunkSize - 1];
+            for
+            (
+                std::size_t cut=chunkSize + 1;
+                cut<=largestCandidateCut;
+                ++cut
+            )
+            {
+                const label gap = candidates[cut] - candidates[cut - 1];
+                // Earliest maximum is deterministic. targetWidth is an
+                // intentionally non-operative diagnostic reference for this
+                // first experiment.
+                if (gap > largestGap)
+                {
+                    largestGap = gap;
+                    chunkSize = cut;
+                }
+            }
+        }
+
+        std::vector<label> current;
+        current.reserve(chunkSize);
+        auto position = ready.begin();
+        for (std::size_t index=0; index<chunkSize; ++index)
+        {
+            current.push_back(*position);
+            position = ready.erase(position);
+        }
+        result.newToOld.insert
+        (
+            result.newToOld.end(), current.begin(), current.end()
+        );
+        result.levelStarts.push_back(result.newToOld.size());
+
+        for (const label cell : current)
+            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+                if (--predecessors[upperAddr[face]] == 0)
+                    ready.insert(upperAddr[face]);
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error
+        (
+            "adaptive-gap Index-Kahn scheduler did not cover all cells"
+        );
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
+IndexKahnOrdering makeIndexKahnOrderingUnbounded
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr
+)
+{
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error("invalid unbounded Index-Kahn LDU addressing");
+
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    while (!ready.empty())
+    {
+        std::vector<label> current(ready.begin(), ready.end());
+        ready.clear();
+        result.newToOld.insert
+        (
+            result.newToOld.end(), current.begin(), current.end()
+        );
+        result.levelStarts.push_back(result.newToOld.size());
+        for (const label cell : current)
+            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+                if (--predecessors[upperAddr[face]] == 0)
+                    ready.insert(upperAddr[face]);
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error
+        (
+            "unbounded Index-Kahn scheduler did not cover all cells"
+        );
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
+IndexKahnOrdering makeIndexKahnOrderingSliced
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label targetWidth
+)
+{
+    if (targetWidth < 1)
+        throw std::runtime_error("invalid sliced Index-Kahn width");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error("invalid sliced Index-Kahn LDU addressing");
+
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    while (!ready.empty())
+    {
+        // Freeze the complete natural frontier before releasing successors.
+        // std::set iteration preserves the same index order as IH1U.
+        std::vector<label> currentNatural(ready.begin(), ready.end());
+        ready.clear();
+        result.newToOld.insert
+        (
+            result.newToOld.end(),
+            currentNatural.begin(),
+            currentNatural.end()
+        );
+        const std::size_t naturalBegin =
+            result.newToOld.size() - currentNatural.size();
+        for
+        (
+            std::size_t offset=targetWidth;
+            offset<currentNatural.size();
+            offset += targetWidth
+        )
+        {
+            result.levelStarts.push_back(naturalBegin + offset);
+        }
+        result.levelStarts.push_back(result.newToOld.size());
+
+        // Successors populate only the next natural Kahn frontier.
+        for (const label cell : currentNatural)
+            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+                if (--predecessors[upperAddr[face]] == 0)
+                    ready.insert(upperAddr[face]);
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error
+        (
+            "sliced Index-Kahn scheduler did not cover all cells"
+        );
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
+IndexKahnOrdering makeIndexKahnOrderingContinuing
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label targetWidth
+)
+{
+    if (targetWidth < 1)
+        throw std::runtime_error("invalid continuing Index-Kahn width");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error("invalid continuing Index-Kahn LDU addressing");
+
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    label anchor = 0;
+    while (!ready.empty())
+    {
+        std::vector<label> current;
+        current.reserve(targetWidth);
+        auto position = ready.lower_bound(anchor);
+        if (position == ready.end()) position = ready.begin();
+        label lastSelected = *position;
+        while
+        (
+            !ready.empty()
+         && current.size() < static_cast<std::size_t>(targetWidth)
+        )
+        {
+            lastSelected = *position;
+            current.push_back(lastSelected);
+            position = ready.erase(position);
+            if (position == ready.end() && !ready.empty())
+                position = ready.begin();
+        }
+        anchor = lastSelected == std::numeric_limits<label>::max()
+            ? 0 : lastSelected + 1;
+        result.newToOld.insert
+        (
+            result.newToOld.end(), current.begin(), current.end()
+        );
+        result.levelStarts.push_back(result.newToOld.size());
+        for (const label cell : current)
+            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+                if (--predecessors[upperAddr[face]] == 0)
+                    ready.insert(upperAddr[face]);
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error
+        (
+            "continuing Index-Kahn scheduler did not cover all cells"
+        );
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
+IndexKahnOrdering makeIndexKahnOrderingFrontierContinuing
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label targetWidth
+)
+{
+    if (targetWidth < 1)
+        throw std::runtime_error("invalid frontier-continuing Index-Kahn width");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error
+      (
+          "invalid frontier-continuing Index-Kahn LDU addressing"
+      );
+
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    while (!ready.empty())
+    {
+        // Freeze membership without copying the complete frontier.  Newly
+        // released successors are inserted into ready and cannot participate
+        // until frontierReady has been exhausted.
+        std::set<label> frontierReady;
+        frontierReady.swap(ready);
+        label anchor = *frontierReady.begin();
+
+        while (!frontierReady.empty())
+        {
+            std::vector<label> current;
+            current.reserve(targetWidth);
+            auto position = frontierReady.lower_bound(anchor);
+            if (position == frontierReady.end())
+                position = frontierReady.begin();
+            label lastSelected = *position;
+            while
+            (
+                !frontierReady.empty()
+             && current.size() < static_cast<std::size_t>(targetWidth)
+            )
+            {
+                lastSelected = *position;
+                current.push_back(lastSelected);
+                position = frontierReady.erase(position);
+                if (position == frontierReady.end() && !frontierReady.empty())
+                    position = frontierReady.begin();
+            }
+            anchor = lastSelected == std::numeric_limits<label>::max()
+                ? 0 : lastSelected + 1;
+            result.newToOld.insert
+            (
+                result.newToOld.end(), current.begin(), current.end()
+            );
+            result.levelStarts.push_back(result.newToOld.size());
+
+            // Preserve IH1W incremental release, but place every newly-ready
+            // successor in the next-frontier set.
+            for (const label cell : current)
+            {
+                for
+                (
+                    label face=ownerStarts[cell];
+                    face<ownerStarts[cell + 1];
+                    ++face
+                )
+                {
+                    if (--predecessors[upperAddr[face]] == 0)
+                        ready.insert(upperAddr[face]);
+                }
+            }
+        }
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error
+        (
+            "frontier-continuing Index-Kahn scheduler did not cover all cells"
+        );
     result.oldToNew.resize(nCells);
     for (label row=0; row<nCells; ++row)
         result.oldToNew[result.newToOld[row]] = row;

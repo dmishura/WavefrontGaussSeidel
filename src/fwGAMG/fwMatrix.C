@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace smootherTest::fwgamg
@@ -176,6 +177,289 @@ Matrix Matrix::buildNatural
     return buildWithOrdering
     (
         native, std::move(ordering), 0.0, timing,
+        buildFlatEdges, buildDirectFlatEdges,
+        buildNativeFaceOrderDirectEdges
+    );
+}
+
+Matrix Matrix::buildOriented
+(
+    const NativeMatrixData& native,
+    const Foam::label width,
+    LevelSetupTiming* const timing,
+    const bool buildFlatEdges,
+    const bool buildDirectFlatEdges,
+    const bool buildNativeFaceOrderDirectEdges
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error("invalid native matrix for oriented fw packing");
+
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr) ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    IndexKahnOrdering ordering = makeIndexKahnOrderingOriented
+    (
+        native.nCells, ownerStarts, native.upperAddr, width
+    );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native, std::move(ordering), scheduleSeconds, timing,
+        buildFlatEdges, buildDirectFlatEdges,
+        buildNativeFaceOrderDirectEdges
+    );
+}
+
+Matrix Matrix::buildSlidingWindow
+(
+    const NativeMatrixData& native,
+    const Foam::label activeWidth,
+    const Foam::label advanceStep,
+    LevelSetupTiming* const timing,
+    const bool buildFlatEdges,
+    const bool buildDirectFlatEdges,
+    const bool buildNativeFaceOrderDirectEdges
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error
+      (
+          "invalid native matrix for sliding-window fw packing"
+      );
+
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr) ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    IndexKahnOrdering ordering = makeIndexKahnOrderingSlidingWindow
+    (
+        native.nCells, ownerStarts, native.upperAddr,
+        activeWidth, advanceStep
+    );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native, std::move(ordering), scheduleSeconds, timing,
+        buildFlatEdges, buildDirectFlatEdges,
+        buildNativeFaceOrderDirectEdges
+    );
+}
+
+Matrix Matrix::buildAdaptiveGap
+(
+    const NativeMatrixData& native,
+    const Foam::label minWidth,
+    const Foam::label targetWidth,
+    const Foam::label maxWidth,
+    LevelSetupTiming* const timing,
+    const bool buildFlatEdges,
+    const bool buildDirectFlatEdges,
+    const bool buildNativeFaceOrderDirectEdges
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error
+      (
+          "invalid native matrix for adaptive-gap fw packing"
+      );
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr)
+        ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+    IndexKahnOrdering ordering = makeIndexKahnOrderingAdaptiveGap
+    (
+        native.nCells,
+        ownerStarts,
+        native.upperAddr,
+        minWidth,
+        targetWidth,
+        maxWidth
+    );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native,
+        std::move(ordering),
+        scheduleSeconds,
+        timing,
+        buildFlatEdges,
+        buildDirectFlatEdges,
+        buildNativeFaceOrderDirectEdges
+    );
+}
+
+Matrix Matrix::buildUnbounded
+(
+    const NativeMatrixData& native,
+    LevelSetupTiming* const timing,
+    const bool buildFlatEdges,
+    const bool buildDirectFlatEdges,
+    const bool buildNativeFaceOrderDirectEdges
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error("invalid native matrix for unbounded fw packing");
+
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr) ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    IndexKahnOrdering ordering = makeIndexKahnOrderingUnbounded
+    (
+        native.nCells, ownerStarts, native.upperAddr
+    );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native, std::move(ordering), scheduleSeconds, timing,
+        buildFlatEdges, buildDirectFlatEdges,
+        buildNativeFaceOrderDirectEdges
+    );
+}
+
+Matrix Matrix::buildSliced
+(
+    const NativeMatrixData& native,
+    const Foam::label width,
+    LevelSetupTiming* const timing,
+    const bool buildFlatEdges,
+    const bool buildDirectFlatEdges,
+    const bool buildNativeFaceOrderDirectEdges
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error("invalid native matrix for sliced fw packing");
+
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr) ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    IndexKahnOrdering ordering = makeIndexKahnOrderingSliced
+    (
+        native.nCells, ownerStarts, native.upperAddr, width
+    );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native, std::move(ordering), scheduleSeconds, timing,
+        buildFlatEdges, buildDirectFlatEdges,
+        buildNativeFaceOrderDirectEdges
+    );
+}
+
+Matrix Matrix::buildContinuing
+(
+    const NativeMatrixData& native,
+    const Foam::label width,
+    LevelSetupTiming* const timing,
+    const bool buildFlatEdges,
+    const bool buildDirectFlatEdges,
+    const bool buildNativeFaceOrderDirectEdges
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error
+      (
+          "invalid native matrix for continuing fw packing"
+      );
+
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr) ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    IndexKahnOrdering ordering = makeIndexKahnOrderingContinuing
+    (
+        native.nCells, ownerStarts, native.upperAddr, width
+    );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native, std::move(ordering), scheduleSeconds, timing,
+        buildFlatEdges, buildDirectFlatEdges,
+        buildNativeFaceOrderDirectEdges
+    );
+}
+
+Matrix Matrix::buildFrontierContinuing
+(
+    const NativeMatrixData& native,
+    const Foam::label width,
+    LevelSetupTiming* const timing,
+    const bool buildFlatEdges,
+    const bool buildDirectFlatEdges,
+    const bool buildNativeFaceOrderDirectEdges
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error
+      (
+          "invalid native matrix for frontier-continuing fw packing"
+      );
+
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr) ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    IndexKahnOrdering ordering = makeIndexKahnOrderingFrontierContinuing
+    (
+        native.nCells, ownerStarts, native.upperAddr, width
+    );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native, std::move(ordering), scheduleSeconds, timing,
         buildFlatEdges, buildDirectFlatEdges,
         buildNativeFaceOrderDirectEdges
     );
@@ -589,6 +873,85 @@ void Matrix::multiplyLduOrderDirectFlatEdgeWise
         const Foam::scalar coefficient = lduOrderDirectEdgeCoeffs_[face];
         result[owner] += coefficient*field[column];
         result[column] += coefficient*field[owner];
+    }
+    if (timing && timing->enabled)
+        add(timing->levels.at(level).spmv, elapsed(begin));
+}
+
+void Matrix::multiplyLduOrderDirectFlatEdgeWisePrefetch
+(
+    Foam::scalarField& result,
+    const Foam::scalarField& field,
+    const DirectFlatPrefetch prefetch,
+    const Foam::label distance,
+    TimingStats* const timing,
+    const std::size_t level
+) const
+{
+    if (field.size() != diag_.size())
+        throw std::runtime_error
+        (
+            "fw LDU-order prefetch SpMV field size mismatch"
+        );
+    if
+    (
+        lduOrderDirectEdgeOwners_.size() != static_cast<std::size_t>(nFaces_)
+     || lduOrderDirectEdgeColumns_.size() != static_cast<std::size_t>(nFaces_)
+     || lduOrderDirectEdgeCoeffs_.size() != static_cast<std::size_t>(nFaces_)
+    ) throw std::runtime_error
+    (
+        "fw LDU-order direct flat edge view was not constructed"
+    );
+    if (distance <= 0)
+        throw std::runtime_error("fw Direct-flat prefetch distance must be positive");
+
+    const auto begin = std::chrono::steady_clock::now();
+    result.resize(field.size());
+    for (Foam::label row=0; row<nCells(); ++row)
+        result[row] = diag_[row]*field[row];
+
+    const Foam::label prefetchEnd = std::max(Foam::label(0), nFaces_ - distance);
+    const auto run = [&](const auto prefetchFieldTag, const auto prefetchResultTag)
+    {
+        constexpr bool prefetchField = decltype(prefetchFieldTag)::value;
+        constexpr bool prefetchResult = decltype(prefetchResultTag)::value;
+        Foam::label face = 0;
+        for (; face<prefetchEnd; ++face)
+        {
+            const Foam::label futureColumn =
+                lduOrderDirectEdgeColumns_[face + distance];
+            if constexpr (prefetchField)
+                __builtin_prefetch(&field[futureColumn], 0, 2);
+            if constexpr (prefetchResult)
+                __builtin_prefetch(&result[futureColumn], 1, 2);
+
+            const Foam::label owner = lduOrderDirectEdgeOwners_[face];
+            const Foam::label column = lduOrderDirectEdgeColumns_[face];
+            const Foam::scalar coefficient = lduOrderDirectEdgeCoeffs_[face];
+            result[owner] += coefficient*field[column];
+            result[column] += coefficient*field[owner];
+        }
+        for (; face<nFaces_; ++face)
+        {
+            const Foam::label owner = lduOrderDirectEdgeOwners_[face];
+            const Foam::label column = lduOrderDirectEdgeColumns_[face];
+            const Foam::scalar coefficient = lduOrderDirectEdgeCoeffs_[face];
+            result[owner] += coefficient*field[column];
+            result[column] += coefficient*field[owner];
+        }
+    };
+
+    switch (prefetch)
+    {
+        case DirectFlatPrefetch::Field:
+            run(std::true_type{}, std::false_type{});
+            break;
+        case DirectFlatPrefetch::Result:
+            run(std::false_type{}, std::true_type{});
+            break;
+        case DirectFlatPrefetch::FieldAndResult:
+            run(std::true_type{}, std::true_type{});
+            break;
     }
     if (timing && timing->enabled)
         add(timing->levels.at(level).spmv, elapsed(begin));

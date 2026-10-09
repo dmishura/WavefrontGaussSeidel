@@ -18,6 +18,13 @@ struct NativeMatrixData
 
 NativeMatrixData nativeMatrixData(const Foam::lduMatrix& matrix);
 
+enum class DirectFlatPrefetch
+{
+    Field,
+    Result,
+    FieldAndResult
+};
+
 class Matrix
 {
     Foam::label nFaces_ = 0;
@@ -57,6 +64,78 @@ public:
     Matrix() = default;
 
     static Matrix build
+    (
+        const NativeMatrixData& native,
+        Foam::label width,
+        LevelSetupTiming* timing = nullptr,
+        bool buildFlatEdges = false,
+        bool buildDirectFlatEdges = false,
+        bool buildNativeFaceOrderDirectEdges = false
+    );
+
+    static Matrix buildUnbounded
+    (
+        const NativeMatrixData& native,
+        LevelSetupTiming* timing = nullptr,
+        bool buildFlatEdges = false,
+        bool buildDirectFlatEdges = false,
+        bool buildNativeFaceOrderDirectEdges = false
+    );
+
+    static Matrix buildOriented
+    (
+        const NativeMatrixData& native,
+        Foam::label width,
+        LevelSetupTiming* timing = nullptr,
+        bool buildFlatEdges = false,
+        bool buildDirectFlatEdges = false,
+        bool buildNativeFaceOrderDirectEdges = false
+    );
+
+    static Matrix buildSlidingWindow
+    (
+        const NativeMatrixData& native,
+        Foam::label activeWidth,
+        Foam::label advanceStep,
+        LevelSetupTiming* timing = nullptr,
+        bool buildFlatEdges = false,
+        bool buildDirectFlatEdges = false,
+        bool buildNativeFaceOrderDirectEdges = false
+    );
+
+    static Matrix buildAdaptiveGap
+    (
+        const NativeMatrixData& native,
+        Foam::label minWidth,
+        Foam::label targetWidth,
+        Foam::label maxWidth,
+        LevelSetupTiming* timing = nullptr,
+        bool buildFlatEdges = false,
+        bool buildDirectFlatEdges = false,
+        bool buildNativeFaceOrderDirectEdges = false
+    );
+
+    static Matrix buildSliced
+    (
+        const NativeMatrixData& native,
+        Foam::label width,
+        LevelSetupTiming* timing = nullptr,
+        bool buildFlatEdges = false,
+        bool buildDirectFlatEdges = false,
+        bool buildNativeFaceOrderDirectEdges = false
+    );
+
+    static Matrix buildContinuing
+    (
+        const NativeMatrixData& native,
+        Foam::label width,
+        LevelSetupTiming* timing = nullptr,
+        bool buildFlatEdges = false,
+        bool buildDirectFlatEdges = false,
+        bool buildNativeFaceOrderDirectEdges = false
+    );
+
+    static Matrix buildFrontierContinuing
     (
         const NativeMatrixData& native,
         Foam::label width,
@@ -194,6 +273,18 @@ public:
     (
         Foam::scalarField& result,
         const Foam::scalarField& field,
+        TimingStats* timing = nullptr,
+        std::size_t level = 0
+    ) const;
+
+    // Diagnostic native-face traversal with software prefetch.  The edge
+    // order and arithmetic are identical to the production implementation.
+    void multiplyLduOrderDirectFlatEdgeWisePrefetch
+    (
+        Foam::scalarField& result,
+        const Foam::scalarField& field,
+        DirectFlatPrefetch prefetch,
+        Foam::label distance,
         TimingStats* timing = nullptr,
         std::size_t level = 0
     ) const;

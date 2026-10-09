@@ -43,6 +43,7 @@ struct Options
     bool deltaCandidateOnly = false;
     bool deltaCandidateSolveOnly = false;
     bool l1EvictionCompareOnly = false;
+    bool nativeFaceTimingOnly = false;
     std::string deltaCandidateSolveVariant = "both";
     std::string vtuneProfileVariant;
     bool googleRepetitionsSpecified = false;
@@ -83,6 +84,8 @@ Options consumeArguments(int& argc, char** argv)
             options.deltaCandidateSolveOnly = true;
         else if (argument == "--gamg_l1_eviction_compare_only")
             options.l1EvictionCompareOnly = true;
+        else if (argument == "--gamg_native_face_timing_only")
+            options.nativeFaceTimingOnly = true;
         else if
         (
             argument.rfind("--gamg_delta_candidate_solve_variant=", 0) == 0
@@ -1497,6 +1500,7 @@ int main(int argc, char** argv)
                          "[--gamg_delta_candidate_solve_only] "
                          "[--gamg_delta_candidate_solve_variant=direct|cleaned] "
                          "[--gamg_l1_eviction_compare_only] "
+                         "[--gamg_native_face_timing_only] "
                          "[--gamg_vtune_profile="
                          "reference|native-gs-direct|native-gs-direct-evict|"
                          "direct|direct-evict] "
@@ -1516,6 +1520,16 @@ int main(int argc, char** argv)
         if (options.l1EvictionCompareOnly)
         {
             runL1EvictionComparison(problem, options);
+            benchmark::Shutdown();
+            return 0;
+        }
+        if (options.nativeFaceTimingOnly)
+        {
+            runTimingSummary(problem, options);
+            runFwTimingSummary
+            (
+                problem, options, fwControls(), "NativeFaceDirectFlat"
+            );
             benchmark::Shutdown();
             return 0;
         }

@@ -400,6 +400,8 @@ PolyMeshTopology PolyMeshReader::read(const std::filesystem::path& dir)
         if (points.size() != mesh.nPoints)
             throw std::runtime_error("points size differs from nPoints");
         mesh.cellCentreX.assign(mesh.nCells, 0.0);
+        mesh.cellCentreY.assign(mesh.nCells, 0.0);
+        mesh.cellCentreZ.assign(mesh.nCells, 0.0);
         std::vector<double> cellVolumes(mesh.nCells, 0.0);
         for (std::size_t face=0; face<mesh.nFaces; ++face)
         {
@@ -414,6 +416,8 @@ PolyMeshTopology PolyMeshReader::read(const std::filesystem::path& dir)
                 throw std::runtime_error("face point outside point range");
             double faceVolume = 0.0;
             double faceMomentX = 0.0;
+            double faceMomentY = 0.0;
+            double faceMomentZ = 0.0;
             const auto& a = points[firstPoint];
             for (int p=begin + 1; p<end - 1; ++p)
             {
@@ -436,14 +440,20 @@ PolyMeshTopology PolyMeshReader::read(const std::filesystem::path& dir)
                 )/6.0;
                 faceVolume += volume;
                 faceMomentX += volume*(a[0] + b[0] + c[0])/4.0;
+                faceMomentY += volume*(a[1] + b[1] + c[1])/4.0;
+                faceMomentZ += volume*(a[2] + b[2] + c[2])/4.0;
             }
             const std::size_t ownerCell = mesh.owner[face];
             mesh.cellCentreX[ownerCell] += faceMomentX;
+            mesh.cellCentreY[ownerCell] += faceMomentY;
+            mesh.cellCentreZ[ownerCell] += faceMomentZ;
             cellVolumes[ownerCell] += faceVolume;
             if (face < mesh.nInternalFaces())
             {
                 const std::size_t neighbourCell = mesh.neighbour[face];
                 mesh.cellCentreX[neighbourCell] -= faceMomentX;
+                mesh.cellCentreY[neighbourCell] -= faceMomentY;
+                mesh.cellCentreZ[neighbourCell] -= faceMomentZ;
                 cellVolumes[neighbourCell] -= faceVolume;
             }
         }
@@ -452,6 +462,8 @@ PolyMeshTopology PolyMeshReader::read(const std::filesystem::path& dir)
             if (std::abs(cellVolumes[cell]) < 1e-300)
                 throw std::runtime_error("cell has zero geometric volume");
             mesh.cellCentreX[cell] /= cellVolumes[cell];
+            mesh.cellCentreY[cell] /= cellVolumes[cell];
+            mesh.cellCentreZ[cell] /= cellVolumes[cell];
         }
     }
     mesh.validate();
