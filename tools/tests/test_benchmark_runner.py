@@ -5,6 +5,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -80,6 +81,108 @@ class BenchmarkRunnerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(first), 12)
         self.assertEqual(len({task.key for task in first}), 12)
+
+    def test_series_is_one_process_per_mesh_with_exact_selection(self) -> None:
+        plan = {
+            "executable": "bench",
+            "meshes": [{"name": "m1", "path": "p1"}, {"name": "m2", "path": "p2"}],
+            "solvers": [
+                {"name": "s1", "benchmark": "Mesh/One"},
+                {"name": "s2", "benchmark": "Mesh/Two+Exact"},
+            ],
+            "repetitions": 3,
+            "random_seed": 17,
+            "isolation": "series",
+        }
+        tasks = runner.make_series_tasks(plan, "fingerprint")
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(len({task.key for task in tasks}), 2)
+        command = runner.series_command(plan, tasks[0], Path("result.json"))
+        benchmark_filter = next(
+            value.removeprefix("--benchmark_filter=")
+            for value in command if value.startswith("--benchmark_filter=")
+        )
+        self.assertTrue(re.fullmatch(benchmark_filter, "Mesh/One"))
+        self.assertTrue(re.fullmatch(benchmark_filter, "Mesh/Two+Exact"))
+        self.assertFalse(re.fullmatch(benchmark_filter, "Mesh/OneVariant"))
+        self.assertIn("--benchmark_repetitions=3", command)
+        self.assertIn("--benchmark_enable_random_interleaving=true", command)
+
+    def test_series_run_collects_all_samples_and_resumes_as_one_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.make_plan(root)
+            plan["isolation"] = "series"
+            plan["repetitions"] = 3
+            plan["solvers"] = [
+                {"name": "one", "benchmark": "Mesh/One"},
+                {"name": "two", "benchmark": "Mesh/Two"},
+            ]
+            plan["env"]["MOCK_BENCH_NAMES"] = "Mesh/One,Mesh/Two"
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            command = [sys.executable, str(RUNNER_PATH), "--plan", str(plan_path)]
+            first = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=5, check=False,
+            )
+            self.assertEqual(first.returncode, 0, first.stdout)
+            self.assertIn("complete=1 resumed=0 failed=0", first.stdout)
+            self.assertEqual((root / "counter").read_text(), "1")
+            with (Path(plan["output"]) / "results.csv").open(
+                newline="", encoding="utf-8"
+            ) as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual(len(rows), 6)
+            self.assertEqual({row["solver"] for row in rows}, {"one", "two"})
+            self.assertEqual(
+                {int(row["repetition"]) for row in rows}, {1, 2, 3}
+            )
+
+            tracked = [
+                Path(plan["output"]) / "results.csv",
+                Path(plan["output"]) / "summary.csv",
+            ]
+            before = {
+                path: (runner.sha256_file(path), path.stat().st_mtime_ns)
+                for path in tracked
+            }
+            second = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=5, check=False,
+            )
+            self.assertEqual(second.returncode, 0, second.stdout)
+            self.assertIn("complete=0 resumed=1 failed=0", second.stdout)
+            self.assertEqual((root / "counter").read_text(), "1")
+            self.assertEqual(
+                before,
+                {
+                    path: (runner.sha256_file(path), path.stat().st_mtime_ns)
+                    for path in tracked
+                },
+            )
+
+    def test_series_rejects_missing_extra_or_incomplete_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "result.json"
+
+            def write(names: list[str]) -> None:
+                result.write_text(json.dumps({"benchmarks": [
+                    {"name": name, "run_type": "iteration"} for name in names
+                ]}), encoding="utf-8")
+
+            write(["Mesh/One", "Mesh/One", "Mesh/Two", "Mesh/Two"])
+            self.assertTrue(runner.series_result_is_valid(
+                result, ("Mesh/One", "Mesh/Two"), 2
+            ))
+            write(["Mesh/One", "Mesh/One", "Mesh/Two"])
+            self.assertFalse(runner.series_result_is_valid(
+                result, ("Mesh/One", "Mesh/Two"), 2
+            ))
+            write(["Mesh/One", "Mesh/One", "Mesh/Two", "Mesh/Two", "Mesh/Extra"])
+            self.assertFalse(runner.series_result_is_valid(
+                result, ("Mesh/One", "Mesh/Two"), 2
+            ))
 
     def test_output_lock_rejects_concurrent_runner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

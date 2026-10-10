@@ -1,0 +1,28 @@
+{
+  "executable": "build-intelm2/gamg_level_bench",
+  "isolation": "series",
+  "output": "benchmark-results/release-impact-runner",
+  "prefix": ["taskset", "-c", "2"],
+  "env": {"OMP_NUM_THREADS": "1"},
+  "common_args": [
+    "--gamg_mesh_name=MTBHPC_original",
+    "--gamg_release_impact",
+    "--gamg_release_impact_trace_dir=benchmark-results/release-impact/traces",
+    "--gamg_explicit_thp"
+  ],
+  "meshes": [{
+    "name": "MTBHPC_original",
+    "path": "build-intelm2/all-mesh-data/MTBHPC_original/polyMesh"
+  }],
+  "solvers": [
+    {"name": "W256", "benchmark": "GAMGLevel/MTBHPC_original/L00/ReleaseImpact/W256/GS/min_time:0.050"},
+    {"name": "W512", "benchmark": "GAMGLevel/MTBHPC_original/L00/ReleaseImpact/W512/GS/min_time:0.050"},
+    {"name": "W1024", "benchmark": "GAMGLevel/MTBHPC_original/L00/ReleaseImpact/W1024/GS/min_time:0.050"},
+    {"name": "W2048", "benchmark": "GAMGLevel/MTBHPC_original/L00/ReleaseImpact/W2048/GS/min_time:0.050"},
+    {"name": "W4096", "benchmark": "GAMGLevel/MTBHPC_original/L00/ReleaseImpact/W4096/GS/min_time:0.050"},
+    {"name": "W8192", "benchmark": "GAMGLevel/MTBHPC_original/L00/ReleaseImpact/W8192/GS/min_time:0.050"}
+  ],
+  "repetitions": 15,
+  "timeout_seconds": 1800,
+  "random_seed": 439041101
+}

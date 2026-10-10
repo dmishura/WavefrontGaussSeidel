@@ -1,0 +1,21 @@
+{
+  "executable": "build-intelm2/gamg_level_bench",
+  "isolation": "series",
+  "output": "benchmark-results/ih1w5-runner",
+  "prefix": ["taskset", "-c", "2"],
+  "env": {"OMP_NUM_THREADS": "1"},
+  "common_args": [
+    "--gamg_mesh_name=MTBHPC_renumbered", "--gamg_ih1w5",
+    "--gamg_ih1w5_w4=IH1W4_C",
+    "--gamg_ih1w5_trace_dir=benchmark-results/ih1w5-all/traces",
+    "--gamg_explicit_thp"
+  ],
+  "meshes": [{"name": "MTBHPC_renumbered", "path": "build-intelm2/all-mesh-data/MTBHPC_renumbered/polyMesh"}],
+  "solvers": [
+    {"name": "IH1W1024", "benchmark": "GAMGLevel/MTBHPC_renumbered/L00/IH1W1024/GS/min_time:0.050"},
+    {"name": "IH1W4_C", "benchmark": "GAMGLevel/MTBHPC_renumbered/L00/IH1W4_C/GS/min_time:0.050"},
+    {"name": "IH1W5_Q4", "benchmark": "GAMGLevel/MTBHPC_renumbered/L00/IH1W5_Q4/GS/min_time:0.050"},
+    {"name": "IH1W5_Q8", "benchmark": "GAMGLevel/MTBHPC_renumbered/L00/IH1W5_Q8/GS/min_time:0.050"}
+  ],
+  "repetitions": 15, "timeout_seconds": 900, "random_seed": 439041101
+}

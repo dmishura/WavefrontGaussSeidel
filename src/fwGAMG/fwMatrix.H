@@ -73,6 +73,14 @@ public:
         bool buildNativeFaceOrderDirectEdges = false
     );
 
+    static Matrix buildReleaseDiagnostic
+    (
+        const NativeMatrixData& native,
+        Foam::label width,
+        std::vector<ReleaseImpactChunkDiagnostic>* diagnostics,
+        LevelSetupTiming* timing = nullptr
+    );
+
     static Matrix buildUnbounded
     (
         const NativeMatrixData& native,
@@ -109,6 +117,17 @@ public:
         Foam::label minWidth,
         Foam::label targetWidth,
         Foam::label maxWidth,
+        LevelSetupTiming* timing = nullptr,
+        bool buildFlatEdges = false,
+        bool buildDirectFlatEdges = false,
+        bool buildNativeFaceOrderDirectEdges = false
+    );
+
+    static Matrix buildReadyFractionAdaptiveGap
+    (
+        const NativeMatrixData& native,
+        Foam::label readyDivisor,
+        std::vector<AdaptiveReadyChunkDiagnostic>* diagnostics = nullptr,
         LevelSetupTiming* timing = nullptr,
         bool buildFlatEdges = false,
         bool buildDirectFlatEdges = false,

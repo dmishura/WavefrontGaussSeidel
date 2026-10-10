@@ -81,9 +81,13 @@ verification, offline-use, and custom-workload details.
 
 ## Process-isolated benchmark runner
 
-`tools/benchmark_runner.py` runs every mesh/solver/repetition tuple in a fresh
-process. Child stdout/stderr is retained in per-run log files instead of being
-echoed to the terminal. Successful runs are resumable, checkpoints are written
+`tools/benchmark_runner.py` supports two isolation levels. The compatible
+default, `task`, runs every mesh/solver/repetition tuple in a fresh process.
+`series` runs all selected solvers and Google Benchmark repetitions for one
+mesh in one process, so mesh loading, hierarchy construction, repacking, and
+index preparation occur once per series. A failed series is retried as a unit.
+Child stdout/stderr is retained in per-run log files instead of being echoed to
+the terminal. Successful runs are resumable, checkpoints are written
 atomically, and `results.csv` plus `summary.csv` are refreshed after each run.
 Runner diagnostics support `quiet` (default), `normal`, and `debug` modes.
 The run fingerprint covers the benchmark binary, mesh contents, solver

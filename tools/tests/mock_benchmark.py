@@ -16,6 +16,13 @@ def option(prefix: str) -> str:
     raise RuntimeError(f"missing option {prefix}")
 
 
+def optional_option(prefix: str, default: str) -> str:
+    for argument in sys.argv[1:]:
+        if argument.startswith(prefix):
+            return argument[len(prefix):]
+    return default
+
+
 counter_path = Path(os.environ["MOCK_BENCH_COUNTER"])
 try:
     count = int(counter_path.read_text(encoding="utf-8")) + 1
@@ -58,16 +65,26 @@ elif mode in {"crash_once", "crash"}:
 
 result_path = Path(option("--benchmark_out="))
 result_path.parent.mkdir(parents=True, exist_ok=True)
-benchmarks = [
-    {
-        "name": os.environ.get("MOCK_BENCH_NAME", "Mesh/Solver"),
-        "run_type": "iteration",
-        "real_time": float(os.environ.get("MOCK_BENCH_MS", "2")),
-        "cpu_time": float(os.environ.get("MOCK_BENCH_MS", "2")),
-        "time_unit": "ms",
-        "cells": 10,
-    }
-]
+benchmark_names = os.environ.get(
+    "MOCK_BENCH_NAMES", os.environ.get("MOCK_BENCH_NAME", "Mesh/Solver")
+).split(",")
+repetitions = int(optional_option("--benchmark_repetitions=", "1"))
+benchmarks = []
+for benchmark_name in benchmark_names:
+    for repetition in range(repetitions):
+        milliseconds = float(os.environ.get("MOCK_BENCH_MS", "2")) + repetition
+        benchmarks.append(
+            {
+                "name": benchmark_name,
+                "run_type": "iteration",
+                "repetition_index": repetition,
+                "repetitions": repetitions,
+                "real_time": milliseconds,
+                "cpu_time": milliseconds,
+                "time_unit": "ms",
+                "cells": 10,
+            }
+        )
 if mode == "multiple":
     benchmarks.extend(
         {

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Process-isolated, resumable runner for Google Benchmark executables.
 
-Each mesh/solver/repetition tuple is a separate child process.  Child output is
-always written to disk; this program only emits compact progress diagnostics.
-The native Google Benchmark JSON is retained alongside a restart checkpoint,
-and summary.csv is rebuilt atomically after every successful child.
+The legacy ``task`` isolation runs every mesh/solver/repetition tuple in a
+fresh child.  The ``series`` isolation runs all solvers and repetitions for one
+mesh in one child, so mesh loading and benchmark fixture construction happen
+once for the series.  Child output is always written to disk; this program only
+emits compact progress diagnostics.
 """
 
 from __future__ import annotations
@@ -53,6 +54,34 @@ class Task:
                 f"rep-{self.repetition:04d}",
             )
         )
+
+
+@dataclass(frozen=True)
+class SeriesTask:
+    mesh_name: str
+    mesh_path: str
+    benchmarks: tuple[tuple[str, str], ...]
+    repetitions: int
+    run_fingerprint: str
+
+    @property
+    def key(self) -> str:
+        return "/".join(
+            (self.run_fingerprint, safe_name(self.mesh_name), "series")
+        )
+
+    def status_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "series",
+            "mesh_name": self.mesh_name,
+            "mesh_path": self.mesh_path,
+            "benchmarks": [
+                {"solver_name": solver, "benchmark_name": benchmark}
+                for solver, benchmark in self.benchmarks
+            ],
+            "repetitions": self.repetitions,
+            "run_fingerprint": self.run_fingerprint,
+        }
 
 
 def safe_name(value: str) -> str:
@@ -209,6 +238,9 @@ def load_plan(path: Path) -> dict[str, Any]:
         raise ValueError("plan is missing: " + ", ".join(missing))
     if not plan["meshes"] or not plan["solvers"]:
         raise ValueError("plan meshes and solvers must not be empty")
+    isolation = str(plan.get("isolation", "task"))
+    if isolation not in {"task", "series"}:
+        raise ValueError("plan isolation must be 'task' or 'series'")
     return plan
 
 
@@ -245,6 +277,45 @@ def make_tasks(plan: dict[str, Any], run_fingerprint: str = "unfingerprinted") -
     return tasks
 
 
+def validate_plan_names(plan: dict[str, Any]) -> None:
+    mesh_names = [str(mesh["name"]) for mesh in plan["meshes"]]
+    solver_names = [str(solver["name"]) for solver in plan["solvers"]]
+    benchmark_names = [solver_benchmark_name(solver) for solver in plan["solvers"]]
+    if len(set(mesh_names)) != len(mesh_names):
+        raise ValueError("mesh names must be unique")
+    if len(set(solver_names)) != len(solver_names):
+        raise ValueError("solver names must be unique")
+    if len(set(benchmark_names)) != len(benchmark_names):
+        raise ValueError("solver benchmark names must be unique")
+    if len({safe_name(name) for name in mesh_names}) != len(mesh_names):
+        raise ValueError("mesh names collide after filesystem normalization")
+    if len({safe_name(name) for name in solver_names}) != len(solver_names):
+        raise ValueError("solver names collide after filesystem normalization")
+
+
+def make_series_tasks(
+    plan: dict[str, Any], run_fingerprint: str = "unfingerprinted"
+) -> list[SeriesTask]:
+    repetitions = int(plan.get("repetitions", 1))
+    if repetitions < 1:
+        raise ValueError("repetitions must be positive")
+    validate_plan_names(plan)
+    benchmarks = tuple(
+        (str(solver["name"]), solver_benchmark_name(solver))
+        for solver in plan["solvers"]
+    )
+    tasks = [
+        SeriesTask(
+            str(mesh["name"]), str(mesh["path"]), benchmarks,
+            repetitions, run_fingerprint,
+        )
+        for mesh in plan["meshes"]
+    ]
+    seed = int(plan.get("random_seed", 0x1A2B3C4D))
+    random.Random(seed).shuffle(tasks)
+    return tasks
+
+
 def result_is_valid(result_path: Path, benchmark_name: str | None = None) -> bool:
     try:
         with result_path.open(encoding="utf-8") as source:
@@ -253,8 +324,37 @@ def result_is_valid(result_path: Path, benchmark_name: str | None = None) -> boo
         if len(entries) != 1:
             return False
         return benchmark_name is None or str(entries[0].get("name", "")) == benchmark_name
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, KeyError):
         return False
+
+
+def series_result_is_valid(
+    result_path: Path, benchmark_names: Iterable[str], repetitions: int
+) -> bool:
+    expected = tuple(benchmark_names)
+    try:
+        with result_path.open(encoding="utf-8") as source:
+            result = json.load(source)
+        counts = {name: 0 for name in expected}
+        for entry in iteration_entries(result):
+            name = str(entry.get("name", ""))
+            if name not in counts:
+                return False
+            counts[name] += 1
+        return bool(counts) and all(count == repetitions for count in counts.values())
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def status_result_is_valid(result_path: Path, task_status: dict[str, Any]) -> bool:
+    if task_status.get("kind") == "series":
+        benchmarks = task_status.get("benchmarks", [])
+        return series_result_is_valid(
+            result_path,
+            (str(item["benchmark_name"]) for item in benchmarks),
+            int(task_status["repetitions"]),
+        )
+    return result_is_valid(result_path, task_status.get("benchmark_name"))
 
 
 def completed(task_dir: Path, expected_fingerprint: str | None = None) -> bool:
@@ -270,12 +370,10 @@ def completed(task_dir: Path, expected_fingerprint: str | None = None) -> bool:
                 expected_fingerprint is None
                 or status.get("run_fingerprint") == expected_fingerprint
             )
-            and result_is_valid(
-                result_path, status.get("task", {}).get("benchmark_name")
-            )
+            and status_result_is_valid(result_path, status.get("task", {}))
             and status.get("result_sha256") == sha256_file(result_path)
         )
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, KeyError):
         return False
 
 
@@ -304,12 +402,28 @@ def collect_rows(output_root: Path, run_fingerprint: str) -> list[dict[str, Any]
             status = json.load(source)
         with (task_dir / "benchmark.json").open(encoding="utf-8") as source:
             result = json.load(source)
+        task_status = status["task"]
+        series_benchmarks = {
+            str(item["benchmark_name"]): str(item["solver_name"])
+            for item in task_status.get("benchmarks", [])
+        }
+        occurrence: dict[str, int] = {}
         for entry in iteration_entries(result):
+            benchmark_name = str(entry["name"])
+            occurrence[benchmark_name] = occurrence.get(benchmark_name, 0) + 1
+            if task_status.get("kind") == "series":
+                solver_name = series_benchmarks[benchmark_name]
+                repetition = int(
+                    entry.get("repetition_index", occurrence[benchmark_name] - 1)
+                ) + 1
+            else:
+                solver_name = task_status["solver_name"]
+                repetition = int(task_status["repetition"])
             row = {
-                "mesh": status["task"]["mesh_name"],
-                "solver": status["task"]["solver_name"],
-                "repetition": int(status["task"]["repetition"]),
-                "benchmark": entry["name"],
+                "mesh": task_status["mesh_name"],
+                "solver": solver_name,
+                "repetition": repetition,
+                "benchmark": benchmark_name,
                 "run_fingerprint": run_fingerprint,
                 "real_seconds": benchmark_seconds(entry, "real_time"),
                 "cpu_seconds": benchmark_seconds(entry, "cpu_time"),
@@ -407,6 +521,51 @@ def task_command(plan: dict[str, Any], task: Task, result_path: Path) -> list[st
     ]
 
 
+def series_command(
+    plan: dict[str, Any], task: SeriesTask, result_path: Path
+) -> list[str]:
+    prefix = [str(value) for value in plan.get("prefix", [])]
+    common = [str(value) for value in plan.get("common_args", [])]
+    exact_alternatives = "|".join(
+        re.escape(benchmark) for _, benchmark in task.benchmarks
+    )
+    return prefix + [
+        str(plan["executable"]),
+        f"--mesh={task.mesh_path}",
+        *common,
+        f"--benchmark_filter=^({exact_alternatives})$",
+        f"--benchmark_repetitions={task.repetitions}",
+        "--benchmark_enable_random_interleaving=true",
+        "--benchmark_report_aggregates_only=false",
+        f"--benchmark_out={result_path}",
+        "--benchmark_out_format=json",
+    ]
+
+
+def unit_status_dict(task: Task | SeriesTask) -> dict[str, Any]:
+    if isinstance(task, SeriesTask):
+        return task.status_dict()
+    return task.__dict__
+
+
+def unit_command(
+    plan: dict[str, Any], task: Task | SeriesTask, result_path: Path
+) -> list[str]:
+    if isinstance(task, SeriesTask):
+        return series_command(plan, task, result_path)
+    return task_command(plan, task, result_path)
+
+
+def unit_result_is_valid(result_path: Path, task: Task | SeriesTask) -> bool:
+    if isinstance(task, SeriesTask):
+        return series_result_is_valid(
+            result_path,
+            (benchmark for _, benchmark in task.benchmarks),
+            task.repetitions,
+        )
+    return result_is_valid(result_path, task.benchmark_name)
+
+
 class RunnerInterrupted(Exception):
     def __init__(self, signum: int):
         super().__init__(f"runner interrupted by signal {signum}")
@@ -484,7 +643,7 @@ def wait_for_child(
 
 
 def run_task(
-    plan: dict[str, Any], task: Task, output_root: Path, verbosity: int
+    plan: dict[str, Any], task: Task | SeriesTask, output_root: Path, verbosity: int
 ) -> bool:
     task_dir = output_root / "runs" / task.key
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -494,14 +653,14 @@ def run_task(
     result_path = task_dir / "benchmark.json"
     temporary_result = attempts_dir / f"{attempt_id}.benchmark.json.tmp"
     log_path = attempts_dir / f"{attempt_id}.log"
-    command = task_command(plan, task, temporary_result.resolve())
+    command = unit_command(plan, task, temporary_result.resolve())
     environment = os.environ.copy()
     environment.update({str(k): str(v) for k, v in plan.get("env", {}).items()})
     timeout = float(plan.get("timeout_seconds", 1800))
     started = time.time()
     running = {
         "state": "running",
-        "task": task.__dict__,
+        "task": unit_status_dict(task),
         "run_fingerprint": task.run_fingerprint,
         "attempt_id": attempt_id,
         "command": command,
@@ -515,8 +674,8 @@ def run_task(
     try:
         with log_path.open("wb") as log:
             returncode = wait_for_child(command, log, environment, timeout)
-        valid_result = returncode == 0 and result_is_valid(
-            temporary_result, task.benchmark_name
+        valid_result = returncode == 0 and unit_result_is_valid(
+            temporary_result, task
         )
         state = "complete" if valid_result else "failed"
         error = None if state == "complete" else "non-zero exit or invalid benchmark JSON"
@@ -595,7 +754,12 @@ def main() -> int:
     run_fingerprint, identity = measurement_identity(plan)
     with output_lock(output_root):
         atomic_json(output_root / "identities" / f"{run_fingerprint}.json", identity)
-        tasks = make_tasks(plan, run_fingerprint)
+        isolation = str(plan.get("isolation", "task"))
+        tasks: list[Task] | list[SeriesTask]
+        if isolation == "series":
+            tasks = make_series_tasks(plan, run_fingerprint)
+        else:
+            tasks = make_tasks(plan, run_fingerprint)
         verbosity = VERBOSITY[arguments.verbosity]
         complete_count = 0
         skipped_count = 0

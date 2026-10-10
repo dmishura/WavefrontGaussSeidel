@@ -152,6 +152,40 @@ Matrix Matrix::build
     );
 }
 
+Matrix Matrix::buildReleaseDiagnostic
+(
+    const NativeMatrixData& native,
+    const Foam::label width,
+    std::vector<ReleaseImpactChunkDiagnostic>* const diagnostics,
+    LevelSetupTiming* const timing
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error("invalid native matrix for fw packing");
+
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr) ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    IndexKahnOrdering ordering = makeIndexKahnOrderingReleaseDiagnostic
+    (
+        native.nCells, ownerStarts, native.upperAddr, width, diagnostics
+    );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native, std::move(ordering), scheduleSeconds, timing,
+        false, false, false
+    );
+}
+
 Matrix Matrix::buildNatural
 (
     const NativeMatrixData& native,
@@ -299,6 +333,56 @@ Matrix Matrix::buildAdaptiveGap
         targetWidth,
         maxWidth
     );
+    const double scheduleSeconds = elapsed(scheduleBegin);
+    return buildWithOrdering
+    (
+        native,
+        std::move(ordering),
+        scheduleSeconds,
+        timing,
+        buildFlatEdges,
+        buildDirectFlatEdges,
+        buildNativeFaceOrderDirectEdges
+    );
+}
+
+Matrix Matrix::buildReadyFractionAdaptiveGap
+(
+    const NativeMatrixData& native,
+    const Foam::label readyDivisor,
+    std::vector<AdaptiveReadyChunkDiagnostic>* const diagnostics,
+    LevelSetupTiming* const timing,
+    const bool buildFlatEdges,
+    const bool buildDirectFlatEdges,
+    const bool buildNativeFaceOrderDirectEdges
+)
+{
+    if
+    (
+        native.nCells < 1
+     || native.diag.size() != static_cast<std::size_t>(native.nCells)
+     || native.lowerAddr.size() != native.upperAddr.size()
+     || native.upper.size() != native.upperAddr.size()
+    ) throw std::runtime_error
+      (
+          "invalid native matrix for ready-fraction fw packing"
+      );
+
+    const auto scheduleBegin = std::chrono::steady_clock::now();
+    Foam::labelField ownerStarts(native.nCells + 1, 0);
+    for (const Foam::label owner : native.lowerAddr)
+        ++ownerStarts[owner + 1];
+    for (Foam::label cell=0; cell<native.nCells; ++cell)
+        ownerStarts[cell + 1] += ownerStarts[cell];
+    IndexKahnOrdering ordering =
+        makeIndexKahnOrderingReadyFractionAdaptiveGap
+        (
+            native.nCells,
+            ownerStarts,
+            native.upperAddr,
+            readyDivisor,
+            diagnostics
+        );
     const double scheduleSeconds = elapsed(scheduleBegin);
     return buildWithOrdering
     (

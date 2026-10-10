@@ -27,6 +27,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <signal.h>
@@ -55,7 +56,12 @@ bool productionIh1Only = false;
 bool ih1w2WidthSweep = false;
 bool ih1w3Experiment = false;
 bool ih1w4Experiment = false;
+bool ih1w5Experiment = false;
+bool releaseImpactExperiment = false;
 std::string ih1w4Batch = "all";
+std::string ih1w5W4Profile = "IH1W4_A";
+std::string ih1w5TraceDirectory;
+std::string releaseImpactTraceDirectory;
 bool permutationDumpOnly = false;
 std::string benchmarkMeshName;
 std::string permutationDumpDirectory;
@@ -65,6 +71,7 @@ Foam::label vtuneWarmupSweeps = 4;
 
 std::vector<Foam::label> boundedWidths()
 {
+    if (ih1w5Experiment) return {1024};
     if (ih1w4Experiment)
         return ih1w4Batch == "adaptive"
             ? std::vector<Foam::label>{1024}
@@ -254,6 +261,21 @@ void dumpFinePermutations
                     controls.minWidth,
                     controls.targetWidth,
                     controls.maxWidth
+                )
+            );
+        }
+    }
+    if (ih1w5Experiment)
+    {
+        for (const Foam::label divisor : {4, 8})
+        {
+            dumpPermutation
+            (
+                directory,
+                "IH1W5_Q" + std::to_string(divisor),
+                smootherTest::makeIndexKahnOrderingReadyFractionAdaptiveGap
+                (
+                    nCells, ownerStarts, upperAddr, divisor
                 )
             );
         }
@@ -448,6 +470,17 @@ double percentile(std::vector<Foam::label>& values, const double fraction)
     return values[index];
 }
 
+double percentileDouble(std::vector<double> values, const double fraction)
+{
+    if (values.empty()) return 0;
+    const std::size_t index = static_cast<std::size_t>
+    (
+        fraction*static_cast<double>(values.size() - 1)
+    );
+    std::nth_element(values.begin(), values.begin() + index, values.end());
+    return values[index];
+}
+
 struct ChunkJumpStats
 {
     double median = 0;
@@ -472,6 +505,107 @@ ChunkJumpStats chunkJumpStats(const fwgamg::Matrix& matrix)
     result.p90 = percentile(jumps, 0.90);
     result.p99 = percentile(jumps, 0.99);
     return result;
+}
+
+struct OrderingDiagnosticStats
+{
+    std::size_t chunks = 0;
+    double chunkMin = 0;
+    double chunkP10 = 0;
+    double chunkP50 = 0;
+    double chunkP90 = 0;
+    double chunkMean = 0;
+    double chunkMax = 0;
+    double targetP10 = 0;
+    double targetP50 = 0;
+    double targetP90 = 0;
+    double readyP10 = 0;
+    double readyP50 = 0;
+    double readyP90 = 0;
+    std::uint64_t rowJumpTotal = 0;
+    double rowJumpP90 = 0;
+    double rowJumpP99 = 0;
+    std::size_t largeJumps = 0;
+};
+
+OrderingDiagnosticStats orderingDiagnosticStats
+(
+    const fwgamg::Matrix& matrix,
+    const std::vector<smootherTest::AdaptiveReadyChunkDiagnostic>* diagnostics,
+    const double largeJumpThreshold
+)
+{
+    OrderingDiagnosticStats result;
+    std::vector<Foam::label> chunkSizes;
+    std::vector<Foam::label> targets;
+    std::vector<Foam::label> readySizes;
+    if (diagnostics)
+    {
+        chunkSizes.reserve(diagnostics->size());
+        targets.reserve(diagnostics->size());
+        readySizes.reserve(diagnostics->size());
+        for (const auto& diagnostic : *diagnostics)
+        {
+            chunkSizes.push_back(diagnostic.chosenChunkSize);
+            targets.push_back(diagnostic.targetWidth);
+            readySizes.push_back(diagnostic.readySize);
+        }
+    }
+    else
+    {
+        const std::vector<Foam::label>& starts = matrix.levelStarts();
+        chunkSizes.reserve(starts.empty() ? 0 : starts.size() - 1);
+        for (std::size_t chunk=0; chunk + 1<starts.size(); ++chunk)
+            chunkSizes.push_back(starts[chunk + 1] - starts[chunk]);
+    }
+    result.chunks = chunkSizes.size();
+    if (!chunkSizes.empty())
+    {
+        result.chunkMin = *std::min_element(chunkSizes.begin(), chunkSizes.end());
+        result.chunkMax = *std::max_element(chunkSizes.begin(), chunkSizes.end());
+        result.chunkMean = std::accumulate
+        (
+            chunkSizes.begin(), chunkSizes.end(), 0.0
+        )/chunkSizes.size();
+        result.chunkP10 = percentile(chunkSizes, 0.10);
+        result.chunkP50 = percentile(chunkSizes, 0.50);
+        result.chunkP90 = percentile(chunkSizes, 0.90);
+    }
+    result.targetP10 = percentile(targets, 0.10);
+    result.targetP50 = percentile(targets, 0.50);
+    result.targetP90 = percentile(targets, 0.90);
+    result.readyP10 = percentile(readySizes, 0.10);
+    result.readyP50 = percentile(readySizes, 0.50);
+    result.readyP90 = percentile(readySizes, 0.90);
+
+    std::vector<Foam::label> rowJumps;
+    const std::vector<Foam::label>& cells = matrix.newToOld();
+    rowJumps.reserve(cells.empty() ? 0 : cells.size() - 1);
+    for (std::size_t row=1; row<cells.size(); ++row)
+    {
+        const Foam::label jump = cells[row] > cells[row - 1]
+            ? cells[row] - cells[row - 1]
+            : cells[row - 1] - cells[row];
+        rowJumps.push_back(jump);
+        result.rowJumpTotal += static_cast<std::uint64_t>(jump);
+        result.largeJumps += jump >= largeJumpThreshold;
+    }
+    result.rowJumpP90 = percentile(rowJumps, 0.90);
+    result.rowJumpP99 = percentile(rowJumps, 0.99);
+    return result;
+}
+
+double setupTotalMilliseconds(const fwgamg::LevelSetupTiming& timing)
+{
+    return 1e3*
+    (
+        timing.scheduleSeconds
+      + timing.permutationSeconds
+      + timing.inversePermutationSeconds
+      + timing.matrixPackingSeconds
+      + timing.flatEdgeMetadataSeconds
+      + timing.directFlatEdgeMetadataSeconds
+    );
 }
 
 struct OrientedChunkStats
@@ -695,6 +829,7 @@ struct Problem
         Foam::label width = 0;
         std::vector<fwgamg::Matrix> matrices;
         std::vector<Foam::scalarField> sources;
+        std::vector<fwgamg::LevelSetupTiming> setup;
     };
 
     struct AdaptiveGapSweep
@@ -705,6 +840,18 @@ struct Problem
         Foam::label maxWidth = 0;
         std::vector<fwgamg::Matrix> matrices;
         std::vector<Foam::scalarField> sources;
+        std::vector<fwgamg::LevelSetupTiming> setup;
+    };
+
+    struct ReadyFractionSweep
+    {
+        std::string name;
+        Foam::label divisor = 0;
+        fwgamg::Matrix matrix;
+        Foam::scalarField source;
+        fwgamg::LevelSetupTiming setup;
+        std::vector<smootherTest::AdaptiveReadyChunkDiagnostic> diagnostics;
+        bool deterministic = false;
     };
 
     smootherTest::PolyMeshTopology mesh;
@@ -725,6 +872,7 @@ struct Problem
     std::vector<WidthSweep> orientedWidthSweeps;
     std::vector<WidthSweep> slidingWindowSweeps;
     std::vector<AdaptiveGapSweep> adaptiveGapSweeps;
+    std::vector<ReadyFractionSweep> readyFractionSweeps;
     std::vector<fwgamg::Matrix> slicedMatrices;
     std::vector<Foam::scalarField> slicedSources;
     std::vector<fwgamg::Matrix> continuingMatrices;
@@ -799,6 +947,7 @@ struct Problem
             variant.width = width;
             variant.matrices.reserve(baseline.matrices().size());
             variant.sources.reserve(baseline.matrices().size());
+            variant.setup.reserve(baseline.matrices().size());
             for
             (
                 std::size_t level=0;
@@ -806,13 +955,15 @@ struct Problem
                 ++level
             )
             {
+                fwgamg::LevelSetupTiming setup;
                 variant.matrices.push_back
                 (
                     fwgamg::Matrix::build
                     (
-                        nativeData(baseline.matrices()[level]), width
+                        nativeData(baseline.matrices()[level]), width, &setup
                     )
                 );
+                variant.setup.push_back(setup);
                 const fwgamg::Matrix& matrix = variant.matrices.back();
                 Foam::scalarField source(matrix.nCells());
                 for (Foam::label row=0; row<matrix.nCells(); ++row)
@@ -909,21 +1060,37 @@ struct Problem
             }
         }
 
-        if (ih1w4Experiment && ih1w4Batch != "fixed")
+        if
+        (
+            (ih1w4Experiment && ih1w4Batch != "fixed")
+         || ih1w5Experiment
+        )
         {
             struct Controls
             {
                 const char* name;
                 Foam::label minWidth, targetWidth, maxWidth;
             };
+            const std::vector<Controls> allConfigurations
+            {
+                Controls{"IH1W4_A", 768, 1024, 1536},
+                Controls{"IH1W4_B", 512, 1024, 2048},
+                Controls{"IH1W4_C", 1024, 1024, 2048}
+            };
+            std::vector<Controls> configurations;
+            if (ih1w5Experiment)
+            {
+                for (const Controls controls : allConfigurations)
+                    if (controls.name == ih1w5W4Profile)
+                        configurations.push_back(controls);
+                if (configurations.empty())
+                    throw std::runtime_error("invalid IH1W5 W4 profile");
+            }
+            else
+                configurations = allConfigurations;
             for
             (
-                const Controls controls :
-                {
-                    Controls{"IH1W4_A", 768, 1024, 1536},
-                    Controls{"IH1W4_B", 512, 1024, 2048},
-                    Controls{"IH1W4_C", 1024, 1024, 2048}
-                }
+                const Controls controls : configurations
             )
             {
                 AdaptiveGapSweep variant;
@@ -933,13 +1100,17 @@ struct Problem
                 variant.maxWidth = controls.maxWidth;
                 variant.matrices.reserve(baseline.matrices().size());
                 variant.sources.reserve(baseline.matrices().size());
+                variant.setup.reserve(baseline.matrices().size());
+                const std::size_t buildLevels = ih1w5Experiment
+                    ? 1 : baseline.matrices().size();
                 for
                 (
                     std::size_t level=0;
-                    level<baseline.matrices().size();
+                    level<buildLevels;
                     ++level
                 )
                 {
+                    fwgamg::LevelSetupTiming setup;
                     variant.matrices.push_back
                     (
                         fwgamg::Matrix::buildAdaptiveGap
@@ -947,9 +1118,11 @@ struct Problem
                             nativeData(baseline.matrices()[level]),
                             controls.minWidth,
                             controls.targetWidth,
-                            controls.maxWidth
+                            controls.maxWidth,
+                            &setup
                         )
                     );
+                    variant.setup.push_back(setup);
                     const fwgamg::Matrix& matrix = variant.matrices.back();
                     Foam::scalarField source(matrix.nCells());
                     for (Foam::label row=0; row<matrix.nCells(); ++row)
@@ -958,6 +1131,40 @@ struct Problem
                     variant.sources.push_back(std::move(source));
                 }
                 adaptiveGapSweeps.push_back(std::move(variant));
+            }
+        }
+
+        if (ih1w5Experiment)
+        {
+            const gamg::GAMGMatrix& level0 = baseline.matrices()[0];
+            const fwgamg::NativeMatrixData native = nativeData(level0);
+            Foam::labelField ownerStarts(level0.nCells() + 1, 0);
+            for (const Foam::label owner : level0.lowerAddr())
+                ++ownerStarts[owner + 1];
+            for (Foam::label cell=0; cell<level0.nCells(); ++cell)
+                ownerStarts[cell + 1] += ownerStarts[cell];
+            for (const Foam::label divisor : {4, 8})
+            {
+                ReadyFractionSweep variant;
+                variant.name = "IH1W5_Q" + std::to_string(divisor);
+                variant.divisor = divisor;
+                variant.matrix = fwgamg::Matrix::buildReadyFractionAdaptiveGap
+                (
+                    native, divisor, &variant.diagnostics, &variant.setup
+                );
+                variant.source.resize(variant.matrix.nCells());
+                for (Foam::label row=0; row<variant.matrix.nCells(); ++row)
+                    variant.source[row] =
+                        naturalSource.front()[variant.matrix.newToOld()[row]];
+                const smootherTest::IndexKahnOrdering repeated =
+                    smootherTest::makeIndexKahnOrderingReadyFractionAdaptiveGap
+                    (
+                        level0.nCells(), ownerStarts, level0.upperAddr(), divisor
+                    );
+                variant.deterministic =
+                    repeated.newToOld == variant.matrix.newToOld()
+                 && repeated.levelStarts == variant.matrix.levelStarts();
+                readyFractionSweeps.push_back(std::move(variant));
             }
         }
 
@@ -1018,6 +1225,171 @@ struct Problem
     }
 };
 
+// Memory-bounded L0-only fixture for the IH1W5 portability sweep.  Keeping
+// this separate avoids constructing unrelated full GAMG hierarchy views in
+// every process-isolated runner task.
+struct Ih1w5FocusedProblem
+{
+    struct Variant
+    {
+        std::string name;
+        fwgamg::Matrix matrix;
+        Foam::scalarField source;
+        fwgamg::LevelSetupTiming setup;
+        std::vector<smootherTest::AdaptiveReadyChunkDiagnostic> diagnostics;
+        bool deterministic = true;
+    };
+
+    smootherTest::PolyMeshTopology mesh;
+    Foam::lduMatrix fineMatrix;
+    gamg::GAMGMatrix ldu;
+    Foam::scalarField naturalSource;
+    std::vector<std::size_t> naturalWidths;
+    std::vector<Variant> variants;
+
+    explicit Ih1w5FocusedProblem(const std::string& meshDirectory)
+    :
+        mesh(smootherTest::PolyMeshReader::read(meshDirectory)),
+        fineMatrix(harness::makeMatrix(mesh)),
+        ldu(gamg::GAMGMatrix::fromLduMatrix(fineMatrix)),
+        naturalSource(ldu.nCells()),
+        naturalWidths(naturalDependencyWidths(ldu))
+    {
+        for (Foam::label cell=0; cell<ldu.nCells(); ++cell)
+            naturalSource[cell] = 0.75 + std::sin(0.019*cell)
+                + 0.2*std::cos(0.071*cell);
+
+        const fwgamg::NativeMatrixData native = nativeData(ldu);
+        const auto add = [&](Variant&& variant)
+        {
+            variant.source.resize(variant.matrix.nCells());
+            for (Foam::label row=0; row<variant.matrix.nCells(); ++row)
+                variant.source[row] =
+                    naturalSource[variant.matrix.newToOld()[row]];
+            variants.push_back(std::move(variant));
+        };
+
+        Variant bounded;
+        bounded.name = "IH1W1024";
+        bounded.matrix = fwgamg::Matrix::build
+        (
+            native, 1024, &bounded.setup
+        );
+        add(std::move(bounded));
+
+        Foam::label minWidth = 0, targetWidth = 1024, maxWidth = 0;
+        if (ih1w5W4Profile == "IH1W4_A")
+            minWidth = 768, maxWidth = 1536;
+        else if (ih1w5W4Profile == "IH1W4_B")
+            minWidth = 512, maxWidth = 2048;
+        else if (ih1w5W4Profile == "IH1W4_C")
+            minWidth = 1024, maxWidth = 2048;
+        else
+            throw std::runtime_error("invalid IH1W5 W4 profile");
+        Variant w4;
+        w4.name = ih1w5W4Profile;
+        w4.matrix = fwgamg::Matrix::buildAdaptiveGap
+        (
+            native, minWidth, targetWidth, maxWidth, &w4.setup
+        );
+        add(std::move(w4));
+
+        Foam::labelField ownerStarts(ldu.nCells() + 1, 0);
+        for (const Foam::label owner : ldu.lowerAddr())
+            ++ownerStarts[owner + 1];
+        for (Foam::label cell=0; cell<ldu.nCells(); ++cell)
+            ownerStarts[cell + 1] += ownerStarts[cell];
+        for (const Foam::label divisor : {4, 8})
+        {
+            Variant adaptive;
+            adaptive.name = "IH1W5_Q" + std::to_string(divisor);
+            adaptive.matrix = fwgamg::Matrix::buildReadyFractionAdaptiveGap
+            (
+                native, divisor, &adaptive.diagnostics, &adaptive.setup
+            );
+            const smootherTest::IndexKahnOrdering repeated =
+                smootherTest::makeIndexKahnOrderingReadyFractionAdaptiveGap
+                (
+                    ldu.nCells(), ownerStarts, ldu.upperAddr(), divisor
+                );
+            adaptive.deterministic =
+                repeated.newToOld == adaptive.matrix.newToOld()
+             && repeated.levelStarts == adaptive.matrix.levelStarts();
+            add(std::move(adaptive));
+        }
+    }
+};
+
+struct ReleaseImpactFocusedProblem
+{
+    struct Variant
+    {
+        Foam::label width = 0;
+        fwgamg::Matrix matrix;
+        Foam::scalarField source;
+        fwgamg::LevelSetupTiming setup;
+        std::vector<smootherTest::ReleaseImpactChunkDiagnostic> diagnostics;
+        bool deterministic = false;
+    };
+
+    smootherTest::PolyMeshTopology mesh;
+    Foam::lduMatrix fineMatrix;
+    gamg::GAMGMatrix ldu;
+    Foam::scalarField naturalSource;
+    std::vector<std::size_t> naturalWidths;
+    std::vector<Variant> variants;
+
+    explicit ReleaseImpactFocusedProblem(const std::string& meshDirectory)
+    :
+        mesh(smootherTest::PolyMeshReader::read(meshDirectory)),
+        fineMatrix(harness::makeMatrix(mesh)),
+        ldu(gamg::GAMGMatrix::fromLduMatrix(fineMatrix)),
+        naturalSource(ldu.nCells()),
+        naturalWidths(naturalDependencyWidths(ldu))
+    {
+        for (Foam::label cell=0; cell<ldu.nCells(); ++cell)
+            naturalSource[cell] = 0.75 + std::sin(0.019*cell)
+                + 0.2*std::cos(0.071*cell);
+
+        Foam::labelField ownerStarts(ldu.nCells() + 1, 0);
+        for (const Foam::label owner : ldu.lowerAddr())
+            ++ownerStarts[owner + 1];
+        for (Foam::label cell=0; cell<ldu.nCells(); ++cell)
+            ownerStarts[cell + 1] += ownerStarts[cell];
+
+        const fwgamg::NativeMatrixData native = nativeData(ldu);
+        for (const Foam::label width : {256, 512, 1024, 2048, 4096, 8192})
+        {
+            Variant variant;
+            variant.width = width;
+            variant.matrix = fwgamg::Matrix::buildReleaseDiagnostic
+            (
+                native, width, &variant.diagnostics, &variant.setup
+            );
+            variant.source.resize(variant.matrix.nCells());
+            for (Foam::label row=0; row<variant.matrix.nCells(); ++row)
+                variant.source[row] =
+                    naturalSource[variant.matrix.newToOld()[row]];
+            const smootherTest::IndexKahnOrdering ordinary =
+                smootherTest::makeIndexKahnOrdering
+                (
+                    ldu.nCells(), ownerStarts, ldu.upperAddr(), width
+                );
+            const smootherTest::IndexKahnOrdering repeated =
+                smootherTest::makeIndexKahnOrderingReleaseDiagnostic
+                (
+                    ldu.nCells(), ownerStarts, ldu.upperAddr(), width, nullptr
+                );
+            variant.deterministic =
+                repeated.newToOld == variant.matrix.newToOld()
+             && repeated.levelStarts == variant.matrix.levelStarts()
+             && ordinary.newToOld == variant.matrix.newToOld()
+             && ordinary.levelStarts == variant.matrix.levelStarts();
+            variants.push_back(std::move(variant));
+        }
+    }
+};
+
 std::string consumeMesh(int& argc, char** argv)
 {
 #ifdef SMOOTHER_TEST_DEFAULT_MESH
@@ -1037,6 +1409,33 @@ std::string consumeMesh(int& argc, char** argv)
             ih1w2WidthSweep = true;
         else if (argument == "--gamg_ih1w3") ih1w3Experiment = true;
         else if (argument == "--gamg_ih1w4") ih1w4Experiment = true;
+        else if (argument == "--gamg_ih1w5") ih1w5Experiment = true;
+        else if (argument == "--gamg_release_impact")
+            releaseImpactExperiment = true;
+        else if (argument.rfind("--gamg_ih1w5_w4=", 0) == 0)
+        {
+            ih1w5Experiment = true;
+            ih1w5W4Profile = argument.substr
+            (
+                sizeof("--gamg_ih1w5_w4=") - 1
+            );
+        }
+        else if (argument.rfind("--gamg_ih1w5_trace_dir=", 0) == 0)
+        {
+            ih1w5Experiment = true;
+            ih1w5TraceDirectory = argument.substr
+            (
+                sizeof("--gamg_ih1w5_trace_dir=") - 1
+            );
+        }
+        else if (argument.rfind("--gamg_release_impact_trace_dir=", 0) == 0)
+        {
+            releaseImpactExperiment = true;
+            releaseImpactTraceDirectory = argument.substr
+            (
+                sizeof("--gamg_release_impact_trace_dir=") - 1
+            );
+        }
         else if (argument.rfind("--gamg_ih1w4_batch=", 0) == 0)
         {
             ih1w4Experiment = true;
@@ -1079,7 +1478,7 @@ void prepareHugePages(const Problem& problem)
         // The focused IH1W4 experiment registers only L0.  Avoid consuming
         // explicit collapse capacity for coarse-level arrays that never enter
         // the timed benchmark.
-        if (ih1w4Experiment && level != 0) continue;
+        if ((ih1w4Experiment || ih1w5Experiment) && level != 0) continue;
         const gamg::GAMGMatrix& ldu = problem.baseline.matrices()[level];
         const fwgamg::Matrix& natural = problem.natural[level];
         const std::string prefix = "L" + std::to_string(level) + '.';
@@ -1099,7 +1498,7 @@ void prepareHugePages(const Problem& problem)
             prefix + "LDU.field", problem.naturalSource[level]
         );
 
-        if (!ih1w4Experiment)
+        if (!(ih1w4Experiment || ih1w5Experiment))
         {
             adviseAndCollapseHugePages
             (
@@ -1252,10 +1651,40 @@ void prepareHugePages(const Problem& problem)
             );
         }
 
+        for (const Problem::ReadyFractionSweep& variant : problem.readyFractionSweeps)
+        {
+            const fwgamg::Matrix& adaptive = variant.matrix;
+            const std::string adaptivePrefix = prefix + variant.name + '.';
+            adviseAndCollapseHugePages
+            (
+                adaptivePrefix + "levelStarts", adaptive.levelStarts()
+            );
+            adviseAndCollapseHugePages
+            (
+                adaptivePrefix + "rowStarts", adaptive.rowStarts()
+            );
+            adviseAndCollapseHugePages
+            (
+                adaptivePrefix + "cols", adaptive.cols()
+            );
+            adviseAndCollapseHugePages
+            (
+                adaptivePrefix + "coeffs", adaptive.coeffs()
+            );
+            adviseAndCollapseHugePages
+            (
+                adaptivePrefix + "diag", adaptive.diag()
+            );
+            adviseAndCollapseHugePages
+            (
+                adaptivePrefix + "source", variant.source
+            );
+        }
+
         // The focused IH1W4 benchmark never executes the older U/S/C/W2
         // schedules.  Leaving those allocations on ordinary pages avoids
         // exhausting explicit huge-page collapse capacity on large meshes.
-        if (ih1w4Experiment) continue;
+        if (ih1w4Experiment || ih1w5Experiment) continue;
 
         const fwgamg::Matrix& unbounded = problem.unboundedMatrices[level];
         const std::string unboundedPrefix = prefix + "IH1U.";
@@ -1435,6 +1864,450 @@ void addDependencyCounters
         maximumLevelWidth(naturalLevels);
 }
 
+void addFocusedDependencyCounters
+(
+    benchmark::State& state,
+    const fwgamg::Matrix& schedule,
+    const std::vector<std::size_t>& naturalWidths
+)
+{
+    const std::size_t naturalLevels = naturalWidths.size();
+    state.counters["dependencyLevels"] = schedule.levelStarts().size() - 1;
+    state.counters["naturalDependencyLevels"] = naturalLevels;
+    state.counters["meanNaturalLevelWidth"] =
+        static_cast<double>(schedule.nCells())/naturalLevels;
+    state.counters["maxNaturalLevelWidth"] =
+        *std::max_element(naturalWidths.begin(), naturalWidths.end());
+}
+
+void validateIh1w5Focused(const Ih1w5FocusedProblem& problem)
+{
+    Foam::scalarField reference(problem.ldu.nCells(), 0.0);
+    gamg::gaussSeidelSmooth
+    (
+        reference, problem.ldu, problem.naturalSource, 1
+    );
+    bool allExact = true;
+    bool allDeterministic = true;
+    for (const Ih1w5FocusedProblem::Variant& variant : problem.variants)
+    {
+        Foam::scalarField psi(variant.matrix.nCells(), 0.0);
+        variant.matrix.smooth(psi, variant.source, 1, false);
+        Foam::scalarField naturalPsi(variant.matrix.nCells());
+        for (Foam::label row=0; row<variant.matrix.nCells(); ++row)
+            naturalPsi[variant.matrix.newToOld()[row]] = psi[row];
+        const bool exact = naturalPsi == reference;
+        allExact = allExact && exact;
+        allDeterministic = allDeterministic && variant.deterministic;
+        std::cout << "GAMG IH1W5 focused validation variant="
+            << variant.name << " exact=" << (exact ? "PASS" : "FAIL")
+            << " deterministic="
+            << (variant.deterministic ? "PASS" : "FAIL")
+            << " chunks=" << variant.matrix.levelStarts().size() - 1
+            << '\n';
+    }
+    if (!allExact || !allDeterministic)
+        throw std::runtime_error("IH1W5 focused validation failed");
+}
+
+void writeIh1w5FocusedChunkTraces(const Ih1w5FocusedProblem& problem)
+{
+    if (ih1w5TraceDirectory.empty()) return;
+    const std::filesystem::path directory(ih1w5TraceDirectory);
+    std::filesystem::create_directories(directory);
+    const std::string meshName = safeFileName
+    (
+        benchmarkMeshName.empty() ? "mesh" : benchmarkMeshName
+    );
+    for (const Ih1w5FocusedProblem::Variant& variant : problem.variants)
+    {
+        if (variant.diagnostics.empty()) continue;
+        const std::filesystem::path path = directory/
+        (
+            meshName + '_' + safeFileName(variant.name) + "_chunks.csv"
+        );
+        std::ofstream output(path);
+        if (!output)
+            throw std::runtime_error("cannot open IH1W5 chunk trace: " + path.string());
+        output << "chunkIndex,readySize,targetWidth,searchMinWidth,"
+            << "searchMaxWidth,chosenChunkSize,largestGap\n";
+        for (std::size_t chunk=0; chunk<variant.diagnostics.size(); ++chunk)
+        {
+            const auto& diagnostic = variant.diagnostics[chunk];
+            output << chunk << ',' << diagnostic.readySize << ','
+                << diagnostic.targetWidth << ','
+                << diagnostic.searchMinWidth << ','
+                << diagnostic.searchMaxWidth << ','
+                << diagnostic.chosenChunkSize << ','
+                << diagnostic.largestGap << '\n';
+        }
+        if (!output)
+            throw std::runtime_error("failed writing IH1W5 chunk trace: " + path.string());
+    }
+}
+
+void printIh1w5FocusedDiagnostics(const Ih1w5FocusedProblem& problem)
+{
+    const Ih1w5FocusedProblem::Variant& baseline = problem.variants.front();
+    const OrderingDiagnosticStats preliminary = orderingDiagnosticStats
+    (
+        baseline.matrix, nullptr, std::numeric_limits<double>::infinity()
+    );
+    const double threshold = preliminary.rowJumpP99;
+    std::cout << "IH1W5 ordering diagnostics"
+        << " baselineLargeJumpThreshold=" << threshold << '\n'
+        << "variant orderingMs setupMs chunks chunkMin chunkP10 "
+        << "chunkP50 chunkP90 chunkMean chunkMax targetP10 targetP50 "
+        << "targetP90 readyP10 readyP50 readyP90 rowJumpTotal rowP90 "
+        << "rowP99 largeJumps deterministic\n";
+    for (const Ih1w5FocusedProblem::Variant& variant : problem.variants)
+    {
+        const auto* diagnostics = variant.diagnostics.empty()
+            ? nullptr : &variant.diagnostics;
+        const OrderingDiagnosticStats stats = orderingDiagnosticStats
+        (
+            variant.matrix, diagnostics, threshold
+        );
+        std::cout << variant.name << ' '
+            << 1e3*variant.setup.scheduleSeconds << ' '
+            << setupTotalMilliseconds(variant.setup) << ' '
+            << stats.chunks << ' ' << stats.chunkMin << ' '
+            << stats.chunkP10 << ' ' << stats.chunkP50 << ' '
+            << stats.chunkP90 << ' ' << stats.chunkMean << ' '
+            << stats.chunkMax << ' ' << stats.targetP10 << ' '
+            << stats.targetP50 << ' ' << stats.targetP90 << ' '
+            << stats.readyP10 << ' ' << stats.readyP50 << ' '
+            << stats.readyP90 << ' ' << stats.rowJumpTotal << ' '
+            << stats.rowJumpP90 << ' ' << stats.rowJumpP99 << ' '
+            << stats.largeJumps << ' '
+            << (variant.deterministic ? "PASS" : "FAIL") << '\n';
+    }
+}
+
+void prepareIh1w5FocusedHugePages(const Ih1w5FocusedProblem& problem)
+{
+    if (!explicitHugePages) return;
+    adviseAndCollapseHugePages("L0.LDU.lowerAddr", problem.ldu.lowerAddr());
+    adviseAndCollapseHugePages("L0.LDU.upperAddr", problem.ldu.upperAddr());
+    adviseAndCollapseHugePages("L0.LDU.upper", problem.ldu.upper());
+    adviseAndCollapseHugePages("L0.LDU.diag", problem.ldu.diag());
+    adviseAndCollapseHugePages("L0.LDU.source", problem.naturalSource);
+    for (const Ih1w5FocusedProblem::Variant& variant : problem.variants)
+    {
+        const std::string prefix = "L0." + variant.name + '.';
+        adviseAndCollapseHugePages(prefix + "levelStarts", variant.matrix.levelStarts());
+        adviseAndCollapseHugePages(prefix + "rowStarts", variant.matrix.rowStarts());
+        adviseAndCollapseHugePages(prefix + "cols", variant.matrix.cols());
+        adviseAndCollapseHugePages(prefix + "coeffs", variant.matrix.coeffs());
+        adviseAndCollapseHugePages(prefix + "diag", variant.matrix.diag());
+        adviseAndCollapseHugePages(prefix + "source", variant.source);
+    }
+}
+
+void registerIh1w5FocusedBenchmarks(const Ih1w5FocusedProblem& problem)
+{
+    const std::string prefix = "GAMGLevel/"
+        + (benchmarkMeshName.empty() ? std::string() : benchmarkMeshName + '/')
+        + "L00/";
+    for (const Ih1w5FocusedProblem::Variant& variant : problem.variants)
+    {
+        const fwgamg::Matrix* const matrix = &variant.matrix;
+        const Foam::scalarField* const source = &variant.source;
+        const std::vector<std::size_t>* const naturalWidths =
+            &problem.naturalWidths;
+        benchmark::RegisterBenchmark
+        (
+            (prefix + variant.name + "/GS").c_str(),
+            [matrix, source, naturalWidths](benchmark::State& state)
+            {
+                Foam::scalarField psi(matrix->nCells(), 0.0);
+                if (explicitHugePages)
+                    adviseAndCollapseHugePages("IH1W5.psi", psi, false);
+                for (auto unused : state)
+                {
+                    static_cast<void>(unused);
+                    matrix->smooth(psi, *source, 1, false);
+                    benchmark::DoNotOptimize(psi.data());
+                }
+                addCounters(state, matrix->nCells(), matrix->nFaces());
+                addFocusedDependencyCounters(state, *matrix, *naturalWidths);
+            }
+        )->MinTime(0.05);
+    }
+}
+
+struct ReleaseImpactStats
+{
+    std::size_t chunks = 0;
+    double chunkMean = 0;
+    double chunkP50 = 0;
+    double chunkP90 = 0;
+    std::uint64_t releasedCount = 0;
+    std::uint64_t releasedBeforeHead = 0;
+    std::uint64_t releasedBelowCut = 0;
+    double headChangedPercent = 0;
+    double beforeHeadPerChunkWorkMean = 0;
+    double beforeHeadPerChunkWorkMedian = 0;
+    double beforeHeadFractionMean = 0;
+    double beforeHeadFractionMedian = 0;
+    double headBackstepP50 = 0;
+    double headBackstepP90 = 0;
+    double headBackstepP99 = 0;
+};
+
+ReleaseImpactStats releaseImpactStats
+(
+    const std::vector<smootherTest::ReleaseImpactChunkDiagnostic>& diagnostics
+)
+{
+    ReleaseImpactStats result;
+    result.chunks = diagnostics.size();
+    std::vector<Foam::label> chunkSizes;
+    std::vector<Foam::label> backsteps;
+    std::vector<double> perChunkWork;
+    std::vector<double> releasedFractions;
+    chunkSizes.reserve(diagnostics.size());
+    backsteps.reserve(diagnostics.size());
+    perChunkWork.reserve(diagnostics.size());
+    releasedFractions.reserve(diagnostics.size());
+    std::size_t changed = 0;
+    for (const auto& diagnostic : diagnostics)
+    {
+        chunkSizes.push_back(diagnostic.chosenChunkSize);
+        backsteps.push_back(diagnostic.headBackstep);
+        result.releasedCount += diagnostic.releasedCount;
+        result.releasedBeforeHead += diagnostic.releasedBeforeHead;
+        result.releasedBelowCut += diagnostic.releasedBelowCut;
+        changed += diagnostic.headChanged;
+        perChunkWork.push_back
+        (
+            diagnostic.chosenChunkSize
+          ? static_cast<double>(diagnostic.releasedBeforeHead)
+           /diagnostic.chosenChunkSize
+          : 0.0
+        );
+        releasedFractions.push_back
+        (
+            diagnostic.releasedCount
+          ? static_cast<double>(diagnostic.releasedBeforeHead)
+           /diagnostic.releasedCount
+          : 0.0
+        );
+    }
+    if (!diagnostics.empty())
+    {
+        result.chunkMean = std::accumulate
+        (
+            chunkSizes.begin(), chunkSizes.end(), 0.0
+        )/chunkSizes.size();
+        result.headChangedPercent = 100.0*changed/diagnostics.size();
+        result.beforeHeadPerChunkWorkMean = std::accumulate
+        (
+            perChunkWork.begin(), perChunkWork.end(), 0.0
+        )/perChunkWork.size();
+        result.beforeHeadFractionMean = std::accumulate
+        (
+            releasedFractions.begin(), releasedFractions.end(), 0.0
+        )/releasedFractions.size();
+    }
+    result.chunkP50 = percentile(chunkSizes, 0.50);
+    result.chunkP90 = percentile(chunkSizes, 0.90);
+    result.beforeHeadPerChunkWorkMedian =
+        percentileDouble(perChunkWork, 0.50);
+    result.beforeHeadFractionMedian =
+        percentileDouble(releasedFractions, 0.50);
+    result.headBackstepP50 = percentile(backsteps, 0.50);
+    result.headBackstepP90 = percentile(backsteps, 0.90);
+    result.headBackstepP99 = percentile(backsteps, 0.99);
+    return result;
+}
+
+void validateReleaseImpactFocused(const ReleaseImpactFocusedProblem& problem)
+{
+    Foam::scalarField reference(problem.ldu.nCells(), 0.0);
+    gamg::gaussSeidelSmooth
+    (
+        reference, problem.ldu, problem.naturalSource, 1
+    );
+    bool allExact = true;
+    bool allDeterministic = true;
+    for (const ReleaseImpactFocusedProblem::Variant& variant : problem.variants)
+    {
+        Foam::scalarField psi(variant.matrix.nCells(), 0.0);
+        variant.matrix.smooth(psi, variant.source, 1, false);
+        Foam::scalarField naturalPsi(variant.matrix.nCells());
+        for (Foam::label row=0; row<variant.matrix.nCells(); ++row)
+            naturalPsi[variant.matrix.newToOld()[row]] = psi[row];
+        const bool exact = naturalPsi == reference;
+        allExact = allExact && exact;
+        allDeterministic = allDeterministic && variant.deterministic;
+        std::cout << "GAMG release-impact validation width="
+            << variant.width << " exact=" << (exact ? "PASS" : "FAIL")
+            << " deterministic="
+            << (variant.deterministic ? "PASS" : "FAIL") << '\n';
+    }
+    if (!allExact || !allDeterministic)
+        throw std::runtime_error("release-impact validation failed");
+}
+
+void writeReleaseImpactTraces(const ReleaseImpactFocusedProblem& problem)
+{
+    if (releaseImpactTraceDirectory.empty()) return;
+    const std::filesystem::path directory(releaseImpactTraceDirectory);
+    std::filesystem::create_directories(directory);
+    const std::string meshName = safeFileName
+    (
+        benchmarkMeshName.empty() ? "mesh" : benchmarkMeshName
+    );
+    for (const ReleaseImpactFocusedProblem::Variant& variant : problem.variants)
+    {
+        const std::filesystem::path path = directory/
+        (
+            meshName + "_W" + std::to_string(variant.width)
+          + "_release_trace.csv"
+        );
+        std::ofstream output(path);
+        if (!output)
+            throw std::runtime_error
+            (
+                "cannot open release-impact trace: " + path.string()
+            );
+        output << "chunkIndex,chosenChunkSize,headBefore,headAfter,cut,"
+            << "releasedCount,releasedBelowCut,releasedBeforeHead,"
+            << "headBackstep,headChanged,releasedBeforeHeadPerChunk,"
+            << "releasedBeforeHeadFraction\n";
+        for (std::size_t chunk=0; chunk<variant.diagnostics.size(); ++chunk)
+        {
+            const auto& diagnostic = variant.diagnostics[chunk];
+            const double perChunk = diagnostic.chosenChunkSize
+                ? static_cast<double>(diagnostic.releasedBeforeHead)
+                    /diagnostic.chosenChunkSize
+                : 0.0;
+            const double fraction = diagnostic.releasedCount
+                ? static_cast<double>(diagnostic.releasedBeforeHead)
+                    /diagnostic.releasedCount
+                : 0.0;
+            output << chunk << ',' << diagnostic.chosenChunkSize << ','
+                << diagnostic.headBefore << ',' << diagnostic.headAfter << ','
+                << diagnostic.cut << ',' << diagnostic.releasedCount << ','
+                << diagnostic.releasedBelowCut << ','
+                << diagnostic.releasedBeforeHead << ','
+                << diagnostic.headBackstep << ','
+                << static_cast<int>(diagnostic.headChanged) << ','
+                << std::setprecision(17) << perChunk << ',' << fraction << '\n';
+        }
+        if (!output)
+            throw std::runtime_error
+            (
+                "failed writing release-impact trace: " + path.string()
+            );
+        std::cout << "release-impact trace width=" << variant.width
+            << " path=\"" << path.string() << "\" rows="
+            << variant.diagnostics.size() << '\n';
+    }
+}
+
+void printReleaseImpactDiagnostics(const ReleaseImpactFocusedProblem& problem)
+{
+    std::cout << "Release-impact diagnostics\n"
+        << "width setupMs chunks chunkMean chunkP50 chunkP90 releasedCount "
+        << "releasedBeforeHead releasedBelowCut headChangedPercent "
+        << "beforeHeadPerChunkWorkMean beforeHeadPerChunkWorkMedian "
+        << "beforeHeadFractionMean beforeHeadFractionMedian "
+        << "headBackstepP50 headBackstepP90 headBackstepP99\n";
+    for (const ReleaseImpactFocusedProblem::Variant& variant : problem.variants)
+    {
+        const ReleaseImpactStats stats = releaseImpactStats(variant.diagnostics);
+        std::cout << variant.width << ' '
+            << setupTotalMilliseconds(variant.setup) << ' '
+            << stats.chunks << ' ' << stats.chunkMean << ' '
+            << stats.chunkP50 << ' ' << stats.chunkP90 << ' '
+            << stats.releasedCount << ' ' << stats.releasedBeforeHead << ' '
+            << stats.releasedBelowCut << ' ' << stats.headChangedPercent << ' '
+            << stats.beforeHeadPerChunkWorkMean << ' '
+            << stats.beforeHeadPerChunkWorkMedian << ' '
+            << stats.beforeHeadFractionMean << ' '
+            << stats.beforeHeadFractionMedian << ' '
+            << stats.headBackstepP50 << ' ' << stats.headBackstepP90 << ' '
+            << stats.headBackstepP99 << '\n';
+    }
+}
+
+void prepareReleaseImpactHugePages(const ReleaseImpactFocusedProblem& problem)
+{
+    if (!explicitHugePages) return;
+    adviseAndCollapseHugePages("release.LDU.lowerAddr", problem.ldu.lowerAddr());
+    adviseAndCollapseHugePages("release.LDU.upperAddr", problem.ldu.upperAddr());
+    adviseAndCollapseHugePages("release.LDU.upper", problem.ldu.upper());
+    adviseAndCollapseHugePages("release.LDU.diag", problem.ldu.diag());
+    adviseAndCollapseHugePages("release.LDU.source", problem.naturalSource);
+    for (const ReleaseImpactFocusedProblem::Variant& variant : problem.variants)
+    {
+        const std::string prefix = "release.W" + std::to_string(variant.width) + '.';
+        adviseAndCollapseHugePages(prefix + "levelStarts", variant.matrix.levelStarts());
+        adviseAndCollapseHugePages(prefix + "rowStarts", variant.matrix.rowStarts());
+        adviseAndCollapseHugePages(prefix + "cols", variant.matrix.cols());
+        adviseAndCollapseHugePages(prefix + "coeffs", variant.matrix.coeffs());
+        adviseAndCollapseHugePages(prefix + "diag", variant.matrix.diag());
+        adviseAndCollapseHugePages(prefix + "source", variant.source);
+    }
+}
+
+void registerReleaseImpactBenchmarks(const ReleaseImpactFocusedProblem& problem)
+{
+    const std::string prefix = "GAMGLevel/"
+        + (benchmarkMeshName.empty() ? std::string() : benchmarkMeshName + '/')
+        + "L00/ReleaseImpact/";
+    for (const ReleaseImpactFocusedProblem::Variant& variant : problem.variants)
+    {
+        const fwgamg::Matrix* const matrix = &variant.matrix;
+        const Foam::scalarField* const source = &variant.source;
+        const std::vector<std::size_t>* const naturalWidths = &problem.naturalWidths;
+        const ReleaseImpactStats stats = releaseImpactStats(variant.diagnostics);
+        const double setupMs = setupTotalMilliseconds(variant.setup);
+        const Foam::label width = variant.width;
+        benchmark::RegisterBenchmark
+        (
+            (prefix + "W" + std::to_string(width) + "/GS").c_str(),
+            [matrix, source, naturalWidths, stats, setupMs]
+            (benchmark::State& state)
+            {
+                Foam::scalarField psi(matrix->nCells(), 0.0);
+                if (explicitHugePages)
+                    adviseAndCollapseHugePages("release.psi", psi, false);
+                for (auto unused : state)
+                {
+                    static_cast<void>(unused);
+                    matrix->smooth(psi, *source, 1, false);
+                    benchmark::DoNotOptimize(psi.data());
+                }
+                addCounters(state, matrix->nCells(), matrix->nFaces());
+                addFocusedDependencyCounters(state, *matrix, *naturalWidths);
+                state.counters["setupMs"] = setupMs;
+                state.counters["chunks"] = stats.chunks;
+                state.counters["chunkMean"] = stats.chunkMean;
+                state.counters["chunkP50"] = stats.chunkP50;
+                state.counters["chunkP90"] = stats.chunkP90;
+                state.counters["releasedCount"] = stats.releasedCount;
+                state.counters["releasedBeforeHead"] = stats.releasedBeforeHead;
+                state.counters["releasedBelowCut"] = stats.releasedBelowCut;
+                state.counters["headChangedPercent"] = stats.headChangedPercent;
+                state.counters["beforeHeadPerChunkWorkMean"] =
+                    stats.beforeHeadPerChunkWorkMean;
+                state.counters["beforeHeadPerChunkWorkMedian"] =
+                    stats.beforeHeadPerChunkWorkMedian;
+                state.counters["beforeHeadFractionMean"] =
+                    stats.beforeHeadFractionMean;
+                state.counters["beforeHeadFractionMedian"] =
+                    stats.beforeHeadFractionMedian;
+                state.counters["headBackstepP50"] = stats.headBackstepP50;
+                state.counters["headBackstepP90"] = stats.headBackstepP90;
+                state.counters["headBackstepP99"] = stats.headBackstepP99;
+            }
+        )->MinTime(0.05);
+    }
+}
+
 void validateSmootherProfile(const SmootherProfileProblem& problem)
 {
     Foam::scalarField reference(problem.ldu.nCells(), 0.0);
@@ -1552,7 +2425,9 @@ void runVtuneSmootherProfile(const SmootherProfileProblem& problem)
 
 void registerLevelBenchmarks(const Problem& problem)
 {
-    for (std::size_t level=0; level<problem.baseline.matrices().size(); ++level)
+    const std::size_t registeredLevels = ih1w5Experiment
+        ? std::size_t(1) : problem.baseline.matrices().size();
+    for (std::size_t level=0; level<registeredLevels; ++level)
     {
         const gamg::GAMGMatrix* const ldu = &problem.baseline.matrices()[level];
         const fwgamg::Matrix* const natural = &problem.natural[level];
@@ -1709,6 +2584,35 @@ void registerLevelBenchmarks(const Problem& problem)
                     Foam::scalarField psi(adaptive->nCells(), 0.0);
                     if (explicitHugePages)
                         adviseAndCollapseHugePages("IH1W4.psi", psi, false);
+                    for (auto unused : state)
+                    {
+                        static_cast<void>(unused);
+                        adaptive->smooth(psi, *adaptiveSource, 1, false);
+                        benchmark::DoNotOptimize(psi.data());
+                    }
+                    finish(state);
+                    addDependencyCounters(state, *adaptive, *unbounded);
+                }
+            )->MinTime(0.05);
+        }
+        for
+        (
+            const Problem::ReadyFractionSweep& variant
+          : problem.readyFractionSweeps
+        )
+        {
+            const fwgamg::Matrix* const adaptive = &variant.matrix;
+            const Foam::scalarField* const adaptiveSource = &variant.source;
+            const std::string name = prefix + variant.name + "/GS";
+            benchmark::RegisterBenchmark
+            (
+                name.c_str(),
+                [adaptive, adaptiveSource, finish, unbounded]
+                (benchmark::State& state)
+                {
+                    Foam::scalarField psi(adaptive->nCells(), 0.0);
+                    if (explicitHugePages)
+                        adviseAndCollapseHugePages("IH1W5.psi", psi, false);
                     for (auto unused : state)
                     {
                         static_cast<void>(unused);
@@ -2367,6 +3271,134 @@ void printLocality(const Problem& problem)
     std::cout << std::flush;
 }
 
+void printIh1w5Diagnostics(const Problem& problem)
+{
+    if (!ih1w5Experiment) return;
+
+    const Problem::WidthSweep* bounded1024 = nullptr;
+    for (const Problem::WidthSweep& variant : problem.widthSweeps)
+        if (variant.width == 1024) bounded1024 = &variant;
+    if (!bounded1024 || bounded1024->matrices.empty())
+        throw std::runtime_error("IH1W5 diagnostics require IH1W1024");
+
+    const OrderingDiagnosticStats preliminary = orderingDiagnosticStats
+    (
+        bounded1024->matrices.front(), nullptr,
+        std::numeric_limits<double>::infinity()
+    );
+    const double largeJumpThreshold = preliminary.rowJumpP99;
+    std::cout << "IH1W5 ordering diagnostics"
+        << " baselineLargeJumpThreshold=" << largeJumpThreshold << '\n';
+    std::cout << "variant orderingMs setupMs chunks chunkMin chunkP10 "
+        << "chunkP50 chunkP90 chunkMean chunkMax targetP10 targetP50 "
+        << "targetP90 readyP10 readyP50 readyP90 rowJumpTotal rowP90 "
+        << "rowP99 largeJumps deterministic\n";
+
+    const auto print = [largeJumpThreshold]
+    (
+        const std::string& name,
+        const fwgamg::Matrix& matrix,
+        const fwgamg::LevelSetupTiming& setup,
+        const std::vector<smootherTest::AdaptiveReadyChunkDiagnostic>* diagnostics,
+        const bool deterministic
+    )
+    {
+        const OrderingDiagnosticStats stats = orderingDiagnosticStats
+        (
+            matrix, diagnostics, largeJumpThreshold
+        );
+        std::cout << name << ' ' << 1e3*setup.scheduleSeconds << ' '
+            << setupTotalMilliseconds(setup) << ' ' << stats.chunks << ' '
+            << stats.chunkMin << ' ' << stats.chunkP10 << ' '
+            << stats.chunkP50 << ' ' << stats.chunkP90 << ' '
+            << stats.chunkMean << ' ' << stats.chunkMax << ' '
+            << stats.targetP10 << ' ' << stats.targetP50 << ' '
+            << stats.targetP90 << ' ' << stats.readyP10 << ' '
+            << stats.readyP50 << ' ' << stats.readyP90 << ' '
+            << stats.rowJumpTotal << ' ' << stats.rowJumpP90 << ' '
+            << stats.rowJumpP99 << ' ' << stats.largeJumps << ' '
+            << (deterministic ? "PASS" : "N/A") << '\n';
+    };
+
+    print
+    (
+        "IH1W1024", bounded1024->matrices.front(),
+        bounded1024->setup.front(), nullptr, true
+    );
+    for (const Problem::AdaptiveGapSweep& variant : problem.adaptiveGapSweeps)
+    {
+        print
+        (
+            variant.name, variant.matrices.front(), variant.setup.front(),
+            nullptr, true
+        );
+    }
+    for (const Problem::ReadyFractionSweep& variant : problem.readyFractionSweeps)
+    {
+        print
+        (
+            variant.name, variant.matrix, variant.setup,
+            &variant.diagnostics, variant.deterministic
+        );
+        if (ih1w5TraceDirectory.empty()) for
+        (
+            std::size_t chunk=0;
+            chunk<variant.diagnostics.size();
+            ++chunk
+        )
+        {
+            const auto& diagnostic = variant.diagnostics[chunk];
+            std::cout << "IH1W5 chunk variant=" << variant.name
+                << " index=" << chunk
+                << " readySize=" << diagnostic.readySize
+                << " targetWidth=" << diagnostic.targetWidth
+                << " searchMinWidth=" << diagnostic.searchMinWidth
+                << " searchMaxWidth=" << diagnostic.searchMaxWidth
+                << " chosenChunkSize=" << diagnostic.chosenChunkSize
+                << " largestGap=" << diagnostic.largestGap << '\n';
+        }
+    }
+    std::cout << std::flush;
+}
+
+void writeIh1w5ChunkTraces(const Problem& problem)
+{
+    if (!ih1w5Experiment || ih1w5TraceDirectory.empty()) return;
+    const std::filesystem::path directory(ih1w5TraceDirectory);
+    std::filesystem::create_directories(directory);
+    const std::string meshName = safeFileName
+    (
+        benchmarkMeshName.empty() ? "mesh" : benchmarkMeshName
+    );
+    for (const Problem::ReadyFractionSweep& variant : problem.readyFractionSweeps)
+    {
+        const std::filesystem::path path = directory/
+        (
+            meshName + '_' + safeFileName(variant.name) + "_chunks.csv"
+        );
+        std::ofstream output(path);
+        if (!output)
+            throw std::runtime_error("cannot open IH1W5 chunk trace: " + path.string());
+        output << "chunkIndex,readySize,targetWidth,searchMinWidth,"
+            << "searchMaxWidth,chosenChunkSize,largestGap\n";
+        for (std::size_t chunk=0; chunk<variant.diagnostics.size(); ++chunk)
+        {
+            const auto& diagnostic = variant.diagnostics[chunk];
+            output << chunk << ',' << diagnostic.readySize << ','
+                << diagnostic.targetWidth << ','
+                << diagnostic.searchMinWidth << ','
+                << diagnostic.searchMaxWidth << ','
+                << diagnostic.chosenChunkSize << ','
+                << diagnostic.largestGap << '\n';
+        }
+        if (!output)
+            throw std::runtime_error("failed writing IH1W5 chunk trace: " + path.string());
+        std::cout << "IH1W5 chunk trace variant=" << variant.name
+            << " path=\"" << path.string() << "\" rows="
+            << variant.diagnostics.size() << '\n';
+    }
+}
+
 void printFlatEdgeSetup(const Problem& problem)
 {
     double indirectSeconds = 0;
@@ -2444,6 +3476,11 @@ void validateSpmv(const Problem& problem)
     (
         problem.adaptiveGapSweeps.size(), true
     );
+    std::vector<bool> readyFractionSweepExact
+    (
+        problem.readyFractionSweeps.size(), true
+    );
+    bool readyFractionDeterministic = true;
     bool orientedChunkMembershipExact = true;
     std::size_t orientedChunks = 0;
     std::size_t orientedReversedChunks = 0;
@@ -2627,6 +3664,7 @@ void validateSpmv(const Problem& problem)
         {
             const Problem::AdaptiveGapSweep& variant =
                 problem.adaptiveGapSweeps[variantIndex];
+            if (level >= variant.matrices.size()) continue;
             const fwgamg::Matrix& adaptive = variant.matrices[level];
             Foam::scalarField adaptivePsi(adaptive.nCells(), 0.0);
             adaptive.smooth
@@ -2648,6 +3686,50 @@ void validateSpmv(const Problem& problem)
                 << " exact=" << (levelExact ? "PASS" : "FAIL")
                 << " chunks=" << adaptive.levelStarts().size() - 1
                 << '\n';
+        }
+
+        if (level == 0)
+        {
+            for
+            (
+                std::size_t variantIndex=0;
+                variantIndex<problem.readyFractionSweeps.size();
+                ++variantIndex
+            )
+            {
+                const Problem::ReadyFractionSweep& variant =
+                    problem.readyFractionSweeps[variantIndex];
+                Foam::scalarField adaptivePsi(variant.matrix.nCells(), 0.0);
+                variant.matrix.smooth
+                (
+                    adaptivePsi, variant.source, 1, false
+                );
+                Foam::scalarField naturalAdaptivePsi
+                (
+                    variant.matrix.nCells()
+                );
+                for
+                (
+                    Foam::label row=0;
+                    row<variant.matrix.nCells();
+                    ++row
+                )
+                {
+                    naturalAdaptivePsi[variant.matrix.newToOld()[row]] =
+                        adaptivePsi[row];
+                }
+                const bool exact = naturalAdaptivePsi == referencePsi;
+                readyFractionSweepExact[variantIndex] = exact;
+                readyFractionDeterministic =
+                    readyFractionDeterministic && variant.deterministic;
+                std::cout << "GAMG IH1W5 permutation L0 variant="
+                    << variant.name
+                    << " exact=" << (exact ? "PASS" : "FAIL")
+                    << " deterministic="
+                    << (variant.deterministic ? "PASS" : "FAIL")
+                    << " chunks="
+                    << variant.matrix.levelStarts().size() - 1 << '\n';
+            }
         }
 
         const fwgamg::Matrix& continuing =
@@ -2983,6 +4065,24 @@ void validateSpmv(const Problem& problem)
             << "Exact="
             << (adaptiveGapSweepExact[variantIndex] ? "PASS" : "FAIL");
     }
+    for
+    (
+        std::size_t variantIndex=0;
+        variantIndex<problem.readyFractionSweeps.size();
+        ++variantIndex
+    )
+    {
+        allWidthSweepsExact =
+            allWidthSweepsExact && readyFractionSweepExact[variantIndex];
+        std::cout << ' ' << problem.readyFractionSweeps[variantIndex].name
+            << "Exact="
+            << (readyFractionSweepExact[variantIndex] ? "PASS" : "FAIL");
+    }
+    allWidthSweepsExact =
+        allWidthSweepsExact && readyFractionDeterministic;
+    if (!problem.readyFractionSweeps.empty())
+        std::cout << " IH1W5Deterministic="
+            << (readyFractionDeterministic ? "PASS" : "FAIL");
     std::cout << '\n';
     std::cout << "GAMG IH1 permutation total: IH1S1024EqIH1U="
         << (slicedPermutationExact ? "PASS" : "FAIL")
@@ -3081,9 +4181,35 @@ int main(int argc, char** argv)
             runVtuneSmootherProfile(problem);
             return 0;
         }
+        if (releaseImpactExperiment)
+        {
+            const ReleaseImpactFocusedProblem problem(mesh);
+            validateReleaseImpactFocused(problem);
+            writeReleaseImpactTraces(problem);
+            printReleaseImpactDiagnostics(problem);
+            prepareReleaseImpactHugePages(problem);
+            registerReleaseImpactBenchmarks(problem);
+            benchmark::RunSpecifiedBenchmarks();
+            benchmark::Shutdown();
+            return 0;
+        }
+        if (ih1w5Experiment)
+        {
+            const Ih1w5FocusedProblem problem(mesh);
+            validateIh1w5Focused(problem);
+            writeIh1w5FocusedChunkTraces(problem);
+            printIh1w5FocusedDiagnostics(problem);
+            prepareIh1w5FocusedHugePages(problem);
+            registerIh1w5FocusedBenchmarks(problem);
+            benchmark::RunSpecifiedBenchmarks();
+            benchmark::Shutdown();
+            return 0;
+        }
         const Problem problem(mesh);
         validateSpmv(problem);
+        writeIh1w5ChunkTraces(problem);
         printLocality(problem);
+        printIh1w5Diagnostics(problem);
         printFlatEdgeSetup(problem);
         prepareHugePages(problem);
         registerLevelBenchmarks(problem);

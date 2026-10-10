@@ -1,5 +1,6 @@
 {
   "executable": "build-cmake/smoother_bench",
+  "isolation": "series",
   "output": "benchmark-results/process-isolated",
   "prefix": ["taskset", "-c", "2"],
   "env": {

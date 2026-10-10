@@ -65,6 +65,95 @@ IndexKahnOrdering makeIndexKahnOrdering
     return result;
 }
 
+IndexKahnOrdering makeIndexKahnOrderingReleaseDiagnostic
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label targetWidth,
+    std::vector<ReleaseImpactChunkDiagnostic>* const diagnostics
+)
+{
+    if (targetWidth < 1) throw std::runtime_error("invalid Index-Kahn width");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error("invalid Index-Kahn LDU addressing");
+
+    if (diagnostics) diagnostics->clear();
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    while (!ready.empty())
+    {
+        std::vector<label> current;
+        current.reserve(targetWidth);
+        auto position = ready.begin();
+        while
+        (
+            !ready.empty()
+         && current.size() < static_cast<std::size_t>(targetWidth)
+        )
+        {
+            current.push_back(*position);
+            position = ready.erase(position);
+        }
+        result.newToOld.insert
+        (
+            result.newToOld.end(), current.begin(), current.end()
+        );
+        result.levelStarts.push_back(result.newToOld.size());
+
+        ReleaseImpactChunkDiagnostic diagnostic;
+        diagnostic.chosenChunkSize = static_cast<label>(current.size());
+        diagnostic.cut = current.back();
+        const bool haveHeadBefore = !ready.empty();
+        if (haveHeadBefore) diagnostic.headBefore = *ready.begin();
+        for (const label cell : current)
+        {
+            for
+            (
+                label face=ownerStarts[cell];
+                face<ownerStarts[cell + 1];
+                ++face
+            )
+            {
+                const label successor = upperAddr[face];
+                if (--predecessors[successor] == 0)
+                {
+                    ++diagnostic.releasedCount;
+                    diagnostic.releasedBelowCut += successor < diagnostic.cut;
+                    diagnostic.releasedBeforeHead +=
+                        haveHeadBefore && successor < diagnostic.headBefore;
+                    ready.insert(successor);
+                }
+            }
+        }
+        if (!ready.empty()) diagnostic.headAfter = *ready.begin();
+        if
+        (
+            haveHeadBefore
+         && diagnostic.headAfter >= 0
+         && diagnostic.headAfter < diagnostic.headBefore
+        ) diagnostic.headBackstep = diagnostic.headBefore - diagnostic.headAfter;
+        diagnostic.headChanged = diagnostic.releasedBeforeHead > 0;
+        if (diagnostics) diagnostics->push_back(diagnostic);
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error("Index-Kahn scheduler did not cover all cells");
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
 IndexKahnOrdering makeIndexKahnOrderingOriented
 (
     const label nCells,
@@ -336,6 +425,126 @@ IndexKahnOrdering makeIndexKahnOrderingAdaptiveGap
         throw std::runtime_error
         (
             "adaptive-gap Index-Kahn scheduler did not cover all cells"
+        );
+    result.oldToNew.resize(nCells);
+    for (label row=0; row<nCells; ++row)
+        result.oldToNew[result.newToOld[row]] = row;
+    return result;
+}
+
+IndexKahnOrdering makeIndexKahnOrderingReadyFractionAdaptiveGap
+(
+    const label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    const label readyDivisor,
+    std::vector<AdaptiveReadyChunkDiagnostic>* const diagnostics
+)
+{
+    if (readyDivisor < 1)
+        throw std::runtime_error("invalid ready-fraction Index-Kahn divisor");
+    if
+    (
+        ownerStarts.size() != static_cast<std::size_t>(nCells + 1)
+     || ownerStarts.back() != static_cast<label>(upperAddr.size())
+    ) throw std::runtime_error
+      (
+          "invalid ready-fraction Index-Kahn LDU addressing"
+      );
+
+    if (diagnostics) diagnostics->clear();
+    std::vector<label> predecessors(nCells, 0);
+    for (const label cell : upperAddr) ++predecessors[cell];
+    std::set<label> ready;
+    for (label cell=0; cell<nCells; ++cell)
+        if (predecessors[cell] == 0) ready.insert(cell);
+
+    IndexKahnOrdering result;
+    result.levelStarts.push_back(0);
+    result.newToOld.reserve(nCells);
+    while (!ready.empty())
+    {
+        const std::size_t readySize = ready.size();
+        const std::size_t target = readySize < 256
+            ? readySize
+            : std::clamp<std::size_t>(readySize/readyDivisor, 256, 8192);
+        const std::size_t minWidth = std::max<std::size_t>(1, target/2);
+        const std::size_t maxWidth = std::min(readySize, 2*target);
+        std::size_t chunkSize = readySize;
+        label largestGap = 0;
+
+        // Below the safety floor, consume the complete available frontier.
+        // The clamp must not manufacture a wider target or split a naturally
+        // small ready set.
+        if (readySize >= 256 && readySize > minWidth)
+        {
+            const std::size_t largestCandidateCut = std::min
+            (
+                maxWidth, readySize - 1
+            );
+            auto position = ready.begin();
+            label previous = *position;
+            ++position;
+            bool haveGap = false;
+            for
+            (
+                std::size_t cut=1;
+                cut<=largestCandidateCut;
+                ++cut, ++position
+            )
+            {
+                const label current = *position;
+                if (cut >= minWidth)
+                {
+                    const label gap = current - previous;
+                    if (!haveGap || gap > largestGap)
+                    {
+                        haveGap = true;
+                        largestGap = gap;
+                        chunkSize = cut;
+                    }
+                }
+                previous = current;
+            }
+        }
+
+        if (diagnostics)
+            diagnostics->push_back
+            (
+                AdaptiveReadyChunkDiagnostic
+                {
+                    static_cast<label>(readySize),
+                    static_cast<label>(target),
+                    static_cast<label>(minWidth),
+                    static_cast<label>(maxWidth),
+                    static_cast<label>(chunkSize),
+                    largestGap
+                }
+            );
+
+        std::vector<label> current;
+        current.reserve(chunkSize);
+        auto position = ready.begin();
+        for (std::size_t index=0; index<chunkSize; ++index)
+        {
+            current.push_back(*position);
+            position = ready.erase(position);
+        }
+        result.newToOld.insert
+        (
+            result.newToOld.end(), current.begin(), current.end()
+        );
+        result.levelStarts.push_back(result.newToOld.size());
+
+        for (const label cell : current)
+            for (label face=ownerStarts[cell]; face<ownerStarts[cell + 1]; ++face)
+                if (--predecessors[upperAddr[face]] == 0)
+                    ready.insert(upperAddr[face]);
+    }
+    if (result.newToOld.size() != static_cast<std::size_t>(nCells))
+        throw std::runtime_error
+        (
+            "ready-fraction Index-Kahn scheduler did not cover all cells"
         );
     result.oldToNew.resize(nCells);
     for (label row=0; row<nCells; ++row)

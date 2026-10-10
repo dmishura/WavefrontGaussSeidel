@@ -154,6 +154,12 @@ add_executable(mesh_centres_export tools/ExportCellCentres.C)
 target_compile_options(mesh_centres_export PRIVATE ${SMOOTHER_COMMON_OPTIONS})
 target_link_libraries(mesh_centres_export PRIVATE smoother_kernels)
 
+add_executable(psi_ready_boundary_analysis tools/PsiReadyBoundaryAnalysis.C)
+target_compile_options(
+    psi_ready_boundary_analysis PRIVATE ${SMOOTHER_COMMON_OPTIONS}
+)
+target_link_libraries(psi_ready_boundary_analysis PRIVATE smoother_kernels)
+
 add_executable(Test-GaussSeidel tests/Test-GaussSeidel.C)
 target_compile_options(Test-GaussSeidel PRIVATE ${SMOOTHER_COMMON_OPTIONS})
 target_link_libraries(Test-GaussSeidel PRIVATE smoother_kernels)

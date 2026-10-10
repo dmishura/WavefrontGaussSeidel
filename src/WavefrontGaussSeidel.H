@@ -45,12 +45,48 @@ struct IndexKahnOrdering
     std::vector<Foam::label> oldToNew;
 };
 
+struct AdaptiveReadyChunkDiagnostic
+{
+    Foam::label readySize = 0;
+    Foam::label targetWidth = 0;
+    Foam::label searchMinWidth = 0;
+    Foam::label searchMaxWidth = 0;
+    Foam::label chosenChunkSize = 0;
+    Foam::label largestGap = 0;
+};
+
+// Diagnostic-only counters collected directly in the ordinary bounded IH1W
+// successor-release path.  A negative head value means that ready was empty.
+struct ReleaseImpactChunkDiagnostic
+{
+    Foam::label chosenChunkSize = 0;
+    Foam::label headBefore = -1;
+    Foam::label headAfter = -1;
+    Foam::label cut = -1;
+    Foam::label releasedCount = 0;
+    Foam::label releasedBelowCut = 0;
+    Foam::label releasedBeforeHead = 0;
+    Foam::label headBackstep = 0;
+    bool headChanged = false;
+};
+
 IndexKahnOrdering makeIndexKahnOrdering
 (
     Foam::label nCells,
     const Foam::labelField& ownerStarts,
     const Foam::labelField& upperAddr,
     Foam::label targetWidth
+);
+
+// Ordinary fixed-width IH1W ordering with setup-only release-impact tracing.
+// The ordering semantics are identical to makeIndexKahnOrdering.
+IndexKahnOrdering makeIndexKahnOrderingReleaseDiagnostic
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label targetWidth,
+    std::vector<ReleaseImpactChunkDiagnostic>* diagnostics
 );
 
 // The same bounded incremental Index-Kahn chunks as makeIndexKahnOrdering,
@@ -89,6 +125,18 @@ IndexKahnOrdering makeIndexKahnOrderingAdaptiveGap
     Foam::label minWidth,
     Foam::label targetWidth,
     Foam::label maxWidth
+);
+
+// IH1W5: incremental IH1W ready-set semantics with target width derived from
+// the current ready frontier.  The selected prefix remains ascending and
+// successors are released only after the complete chunk.
+IndexKahnOrdering makeIndexKahnOrderingReadyFractionAdaptiveGap
+(
+    Foam::label nCells,
+    const Foam::labelField& ownerStarts,
+    const Foam::labelField& upperAddr,
+    Foam::label readyDivisor,
+    std::vector<AdaptiveReadyChunkDiagnostic>* diagnostics = nullptr
 );
 
 // Index-Kahn ordering using complete natural dependency levels.  Unlike the
